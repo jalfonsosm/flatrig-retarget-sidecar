@@ -16,6 +16,7 @@ from flatrig_retarget_sidecar.motion2motion_retarget import (
 from flatrig_retarget_sidecar.scene_formats import (
     convert_3d_source,
     inspect_3d_source,
+    load_3d_scene,
     probe_scene_backend,
 )
 from flatrig_retarget_sidecar.spine_import import load_spine_package
@@ -76,6 +77,13 @@ def main() -> None:
     convert_3d_parser.add_argument("source")
     convert_3d_parser.add_argument("--output", required=True)
     convert_3d_parser.add_argument("--target-format", default="glb")
+
+    load_scene_parser = subparsers.add_parser(
+        "load-scene",
+        help="load a 3D source and export scene data as JSON (mesh, skeleton, animations)",
+    )
+    load_scene_parser.add_argument("source")
+    load_scene_parser.add_argument("--output", required=True)
 
     args = parser.parse_args()
 
@@ -155,6 +163,13 @@ def main() -> None:
 
     if args.command == "convert-3d-source":
         result = convert_3d_source(args.source, args.output, target_format=args.target_format)
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "load-scene":
+        result = load_3d_scene(args.source, args.output)
         print(json.dumps(result.payload, indent=2))
         if not result.ok:
             raise SystemExit(1)

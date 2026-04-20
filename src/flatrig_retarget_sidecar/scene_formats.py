@@ -295,5 +295,76 @@ def convert_3d_source(source: str, output: str, target_format: str = "glb") -> S
     return _run_blender_command("convert", source, output, target_format=target_format)
 
 
+def load_3d_scene(source: str, output: str) -> SceneCommandResult:
+    """Load a 3D source and export scene data (mesh, skeleton, animations) as JSON.
+    
+    This function uses Blender's native import which properly handles all transform
+    hierarchies, replacing the need for TinyGLTF-based loading.
+    """
+    probe = probe_scene_backend_impl()
+    if not probe.available:
+        return SceneCommandResult(
+            ok=False,
+            detail=probe.detail,
+            payload={"ok": False, "detail": probe.detail},
+        )
+
+    output_path = Path(output).expanduser().resolve()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    argv = [
+        probe.executable or sys.executable,
+        "--background",
+        "--factory-startup",
+        "--python",
+        probe.script,
+        "--",
+        "load-scene",
+        str(Path(source).expanduser().resolve()),
+        "--output",
+        str(output_path),
+    ]
+
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    payload: dict[str, Any]
+    if output_path.exists():
+        try:
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {"ok": False, "detail": "Could not read scene data JSON."}
+    else:
+        payload = {
+            "ok": False,
+            "detail": "The Blender scene loader did not create the expected output JSON.",
+        }
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = stderr or stdout or payload.get("detail") or "Blender scene load failed."
+        payload = {
+            **payload,
+            "ok": False,
+            "detail": detail,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        return SceneCommandResult(ok=False, detail=detail, payload=payload, command=argv)
+
+    detail = str(payload.get("detail") or "ok")
+    return SceneCommandResult(
+        ok=bool(payload.get("ok", False)),
+        detail=detail,
+        payload=payload,
+        command=argv,
+    )
+
+
 def probe_scene_backend() -> dict[str, Any]:
     return asdict(probe_scene_backend_impl())
