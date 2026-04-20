@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import bpy
+import mathutils
 
 
 def parse_args() -> argparse.Namespace:
@@ -315,7 +316,16 @@ def extract_skeleton_data(armature_obj) -> dict[str, Any]:
         # Get local transform
         head = bone.head_local
         tail = bone.tail_local
-        roll = bone.roll
+        
+        # Get roll - bone.roll was removed in Blender 5.0
+        # Calculate roll from the Y axis of the bone matrix
+        try:
+            roll = bone.roll
+        except AttributeError:
+            # Blender 5.0+: calculate roll from matrix
+            y_axis = mathutils.Vector((0, 1, 0))
+            y_axis = y_axis @ bone.matrix.to_3x3()
+            roll = math.atan2(y_axis.x, y_axis.y)
         
         # Get world matrix for this bone
         world_matrix = get_bone_world_matrix(armature_obj, bone.name)
@@ -352,9 +362,16 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
         # Extract keyframes for bones
         keyframes = []
         
+        # Get fcurves - API changed in Blender 5.0
+        fcurves = getattr(action, "fcurves", None)
+        if fcurves is None and hasattr(action, "id_data"):
+            fcurves = getattr(action.id_data, "fcurves", None)
+        if fcurves is None:
+            fcurves = []
+        
         # Group fcurves by bone
         bone_keyframes = {}
-        for fcurve in action.fcurves:
+        for fcurve in fcurves:
             data_path = fcurve.data_path
             # Parse pose.bones["BoneName"].property
             if not (data_path.startswith('pose.bones["') or data_path.startswith("pose.bones['")):
