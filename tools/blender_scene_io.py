@@ -345,11 +345,37 @@ def extract_skeleton_data(armature_obj) -> dict[str, Any]:
     }
 
 
+def get_action_fcurves(action) -> list:
+    """Get fcurves from an action, handling Blender 5.0's layered animation system.
+    
+    In Blender 5.0+, animation data is stored in:
+    - action.layers[].strips[].channelbags[].fcurves
+    instead of action.fcurves directly.
+    """
+    # First try the old API (for compatibility with older Blender versions)
+    fcurves = getattr(action, "fcurves", None)
+    if fcurves is not None and len(fcurves) > 0:
+        return list(fcurves)
+    
+    # Blender 5.0+ layered animation system
+    if hasattr(action, "layers"):
+        for layer in action.layers:
+            if hasattr(layer, "strips"):
+                for strip in layer.strips:
+                    if hasattr(strip, "channelbags"):
+                        for channelbag in strip.channelbags:
+                            fc = getattr(channelbag, "fcurves", None)
+                            if fc is not None and len(fc) > 0:
+                                return list(fc)
+    
+    return []
+
+
 def extract_animation_data(armature_obj) -> dict[str, Any]:
     """Extract animation clips from the armature.
     
     Handles Blender 5.0 API changes where action.fcurves may be None
-    and animation data is accessed differently.
+    and animation data is accessed via action.layers[].strips[].channelbags[].fcurves.
     """
     if armature_obj is None:
         return {"animation_count": 0, "animations": []}
@@ -366,39 +392,8 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
         # Extract keyframes for bones
         keyframes = []
         
-        # Get fcurves - API changed in Blender 5.0
-        # Blender 5.0 stores animation data differently
-        fcurves = getattr(action, "fcurves", None) or []
-        
-        # If no fcurves directly on action, try to get them from id_data
-        if not fcurves:
-            id_data = getattr(action, "id_data", None)
-            if id_data is not None:
-                fcurves = getattr(id_data, "fcurves", None) or []
-        
-        # Blender 5.0+: check if animation data is on the armature itself
-        if not fcurves and armature_obj and armature_obj.animation_data:
-            anim_data = armature_obj.animation_data
-            if hasattr(anim_data, "action") and anim_data.action:
-                fcurves = getattr(anim_data.action, "fcurves", None) or []
-        
-        # If still no fcurves, check the action's curves directly via all_items
-        if not fcurves:
-            try:
-                if hasattr(action, "curves"):
-                    fcurves = list(action.curves) or []
-            except (TypeError, AttributeError):
-                pass
-        
-        if not fcurves:
-            # Last resort: try to get FCurves via the Blender RNA path
-            try:
-                if hasattr(action, "bl_rna"):
-                    fcurve_rna = action.bl_rna.properties.get("fcurves")
-                    if fcurve_rna:
-                        fcurves = getattr(action, "fcurves", []) or []
-            except Exception:
-                pass
+        # Get fcurves using the helper function
+        fcurves = get_action_fcurves(action)
         
         # Group fcurves by bone
         bone_keyframes: dict[str, list[dict[str, Any]]] = {}
