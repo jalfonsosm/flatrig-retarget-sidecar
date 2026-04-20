@@ -367,6 +367,12 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
         if fcurves is None and hasattr(action, "id_data"):
             fcurves = getattr(action.id_data, "fcurves", None)
         if fcurves is None:
+            # Blender 5.0+: try to get fcurves from id_data
+            id_data = getattr(action, "id_data", None)
+            if id_data is not None:
+                fcurves = getattr(id_data, "fcurves", [])
+        
+        if fcurves is None:
             fcurves = []
         
         # Group fcurves by bone
