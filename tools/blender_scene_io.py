@@ -404,7 +404,7 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
 def load_scene(source_path: str, output_path: str) -> dict[str, object]:
     """Load a 3D source and export the full scene data as JSON.
     
-    This function replaces the need for TinyGLTF by using Blender's
+    This function uses Blender's
     native import which properly handles all transform hierarchies.
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)

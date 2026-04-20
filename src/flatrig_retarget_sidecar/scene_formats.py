@@ -299,9 +299,13 @@ def load_3d_scene(source: str, output: str) -> SceneCommandResult:
     """Load a 3D source and export scene data (mesh, skeleton, animations) as JSON.
     
     This function uses Blender's native import which properly handles all transform
-    hierarchies, replacing the need for TinyGLTF-based loading.
+    hierarchies.
+    
+    Note: bpy backend is NOT used for load-scene because Blender operators require
+    a context that isn't available in bpy-only mode. Always uses Blender CLI.
     """
-    probe = probe_scene_backend_impl()
+    # Force Blender CLI mode - bpy doesn't work for load-scene
+    probe = probe_blender_backend()
     if not probe.available:
         return SceneCommandResult(
             ok=False,
