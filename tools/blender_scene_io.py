@@ -294,7 +294,103 @@ def extract_mesh_data(mesh_obj) -> dict[str, Any]:
     if uv_layer:
         result["uvs"] = tri_uvs if tri_uvs else []
     
+    # Extract base color texture from materials
+    base_color_data = extract_base_color_texture(mesh_obj)
+    if base_color_data:
+        result["base_color_rgba"] = base_color_data["rgba"]
+        result["base_color_width"] = base_color_data["width"]
+        result["base_color_height"] = base_color_data["height"]
+        result["base_color_channels"] = base_color_data["channels"]
+    
     return result
+
+
+def extract_base_color_texture(mesh_obj) -> dict[str, Any] | None:
+    """Extract base color texture data from a mesh object's materials.
+    
+    Returns a dict with rgba (flattened), width, height, and channels (4 for RGBA).
+    Returns None if no valid texture is found.
+    """
+    if mesh_obj is None:
+        return None
+    
+    mesh = mesh_obj.data
+    if not hasattr(mesh, "materials") or not mesh.materials:
+        return None
+    
+    # Try to get the first material with a base color texture
+    for slot in mesh.materials:
+        if slot is None:
+            continue
+        
+        material = slot
+        # Handle material slots in Blender 5.0+
+        if hasattr(slot, "material"):
+            material = slot.material
+        
+        if material is None:
+            continue
+        
+        # Check for Principled BSDF shader and its Base Color input
+        if hasattr(material, "node_tree") and material.node_tree:
+            nodes = material.node_tree.nodes
+            for node in nodes:
+                if node.type == "BSDF_PRINCIPLED":
+                    # Try to get the Base Color input
+                    base_color_input = node.inputs.get("Base Color")
+                    if base_color_input and base_color_input.links:
+                        link = base_color_input.links[0]
+                        from_node = link.from_node
+                        
+                        # Check if it's an image texture
+                        if from_node and from_node.type == "TEX_IMAGE":
+                            image = from_node.image
+                            if image and image.size[0] > 0 and image.size[1] > 0:
+                                # Read pixels - they come as RGBA
+                                width, height = image.size
+                                pixels = list(image.pixels)
+                                
+                                # Convert to flattened RGBA list
+                                # Image pixels are in [r,g,b,a, r,g,b,a, ...] format
+                                rgba = []
+                                for i in range(0, len(pixels), 4):
+                                    rgba.append(int(pixels[i] * 255))      # R
+                                    rgba.append(int(pixels[i + 1] * 255))  # G
+                                    rgba.append(int(pixels[i + 2] * 255))  # B
+                                    rgba.append(int(pixels[i + 3] * 255))  # A
+                                
+                                return {
+                                    "rgba": rgba,
+                                    "width": width,
+                                    "height": height,
+                                    "channels": 4,
+                                }
+        
+        # Fallback: try to find any image texture node
+        if hasattr(material, "node_tree") and material.node_tree:
+            nodes = material.node_tree.nodes
+            for node in nodes:
+                if node.type == "TEX_IMAGE":
+                    image = node.image
+                    if image and image.size[0] > 0 and image.size[1] > 0:
+                        width, height = image.size
+                        pixels = list(image.pixels)
+                        
+                        rgba = []
+                        for i in range(0, len(pixels), 4):
+                            rgba.append(int(pixels[i] * 255))
+                            rgba.append(int(pixels[i + 1] * 255))
+                            rgba.append(int(pixels[i + 2] * 255))
+                            rgba.append(int(pixels[i + 3] * 255))
+                        
+                        return {
+                            "rgba": rgba,
+                            "width": width,
+                            "height": height,
+                            "channels": 4,
+                        }
+    
+    return None
 
 
 def extract_skeleton_data(armature_obj) -> dict[str, Any]:
