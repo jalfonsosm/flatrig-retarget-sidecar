@@ -346,7 +346,11 @@ def extract_skeleton_data(armature_obj) -> dict[str, Any]:
 
 
 def extract_animation_data(armature_obj) -> dict[str, Any]:
-    """Extract animation clips from the armature."""
+    """Extract animation clips from the armature.
+    
+    Handles Blender 5.0 API changes where action.fcurves may be None
+    and animation data is accessed differently.
+    """
     if armature_obj is None:
         return {"animation_count": 0, "animations": []}
     
@@ -363,22 +367,44 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
         keyframes = []
         
         # Get fcurves - API changed in Blender 5.0
-        fcurves = getattr(action, "fcurves", None)
-        if fcurves is None and hasattr(action, "id_data"):
-            fcurves = getattr(action.id_data, "fcurves", None)
-        if fcurves is None:
-            # Blender 5.0+: try to get fcurves from id_data
+        # Blender 5.0 stores animation data differently
+        fcurves = getattr(action, "fcurves", None) or []
+        
+        # If no fcurves directly on action, try to get them from id_data
+        if not fcurves:
             id_data = getattr(action, "id_data", None)
             if id_data is not None:
-                fcurves = getattr(id_data, "fcurves", [])
+                fcurves = getattr(id_data, "fcurves", None) or []
         
-        if fcurves is None:
-            fcurves = []
+        # Blender 5.0+: check if animation data is on the armature itself
+        if not fcurves and armature_obj and armature_obj.animation_data:
+            anim_data = armature_obj.animation_data
+            if hasattr(anim_data, "action") and anim_data.action:
+                fcurves = getattr(anim_data.action, "fcurves", None) or []
+        
+        # If still no fcurves, check the action's curves directly via all_items
+        if not fcurves:
+            try:
+                if hasattr(action, "curves"):
+                    fcurves = list(action.curves) or []
+            except (TypeError, AttributeError):
+                pass
+        
+        if not fcurves:
+            # Last resort: try to get FCurves via the Blender RNA path
+            try:
+                if hasattr(action, "bl_rna"):
+                    fcurve_rna = action.bl_rna.properties.get("fcurves")
+                    if fcurve_rna:
+                        fcurves = getattr(action, "fcurves", []) or []
+            except Exception:
+                pass
         
         # Group fcurves by bone
-        bone_keyframes = {}
+        bone_keyframes: dict[str, list[dict[str, Any]]] = {}
         for fcurve in fcurves:
-            data_path = fcurve.data_path
+            data_path = str(fcurve.data_path or "")
+            
             # Parse pose.bones["BoneName"].property
             if not (data_path.startswith('pose.bones["') or data_path.startswith("pose.bones['")):
                 continue
@@ -400,16 +426,44 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
             array_index = fcurve.array_index
             
             # Sample keyframes
-            for keyframe_point in fcurve.keyframe_points:
-                frame = int(round(keyframe_point.co.x))
-                value = keyframe_point.co.y
-                keyframes.append({
-                    "bone_name": bone_name,
-                    "frame": frame,
-                    "property": prop,
-                    "array_index": array_index,
-                    "value": value,
-                })
+            try:
+                keyframe_points = fcurve.keyframe_points
+                for kf in keyframe_points:
+                    frame = int(round(kf.co.x))
+                    value = kf.co.y
+                    
+                    # Group by bone
+                    if bone_name not in bone_keyframes:
+                        bone_keyframes[bone_name] = []
+                    bone_keyframes[bone_name].append({
+                        "bone_name": bone_name,
+                        "frame": frame,
+                        "property": prop,
+                        "array_index": array_index,
+                        "value": value,
+                    })
+            except AttributeError:
+                # Blender 5.0+: keyframe_points may not exist, try reading the entire points array
+                try:
+                    points = fcurve.points
+                    for pt in points:
+                        frame, value = pt.co
+                        frame = int(round(frame))
+                        if bone_name not in bone_keyframes:
+                            bone_keyframes[bone_name] = []
+                        bone_keyframes[bone_name].append({
+                            "bone_name": bone_name,
+                            "frame": frame,
+                            "property": prop,
+                            "array_index": array_index,
+                            "value": value,
+                        })
+                except Exception:
+                    pass
+        
+        # Flatten bone_keyframes into keyframes list
+        for bone_name, kf_list in bone_keyframes.items():
+            keyframes.extend(kf_list)
         
         animations.append({
             "name": action.name,
