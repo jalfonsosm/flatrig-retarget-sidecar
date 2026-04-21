@@ -409,9 +409,12 @@ def extract_skeleton_data(armature_obj) -> dict[str, Any]:
                     parent_index = i
                     break
         
-        # Get local transform
-        head = bone.head_local
-        tail = bone.tail_local
+        # Get local transform and convert to WORLD space
+        head_world = armature_obj.matrix_world @ bone.head_local
+        tail_world = armature_obj.matrix_world @ bone.tail_local
+        
+        world_head = [head_world.x, head_world.y, head_world.z]
+        world_tail = [tail_world.x, tail_world.y, tail_world.z]
         
         # Get roll - bone.roll was removed in Blender 5.0
         # Calculate roll from the Y axis of the bone matrix
@@ -429,7 +432,8 @@ def extract_skeleton_data(armature_obj) -> dict[str, Any]:
         bones_data.append({
             "name": bone.name,
             "parent_index": parent_index,
-            "local_position": [head.x, head.y, head.z],
+            "world_position": world_head,
+            "world_tail": world_tail,
             "local_rotation": roll,
             "local_scale": [bone.length, bone.length, bone.length],
             "world_matrix": world_matrix,
