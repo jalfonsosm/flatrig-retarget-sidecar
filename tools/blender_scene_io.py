@@ -195,11 +195,11 @@ def parse_args() -> argparse.Namespace:
         script_args = []
 
     parser = argparse.ArgumentParser(description="Inspect or convert 3D sources for flatRig.")
-    parser.add_argument("command", choices=("inspect", "convert", "load-scene"))
+    parser.add_argument("command", choices=("inspect", "convert", "extract-bone-hierarchy"))
     parser.add_argument("source")
     parser.add_argument("--output", required=True)
     parser.add_argument("--target-format", default="glb", choices=("glb",))
-    # Projection parameters for load-scene
+    # Projection parameters for extract-bone-hierarchy
     parser.add_argument("--view-preset", default="front",
                         choices=list(VIEW_PRESETS.keys()) + list(VIEW_PRESETS.keys()),
                         help="View preset for projection (front, back, side, side_r, top, bottom)")
@@ -209,8 +209,8 @@ def parse_args() -> argparse.Namespace:
                         help="Custom view up hint as 'x,y,z' tuple")
     parser.add_argument("--view-roll", type=float, default=0.0,
                         help="View roll in degrees")
-    parser.add_argument("--projected", action="store_true", default=False,
-                        help="Output projected 2D data instead of world-space 3D")
+    parser.add_argument("--source-frame", type=int, default=None,
+                        help="Source frame for pose evaluation")
     return parser.parse_args(script_args)
 
 
@@ -1002,41 +1002,26 @@ def extract_bone_hierarchy(
 
     return bones
 
-
-def extract_skeleton_data_with_projection(
-    armature_obj,
+def extract_bone_hierarchy_cli(
+    source_path: str,
+    output_path: str,
     view_preset: str = "front",
     view_dir=None,
     view_up=None,
     view_roll: float = 0.0,
-) -> dict[str, Any]:
-    """Extract skeleton hierarchy with projected 2D bone transforms.
+    source_frame: int = None,
+) -> dict[str, object]:
+    """CLI wrapper for extract_bone_hierarchy that matches Python's pipeline.
     
-    This function outputs bones with x, y (projected 2D positions) and rotation
-    instead of world-space 3D coordinates.
-    
-    Args:
-        armature_obj: Blender armature object
-        view_preset: View preset name (front, back, side, side_r, top, bottom)
-        view_dir: Custom view direction vector (overrides preset)
-        view_up: Custom up hint vector
-        view_roll: View roll in degrees
-    
-    Returns:
-        dict with bone_count and bones list, where each bone has:
-        - name: bone name
-        - parent: parent bone name (None for root)
-        - index: bone index
-        - head: [x, y] projected 2D head position
-        - segment: [dx, dy] segment direction
-        - length: bone length
-        - rotation_world: world rotation in degrees
-        - connected: whether bone is connected to parent
-        - x, y: local 2D position (relative to parent)
-        - rotation: local rotation in degrees
+    This function imports the model, finds the armature, and calls extract_bone_hierarchy
+    to get the proper 2D bone hierarchy that Python uses.
     """
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+    
+    mesh_obj, armature_obj = find_mesh_and_armature()
     if armature_obj is None:
-        return {"bone_count": 0, "bones": []}
+        return {"ok": False, "detail": "No armature found in scene"}
     
     # Build view configuration
     view_cfg = _build_view_config(
@@ -1046,392 +1031,24 @@ def extract_skeleton_data_with_projection(
         view_roll=view_roll,
     )
     
-    # Get all bones in topological order (parents before children)
-    bone_order = _topological_sort_bones(armature_obj)
-    
-    bones_data = []
-    world_cache = {}  # For computing local positions
-    
-    for idx, bone_name in enumerate(bone_order):
-        bone = armature_obj.data.bones[bone_name]
-        
-        # Get parent name and index
-        parent_name = None
-        parent_index = -1
-        if bone.parent:
-            parent_name = bone.parent.name
-            for i, b in enumerate(armature_obj.data.bones):
-                if b.name == parent_name:
-                    parent_index = i
-                    break
-        
-        # Get world-space head and tail
-        head_world = armature_obj.matrix_world @ bone.head_local
-        tail_world = armature_obj.matrix_world @ bone.tail_local
-        
-        # Project to 2D
-        head_2d = project_point_ortho([head_world.x, head_world.y, head_world.z], view_cfg)
-        tail_2d = project_point_ortho([tail_world.x, tail_world.y, tail_world.z], view_cfg)
-        
-        # Compute segment direction and length in 2D
-        seg_dx = tail_2d[0] - head_2d[0]
-        seg_dy = tail_2d[1] - head_2d[1]
-        seg_length = math.hypot(seg_dx, seg_dy)
-        world_rotation = math.degrees(math.atan2(seg_dy, seg_dx)) if seg_length > 1e-6 else 0.0
-        
-        # Compute local position and rotation relative to parent
-        if parent_name is not None and parent_name in world_cache:
-            parent_state = world_cache[parent_name]
-            parent_head_2d = parent_state["head_2d"]
-            parent_matrix = parent_state["matrix"]
-            
-            # inv_parent @ (head - parent_head)
-            det = parent_matrix[0] * parent_matrix[3] - parent_matrix[1] * parent_matrix[2]
-            if abs(det) < 1e-6:
-                det = 1.0
-            inv_parent = [
-                parent_matrix[3] / det, -parent_matrix[1] / det,
-                -parent_matrix[2] / det, parent_matrix[0] / det
-            ]
-            
-            dx = head_2d[0] - parent_head_2d[0]
-            dy = head_2d[1] - parent_head_2d[1]
-            local_x = inv_parent[0] * dx + inv_parent[2] * dy
-            local_y = inv_parent[1] * dx + inv_parent[3] * dy
-            
-            # Compute world_x_axis and local_x_axis
-            if seg_length > 1e-6:
-                world_x_axis = [seg_dx / seg_length, seg_dy / seg_length]
-            else:
-                world_x_axis = [1.0, 0.0]
-            
-            # local_x_axis = inv_parent @ world_x_axis
-            local_x_axis = [
-                inv_parent[0] * world_x_axis[0] + inv_parent[2] * world_x_axis[1],
-                inv_parent[1] * world_x_axis[0] + inv_parent[3] * world_x_axis[1],
-            ]
-            local_rotation = math.degrees(math.atan2(local_x_axis[1], local_x_axis[0]))
-            
-            # Build world matrix for child bone
-            cos_r = math.cos(math.radians(local_rotation))
-            sin_r = math.sin(math.radians(local_rotation))
-            world_matrix = [
-                cos_r * parent_matrix[0] - sin_r * parent_matrix[2],
-                cos_r * parent_matrix[1] - sin_r * parent_matrix[3],
-                sin_r * parent_matrix[0] + cos_r * parent_matrix[2],
-                sin_r * parent_matrix[1] + cos_r * parent_matrix[3],
-            ]
-        else:
-            # Root bone: local = world
-            local_x = head_2d[0]
-            local_y = head_2d[1]
-            local_rotation = world_rotation
-            
-            # Build world matrix for root bone (2x2 rotation + translation encoded)
-            cos_r = math.cos(math.radians(world_rotation))
-            sin_r = math.sin(math.radians(world_rotation))
-            world_matrix = [cos_r, -sin_r, sin_r, cos_r]
-        
-        bones_data.append({
-            "name": bone.name,
-            "parent": parent_name,
-            "index": idx,
-            "head": list(head_2d),
-            "segment": [round(seg_dx, 4), round(seg_dy, 4)],
-            "length": round(seg_length, 4),
-            "rotation_world": round(world_rotation, 2),
-            "connected": (seg_length > 1e-4),
-            "x": round(local_x, 4),
-            "y": round(local_y, 4),
-            "rotation": round(local_rotation, 2),
-            "world_matrix": world_matrix,
-        })
-        
-        # Cache world state for children
-        world_cache[bone.name] = {
-            "head_2d": head_2d,
-            "matrix": world_matrix,
-        }
+    # Call extract_bone_hierarchy (same as Python pipeline)
+    bones = extract_bone_hierarchy(
+        armature_obj,
+        view_cfg,
+        source_frame=source_frame,
+        use_rest_pose=False,
+        projection_space="world",
+        projection_reference_root=None,
+    )
     
     return {
-        "bone_count": len(bones_data),
-        "bones": bones_data,
+        "ok": True,
+        "detail": "extracted",
+        "source": source_path,
         "view_preset": view_preset,
         "view_roll": view_roll,
+        "bones": bones,
     }
-
-
-def _topological_sort_bones(armature_obj) -> list[str]:
-    """Sort bone names so parents come before children."""
-    bones = list(armature_obj.data.bones)
-    bone_index = {bone.name: i for i, bone in enumerate(bones)}
-    
-    # Build adjacency list
-    children = {bone.name: [] for bone in bones}
-    in_degree = {bone.name: 0 for bone in bones}
-    
-    for bone in bones:
-        if bone.parent:
-            children[bone.parent.name].append(bone.name)
-            in_degree[bone.name] += 1
-    
-    # Kahn's algorithm
-    queue = [name for name, degree in in_degree.items() if degree == 0]
-    result = []
-    
-    while queue:
-        # Sort for consistent ordering
-        queue.sort(key=lambda n: bone_index[n])
-        name = queue.pop(0)
-        result.append(name)
-        
-        for child in children[name]:
-            in_degree[child] -= 1
-            if in_degree[child] == 0:
-                queue.append(child)
-    
-    return result
-
-
-def extract_skeleton_data(armature_obj) -> dict[str, Any]:
-    """Extract skeleton hierarchy and bone transforms (world-space).
-    
-    This function outputs bones with world-space 3D coordinates (world_position,
-    world_tail, local_rotation).
-    """
-    if armature_obj is None:
-        return {"bone_count": 0, "bones": []}
-    
-    bones_data = []
-    
-    for bone in armature_obj.data.bones:
-        # Get parent index
-        parent_index = -1
-        if bone.parent:
-            for i, b in enumerate(armature_obj.data.bones):
-                if b.name == bone.parent.name:
-                    parent_index = i
-                    break
-        
-        # Get local transform and convert to WORLD space
-        head_world = armature_obj.matrix_world @ bone.head_local
-        tail_world = armature_obj.matrix_world @ bone.tail_local
-        
-        world_head = [head_world.x, head_world.y, head_world.z]
-        world_tail = [tail_world.x, tail_world.y, tail_world.z]
-        
-        # Get roll - bone.roll was removed in Blender 5.0
-        # Calculate roll from the Y axis of the bone matrix
-        try:
-            roll = bone.roll
-        except AttributeError:
-            # Blender 5.0+: calculate roll from matrix
-            y_axis = mathutils.Vector((0, 1, 0))
-            y_axis = y_axis @ bone.matrix.to_3x3()
-            roll = math.atan2(y_axis.x, y_axis.y)
-        
-        # Get world matrix for this bone
-        world_matrix = get_bone_world_matrix(armature_obj, bone.name)
-        
-        bones_data.append({
-            "name": bone.name,
-            "parent_index": parent_index,
-            "world_position": world_head,
-            "world_tail": world_tail,
-            "local_rotation": roll,
-            "local_scale": [bone.length, bone.length, bone.length],
-            "world_matrix": world_matrix,
-        })
-    
-    return {
-        "bone_count": len(bones_data),
-        "bones": bones_data,
-    }
-
-
-def get_action_fcurves(action) -> list:
-    """Get fcurves from an action, handling Blender 5.0's layered animation system.
-    
-    In Blender 5.0+, animation data is stored in:
-    - action.layers[].strips[].channelbags[].fcurves
-    instead of action.fcurves directly.
-    """
-    # First try the old API (for compatibility with older Blender versions)
-    fcurves = getattr(action, "fcurves", None)
-    if fcurves is not None and len(fcurves) > 0:
-        return list(fcurves)
-    
-    # Blender 5.0+ layered animation system
-    all_fcurves = []
-    if hasattr(action, "layers"):
-        for layer in action.layers:
-            if hasattr(layer, "strips"):
-                for strip in layer.strips:
-                    if hasattr(strip, "channelbags"):
-                        for channelbag in strip.channelbags:
-                            fc = getattr(channelbag, "fcurves", None)
-                            if fc is not None and len(fc) > 0:
-                                all_fcurves.extend(list(fc))
-    return all_fcurves
-
-
-def extract_animation_data(armature_obj) -> dict[str, Any]:
-    """Extract animation clips from the armature.
-    
-    Handles Blender 5.0 API changes where action.fcurves may be None
-    and animation data is accessed via action.layers[].strips[].channelbags[].fcurves.
-    """
-    if armature_obj is None:
-        return {"animation_count": 0, "animations": []}
-    
-    animations = []
-    
-    for action in bpy.data.actions:
-        if not is_pose_action(action):
-            continue
-        
-        # Get frame range
-        frame_start, frame_end = action.frame_range
-        
-        # Extract keyframes for bones
-        keyframes = []
-        
-        # Get fcurves using the helper function
-        fcurves = get_action_fcurves(action)
-        
-        # Group fcurves by bone
-        bone_keyframes: dict[str, list[dict[str, Any]]] = {}
-        for fcurve in fcurves:
-            data_path = str(fcurve.data_path or "")
-            
-            # Parse pose.bones["BoneName"].property
-            if not (data_path.startswith('pose.bones["') or data_path.startswith("pose.bones['")):
-                continue
-            
-            # Extract bone name
-            try:
-                brace_start = data_path.index('["') + 2
-                brace_end = data_path.index('"]')
-                if brace_end < 0:
-                    brace_end = data_path.index("']")
-                bone_name = data_path[brace_start:brace_end]
-            except (ValueError, IndexError):
-                continue
-            
-            # Get property being animated
-            prop = data_path[brace_end + 3:] if brace_end + 3 < len(data_path) else ""
-            
-            # Get array index if applicable
-            array_index = fcurve.array_index
-            
-            # Sample keyframes
-            try:
-                keyframe_points = fcurve.keyframe_points
-                for kf in keyframe_points:
-                    frame = int(round(kf.co.x))
-                    value = kf.co.y
-                    
-                    # Group by bone
-                    if bone_name not in bone_keyframes:
-                        bone_keyframes[bone_name] = []
-                    bone_keyframes[bone_name].append({
-                        "bone_name": bone_name,
-                        "frame": frame,
-                        "property": prop,
-                        "array_index": array_index,
-                        "value": value,
-                    })
-            except AttributeError:
-                # Blender 5.0+: keyframe_points may not exist, try reading the entire points array
-                try:
-                    points = fcurve.points
-                    for pt in points:
-                        frame, value = pt.co
-                        frame = int(round(frame))
-                        if bone_name not in bone_keyframes:
-                            bone_keyframes[bone_name] = []
-                        bone_keyframes[bone_name].append({
-                            "bone_name": bone_name,
-                            "frame": frame,
-                            "property": prop,
-                            "array_index": array_index,
-                            "value": value,
-                        })
-                except Exception:
-                    pass
-        
-        # Flatten bone_keyframes into keyframes list
-        for bone_name, kf_list in bone_keyframes.items():
-            keyframes.extend(kf_list)
-        
-        animations.append({
-            "name": action.name,
-            "frame_start": int(round(frame_start)),
-            "frame_end": int(round(frame_end)),
-            "keyframes": keyframes,
-        })
-    
-    return {
-        "animation_count": len(animations),
-        "animations": animations,
-    }
-
-
-def load_scene(
-    source_path: str,
-    output_path: str,
-    projected: bool = False,
-    view_preset: str = "front",
-    view_dir=None,
-    view_up=None,
-    view_roll: float = 0.0,
-) -> dict[str, object]:
-    """Load a 3D source and export the full scene data as JSON.
-    
-    This function uses Blender's native import which properly handles all
-    transform hierarchies.
-    
-    Args:
-        source_path: Path to the 3D source file
-        output_path: Path for the output JSON (not used in function, for CLI compatibility)
-        projected: If True, output projected 2D skeleton data
-        view_preset: View preset for projection (front, back, side, side_r, top, bottom)
-        view_dir: Custom view direction tuple
-        view_up: Custom view up hint tuple
-        view_roll: View roll in degrees
-    
-    Returns:
-        dict with scene data including mesh, skeleton, and animations
-    """
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_model(source_path)
-    
-    mesh_obj, armature_obj = find_mesh_and_armature()
-    
-    # Choose skeleton extraction method based on projected flag
-    if projected:
-        skeleton_data = extract_skeleton_data_with_projection(
-            armature_obj,
-            view_preset=view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
-            view_roll=view_roll,
-        )
-    else:
-        skeleton_data = extract_skeleton_data(armature_obj)
-    
-    scene_data = {
-        "ok": True,
-        "detail": "loaded",
-        "source": source_path,
-        "format": Path(source_path).suffix.lower().lstrip("."),
-        "projected": projected,
-        "mesh": extract_mesh_data(mesh_obj),
-        "skeleton": skeleton_data,
-        "animations": extract_animation_data(armature_obj),
-    }
-    
-    return scene_data
 
 
 def main() -> None:
@@ -1445,7 +1062,7 @@ def main() -> None:
         payload = inspect_source(source_path)
     elif args.command == "convert":
         payload = convert_source(source_path, str(output_path), args.target_format)
-    elif args.command == "load-scene":
+    elif args.command == "extract-bone-hierarchy":
         # Parse view_dir and view_up if provided
         view_dir = None
         view_up = None
@@ -1454,14 +1071,14 @@ def main() -> None:
         if args.view_up:
             view_up = tuple(float(x) for x in args.view_up.split(","))
         
-        payload = load_scene(
+        payload = extract_bone_hierarchy_cli(
             source_path,
             str(output_path),
-            projected=args.projected,
             view_preset=args.view_preset,
             view_dir=view_dir,
             view_up=view_up,
             view_roll=args.view_roll,
+            source_frame=args.source_frame,
         )
     else:
         raise AssertionError(f"Unhandled command: {args.command}")
