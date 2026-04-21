@@ -90,10 +90,12 @@ def _build_view_config(
     
     if view_up is not None:
         up_hint = mathutils.Vector(view_up).normalized()
-        right_axis = mathutils.Vector(np.cross(view_dir, up_hint)).normalized()
+        right_axis_vec = np.cross(view_dir, up_hint)
+        right_axis = mathutils.Vector(right_axis_vec / np.linalg.norm(right_axis_vec))
         if right_axis.length < 1e-6:
             right_axis = view_dir.orthogonal()
-        up_axis = mathutils.Vector(np.cross(right_axis, view_dir)).normalized()
+        up_axis_vec = np.cross(right_axis, view_dir)
+        up_axis = mathutils.Vector(up_axis_vec / np.linalg.norm(up_axis_vec))
     
     # Apply roll
     if abs(view_roll) > 1e-6:
@@ -140,14 +142,11 @@ def _build_view_config(
 
 def _project_projection_space_direction(direction_3d, view_cfg):
     """Project a 3D direction onto the 2D view plane."""
-    basis_2d = view_cfg["basis_2d"]
-    dx = direction_3d[0]
-    dy = direction_3d[1]
-    dz = direction_3d[2]
-    return (
-        basis_2d[0][0] * dx + basis_2d[0][1] * dy,
-        basis_2d[1][0] * dx + basis_2d[1][1] * dy,
-    )
+    direction_3d = np.asarray(direction_3d, dtype=np.float64)
+    basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
+    if direction_3d.ndim == 1:
+        return basis_2d @ direction_3d
+    return direction_3d @ basis_2d.T
 
 
 def project_point_ortho(point_3d, view_cfg, projection_inverse=None):
@@ -167,16 +166,25 @@ def _transform_point_to_projection_space(point_3d, projection_inverse=None):
     if projection_inverse is None:
         return point_3d
     
+    squeeze = False
+    if point_3d.ndim == 1:
+        point_3d = point_3d[np.newaxis, :]
+        squeeze = True
+    
     point_h = np.concatenate(
-        (point_3d, np.array((1.0,), dtype=np.float64)),
-        axis=0,
+        (point_3d, np.ones((point_3d.shape[0], 1), dtype=np.float64)),
+        axis=1,
     )
     projection_inverse = np.asarray(projection_inverse, dtype=np.float64)
+    
     if projection_inverse.ndim == 2:
-        transformed = projection_inverse @ point_h
+        transformed = (projection_inverse @ point_h.T).T[:, :3]
     else:
-        transformed = np.einsum("ij,j->i", projection_inverse, point_h)
-    return transformed[:3]
+        transformed = np.einsum("nij,nj->ni", projection_inverse, point_h)[:, :3]
+    
+    if squeeze:
+        return transformed[0]
+    return transformed
 
 
 def parse_args() -> argparse.Namespace:
