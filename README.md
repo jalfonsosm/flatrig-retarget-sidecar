@@ -15,7 +15,6 @@ The sidecar is designed around optional backends:
 
 - Base package: public CLI, Spine parsing, sparse mapping, and scene-backend orchestration.
 - Motion2Motion backend: optional. Installed through `tools/install_motion2motion_backend.py`.
-- PAN backend: optional and experimental. Kept out of the default quality gates.
 - Torch runtime: provisioned separately through `tools/install_torch_runtime.py` because the correct wheel flavor depends on the host platform.
 
 That separation keeps the package importable in CI without forcing heavyweight GPU runtimes.
@@ -36,7 +35,6 @@ Optional extras:
 
 ```bash
 python -m pip install -e .[motion2motion]
-python -m pip install -e .[pan]
 python -m pip install -e .[all]
 ```
 
@@ -77,7 +75,7 @@ CI runs:
 - unit tests on Python `3.10`, `3.11`, and `3.12`
 - coverage reporting from the unit-test job
 
-The default CI suite does not require Motion2Motion, PAN, `bpy`, Blender, CUDA, or Node.
+The default CI suite does not require Motion2Motion, `bpy`, Blender, CUDA, or Node.
 
 ## Scene Backends
 
@@ -125,4 +123,3 @@ Plain Spine `.json` and `.zip` packages do not need Node.
 
 - Motion2Motion path: supported and tested through the public CLI contract.
 - Scene conversion path: supported through `bpy` or Blender CLI.
-- PAN path: experimental, optional, and not part of the default CI contract.

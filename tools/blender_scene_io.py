@@ -90,10 +90,10 @@ def _build_view_config(
     
     if view_up is not None:
         up_hint = mathutils.Vector(view_up).normalized()
-        right_axis = up_hint.cross(view_dir).normalized()
+        right_axis = mathutils.Vector(np.cross(view_dir, up_hint)).normalized()
         if right_axis.length < 1e-6:
             right_axis = view_dir.orthogonal()
-        up_axis = view_dir.cross(right_axis).normalized()
+        up_axis = mathutils.Vector(np.cross(right_axis, view_dir)).normalized()
     
     # Apply roll
     if abs(view_roll) > 1e-6:

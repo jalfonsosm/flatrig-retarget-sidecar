@@ -20,11 +20,6 @@ motion2motion = [
   "tqdm",
   "unfoldNd",
 ]
-pan = [
-  "scikit-learn",
-  "tensorboard",
-  "torchsummary",
-]
 dev = [
   "pre-commit>=3.7,<5",
   "pytest>=8.2,<9",
