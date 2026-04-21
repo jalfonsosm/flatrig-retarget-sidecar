@@ -609,8 +609,8 @@ def get_projection_reference_inverse(
     else:
         reference_root_matrix = np.asarray(reference_root_matrix, dtype=np.float64)
     
-    current_rotation = _orthonormalize_3x3(current_matrix[:3, :3])
-    reference_rotation = _orthonormalize_3x3(reference_root_matrix[:3, :3])
+    current_rotation = orthonormalize_3x3(current_matrix[:3, :3])
+    reference_rotation = orthonormalize_3x3(reference_root_matrix[:3, :3])
     projection_matrix = np.eye(4, dtype=np.float64)
     projection_matrix[:3, :3] = current_rotation @ reference_rotation.T
     projection_matrix[:3, 3] = current_matrix[:3, 3]
@@ -618,56 +618,39 @@ def get_projection_reference_inverse(
     return np.linalg.inv(projection_matrix)
 
 
-def _orthonormalize_3x3(matrix):
-    """Extract the closest rigid rotation from a 3x3 transform."""
+def orthonormalize_3x3(matrix):
+    """Extract the closest rigid rotation from a 3x3 transform using SVD."""
     matrix = np.asarray(matrix, dtype=np.float64)
-    x_axis = matrix[:3, 0]
-    y_axis = matrix[:3, 1]
-    
-    x_norm = float(np.linalg.norm(x_axis))
-    if x_norm <= VECTOR_EPSILON:
-        x_axis = np.array((1.0, 0.0, 0.0), dtype=np.float64)
-    else:
-        x_axis = x_axis / x_norm
-    
-    z_axis = np.cross(x_axis, y_axis)
-    z_norm = float(np.linalg.norm(z_axis))
-    if z_norm <= VECTOR_EPSILON:
-        z_axis = np.array((0.0, 0.0, 1.0), dtype=np.float64)
-    else:
-        z_axis = z_axis / z_norm
-    
-    y_axis = np.cross(z_axis, x_axis)
-    det = float(np.linalg.norm(y_axis))
-    if det <= VECTOR_EPSILON:
-        y_axis = np.array((0.0, 1.0, 0.0), dtype=np.float64)
-    
-    orthonormal = np.eye(3, dtype=np.float64)
-    orthonormal[:3, 0] = x_axis
-    orthonormal[:3, 1] = y_axis
-    orthonormal[:3, 2] = z_axis
-    
-    return orthonormal
+    u, _, vh = np.linalg.svd(matrix)
+    rotation = u @ vh
+    if np.linalg.det(rotation) < 0.0:
+        u[:, -1] *= -1.0
+        rotation = u @ vh
+    return rotation
 
 
 # ============================================================================
 # Skeleton Helpers
 # ============================================================================
 
-def _safe_inverse_2x2(matrix):
+def safe_inverse_2x2(matrix, epsilon=None):
     """Invert a 2x2 matrix, falling back to the identity for degenerate cases."""
+    if epsilon is None:
+        epsilon = SEGMENT_EPSILON
     det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
-    if abs(det) <= SEGMENT_EPSILON:
+    if abs(det) <= epsilon:
         return np.eye(2, dtype=np.float64)
     return np.linalg.inv(matrix)
 
 
-def _orthonormalize_2x2(matrix):
+def orthonormalize_2x2(matrix, epsilon=None):
     """Orthonormalize a 2x2 matrix preserving handedness."""
+    if epsilon is None:
+        epsilon = SEGMENT_EPSILON
     det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
     x_axis = np.array((matrix[0, 0], matrix[1, 0]), dtype=np.float64)
     x_norm = float(np.linalg.norm(x_axis))
-    if x_norm <= SEGMENT_EPSILON:
+    if x_norm <= epsilon:
         x_axis = np.array((1.0, 0.0), dtype=np.float64)
     else:
         x_axis = x_axis / x_norm
@@ -740,7 +723,7 @@ def _basis_inverse_for_inherit(parent_state, inherit_mode):
     basis = parent_state["matrix"]
     if inherit_mode == "NoScale":
         basis = parent_state["rigid_matrix"]
-    return _safe_inverse_2x2(basis)
+    return safe_inverse_2x2(basis)
 
 
 def _compose_world_matrix(parent_state, local_rotation, scale_x, inherit_mode):
@@ -959,7 +942,7 @@ def extract_bone_hierarchy(
 
         if parent_name:
             parent_state = world_cache[parent_name]
-            inv_parent = _safe_inverse_2x2(parent_state["matrix"])
+            inv_parent = safe_inverse_2x2(parent_state["matrix"])
             local_position = inv_parent @ (head_vector - parent_state["head"])
             if length > SEGMENT_EPSILON:
                 world_x_axis = segment / length
@@ -1002,7 +985,7 @@ def extract_bone_hierarchy(
         world_cache[bone_name] = {
             "head": head_vector,
             "matrix": world_matrix,
-            "rigid_matrix": _orthonormalize_2x2(world_matrix),
+            "rigid_matrix": orthonormalize_2x2(world_matrix),
         }
 
     return bones
