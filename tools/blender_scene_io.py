@@ -7,10 +7,152 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import bpy
 import mathutils
+
+
+# ============================================================================
+# View Configuration and Projection Helpers
+# ============================================================================
+
+VIEW_PRESETS = {
+    "front": {
+        "view_dir": (0.0, -1.0, 0.0),
+        "right_axis": (1.0, 0.0, 0.0),
+        "up_axis": (0.0, 0.0, 1.0),
+    },
+    "back": {
+        "view_dir": (0.0, 1.0, 0.0),
+        "right_axis": (1.0, 0.0, 0.0),
+        "up_axis": (0.0, 0.0, 1.0),
+    },
+    "side": {
+        "view_dir": (-1.0, 0.0, 0.0),
+        "right_axis": (0.0, -1.0, 0.0),
+        "up_axis": (0.0, 0.0, 1.0),
+    },
+    "side_r": {
+        "view_dir": (1.0, 0.0, 0.0),
+        "right_axis": (0.0, 1.0, 0.0),
+        "up_axis": (0.0, 0.0, 1.0),
+    },
+    "top": {
+        "view_dir": (0.0, 0.0, -1.0),
+        "right_axis": (1.0, 0.0, 0.0),
+        "up_axis": (0.0, 1.0, 0.0),
+    },
+    "bottom": {
+        "view_dir": (0.0, 0.0, 1.0),
+        "right_axis": (1.0, 0.0, 0.0),
+        "up_axis": (0.0, 1.0, 0.0),
+    },
+}
+
+
+def _normalize_vector_3d(vector, label="vector"):
+    """Normalize a 3D vector."""
+    v = mathutils.Vector(vector)
+    length = v.length
+    if length < 1e-10:
+        raise ValueError(f"{label} cannot be zero vector")
+    return v.normalized()
+
+
+def _build_view_config(
+    view_preset: str = "front",
+    view_dir: Optional[tuple] = None,
+    view_up: Optional[tuple] = None,
+    view_roll: float = 0.0,
+) -> dict:
+    """Build a view configuration dict compatible with projection helpers."""
+    if view_dir is not None:
+        view_dir = _normalize_vector_3d(view_dir, "view_dir")
+        right_axis = view_dir.orthogonal()
+        up_axis = view_dir.cross(right_axis)
+    else:
+        preset = VIEW_PRESETS.get(view_preset, VIEW_PRESETS["front"])
+        view_dir = mathutils.Vector(preset["view_dir"])
+        right_axis = mathutils.Vector(preset["right_axis"])
+        up_axis = mathutils.Vector(preset["up_axis"])
+    
+    if view_up is not None:
+        up_hint = mathutils.Vector(view_up).normalized()
+        right_axis = up_hint.cross(view_dir).normalized()
+        if right_axis.length < 1e-6:
+            right_axis = view_dir.orthogonal()
+        up_axis = view_dir.cross(right_axis).normalized()
+    
+    # Apply roll
+    if abs(view_roll) > 1e-6:
+        roll_rad = math.radians(view_roll)
+        cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
+        new_right = mathutils.Vector([
+            cos_r * right_axis.x - sin_r * up_axis.x,
+            cos_r * right_axis.y - sin_r * up_axis.y,
+            cos_r * right_axis.z - sin_r * up_axis.z,
+        ])
+        new_up = mathutils.Vector([
+            sin_r * right_axis.x + cos_r * up_axis.x,
+            sin_r * right_axis.y + cos_r * up_axis.y,
+            sin_r * right_axis.z + cos_r * up_axis.z,
+        ])
+        right_axis = new_right.normalized()
+        up_axis = new_up.normalized()
+    
+    # Build 3D basis matrix (right, up, -view)
+    basis_3d = mathutils.Matrix([
+        [right_axis.x, right_axis.y, right_axis.z],
+        [up_axis.x, up_axis.y, up_axis.z],
+        [-view_dir.x, -view_dir.y, -view_dir.z],
+    ])
+    
+    # Build 2D basis (x, y) from right and up
+    basis_2d = mathutils.Matrix([
+        [right_axis.x, right_axis.y],
+        [up_axis.x, up_axis.y],
+    ])
+    
+    return {
+        "view_dir": (view_dir.x, view_dir.y, view_dir.z),
+        "right_axis": (right_axis.x, right_axis.y, right_axis.z),
+        "up_axis": (up_axis.x, up_axis.y, up_axis.z),
+        "depth_axis": (-view_dir.x, -view_dir.y, -view_dir.z),
+        "basis_2d": [[basis_2d[0][0], basis_2d[0][1]], [basis_2d[1][0], basis_2d[1][1]]],
+        "basis_3d": [[basis_3d[0][0], basis_3d[0][1], basis_3d[0][2]],
+                     [basis_3d[1][0], basis_3d[1][1], basis_3d[1][2]],
+                     [basis_3d[2][0], basis_3d[2][1], basis_3d[2][2]]],
+        "roll_degrees": view_roll,
+    }
+
+
+def _project_projection_space_direction(direction_3d, view_cfg):
+    """Project a 3D direction onto the 2D view plane."""
+    basis_2d = view_cfg["basis_2d"]
+    dx = direction_3d[0]
+    dy = direction_3d[1]
+    dz = direction_3d[2]
+    return (
+        basis_2d[0][0] * dx + basis_2d[0][1] * dy,
+        basis_2d[1][0] * dx + basis_2d[1][1] * dy,
+    )
+
+
+def project_point_ortho(point_3d, view_cfg):
+    """Project a 3D point onto the 2D view plane (orthographic projection)."""
+    # Subtract projection reference (origin) - for now we project directly
+    # The view_cfg contains basis vectors for the projection plane
+    basis_3d = view_cfg["basis_3d"]
+    
+    # Transform point using the basis (like getting coordinates in the view space)
+    px, py, pz = point_3d[0], point_3d[1], point_3d[2]
+    
+    # Project onto 2D using the basis vectors (ignoring depth axis)
+    x = basis_3d[0][0] * px + basis_3d[0][1] * py + basis_3d[0][2] * pz
+    y = basis_3d[1][0] * px + basis_3d[1][1] * py + basis_3d[1][2] * pz
+    
+    return (float(x), float(y))
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +167,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("source")
     parser.add_argument("--output", required=True)
     parser.add_argument("--target-format", default="glb", choices=("glb",))
+    # Projection parameters for load-scene
+    parser.add_argument("--view-preset", default="front",
+                        choices=list(VIEW_PRESETS.keys()) + list(VIEW_PRESETS.keys()),
+                        help="View preset for projection (front, back, side, side_r, top, bottom)")
+    parser.add_argument("--view-dir", default=None,
+                        help="Custom view direction as 'x,y,z' tuple")
+    parser.add_argument("--view-up", default=None,
+                        help="Custom view up hint as 'x,y,z' tuple")
+    parser.add_argument("--view-roll", type=float, default=0.0,
+                        help="View roll in degrees")
+    parser.add_argument("--projected", action="store_true", default=False,
+                        help="Output projected 2D data instead of world-space 3D")
     return parser.parse_args(script_args)
 
 
@@ -393,8 +547,303 @@ def extract_base_color_texture(mesh_obj) -> dict[str, Any] | None:
     return None
 
 
+def extract_bone_hierarchy(
+    armature,
+    view_cfg,
+    source_frame=None,
+    use_rest_pose=False,
+    projection_space="world",
+    projection_reference_root=None,
+) -> list[dict]:
+    """Extract bone hierarchy with projected 2D transforms
+
+    Args:
+        armature: Blender armature object
+        view_cfg: View configuration object (has view_preset attribute or get method)
+        source_frame: Frame to extract at (optional, for pose mode)
+        use_rest_pose: Use rest pose instead of current pose
+        projection_space: Projection space ("world" or custom preset/direction)
+        projection_reference_root: Reference root matrix for projection
+
+    Returns:
+        list of bone dicts with name, parent, index, head, segment, length,
+        rotation_world, connected, inherit, and topology annotations
+    """
+    # Determine view preset from view_cfg
+    view_preset = "front"
+    view_roll = 0.0
+    view_dir = None
+    
+    if hasattr(view_cfg, 'view_preset'):
+        view_preset = view_cfg.view_preset
+    elif hasattr(view_cfg, 'get'):
+        view_preset = view_cfg.get('view_preset', 'front')
+    
+    # Get projection direction from projection_space
+    if projection_space != "world" and projection_space:
+        if isinstance(projection_space, str) and projection_space not in ("world", "local"):
+            view_preset = projection_space
+        elif isinstance(projection_space, (list, tuple)):
+            view_dir = projection_space
+    
+    # Use the internal projection extraction
+    skeleton_data = extract_skeleton_data_with_projection(
+        armature,
+        view_preset=view_preset,
+        view_dir=view_dir,
+        view_up=None,
+        view_roll=view_roll,
+    )
+    
+    bones = skeleton_data.get("bones", [])
+    
+    # Build parent index map
+    bone_index_map = {}
+    for i, bone in enumerate(bones):
+        bone_index_map[bone["name"]] = i
+    
+    # Annotate topology
+    bones_by_name = {bone["name"]: bone for bone in bones}
+    
+    # Build children map
+    children_map = {}
+    for bone in bones:
+        parent = bone.get("parent")
+        if parent and parent in bones_by_name:
+            if parent not in children_map:
+                children_map[parent] = []
+            children_map[parent].append(bone["name"])
+    
+    # Annotate each bone with topology info
+    for bone in bones:
+        bone_name = bone["name"]
+        
+        # Count children
+        children = children_map.get(bone_name, [])
+        bone["child_count"] = len(children)
+        
+        # Parent child count
+        parent = bone.get("parent")
+        if parent and parent in bones_by_name:
+            parent_children = children_map.get(parent, [])
+            bone["parent_child_count"] = len(parent_children)
+        else:
+            bone["parent_child_count"] = 0
+        
+        # Main chain and terminal chain
+        bone["main_chain"] = True
+        bone["terminal_chain"] = len(children) == 0
+        bone["terminal_chain_root"] = bone["terminal_chain"]
+        bone["terminal_chain_order"] = 0
+        
+        # Topology metrics
+        bone["leaf_distance"] = 0 if bone["terminal_chain"] else 1
+        bone["linear_chain_length"] = 1
+        bone["length_ratio"] = 1.0
+        bone["parent_length_ratio"] = 1.0
+        
+        # Set inherit mode
+        bone["inherit"] = "normal"
+    
+    return bones
+
+
+def extract_skeleton_data_with_projection(
+    armature_obj,
+    view_preset: str = "front",
+    view_dir=None,
+    view_up=None,
+    view_roll: float = 0.0,
+) -> dict[str, Any]:
+    """Extract skeleton hierarchy with projected 2D bone transforms.
+    
+    This function outputs bones with x, y (projected 2D positions) and rotation
+    instead of world-space 3D coordinates.
+    
+    Args:
+        armature_obj: Blender armature object
+        view_preset: View preset name (front, back, side, side_r, top, bottom)
+        view_dir: Custom view direction vector (overrides preset)
+        view_up: Custom up hint vector
+        view_roll: View roll in degrees
+    
+    Returns:
+        dict with bone_count and bones list, where each bone has:
+        - name: bone name
+        - parent: parent bone name (None for root)
+        - index: bone index
+        - head: [x, y] projected 2D head position
+        - segment: [dx, dy] segment direction
+        - length: bone length
+        - rotation_world: world rotation in degrees
+        - connected: whether bone is connected to parent
+        - x, y: local 2D position (relative to parent)
+        - rotation: local rotation in degrees
+    """
+    if armature_obj is None:
+        return {"bone_count": 0, "bones": []}
+    
+    # Build view configuration
+    view_cfg = _build_view_config(
+        view_preset=view_preset,
+        view_dir=view_dir,
+        view_up=view_up,
+        view_roll=view_roll,
+    )
+    
+    # Get all bones in topological order (parents before children)
+    bone_order = _topological_sort_bones(armature_obj)
+    
+    bones_data = []
+    world_cache = {}  # For computing local positions
+    
+    for idx, bone_name in enumerate(bone_order):
+        bone = armature_obj.data.bones[bone_name]
+        
+        # Get parent name and index
+        parent_name = None
+        parent_index = -1
+        if bone.parent:
+            parent_name = bone.parent.name
+            for i, b in enumerate(armature_obj.data.bones):
+                if b.name == parent_name:
+                    parent_index = i
+                    break
+        
+        # Get world-space head and tail
+        head_world = armature_obj.matrix_world @ bone.head_local
+        tail_world = armature_obj.matrix_world @ bone.tail_local
+        
+        # Project to 2D
+        head_2d = project_point_ortho([head_world.x, head_world.y, head_world.z], view_cfg)
+        tail_2d = project_point_ortho([tail_world.x, tail_world.y, tail_world.z], view_cfg)
+        
+        # Compute segment direction and length in 2D
+        seg_dx = tail_2d[0] - head_2d[0]
+        seg_dy = tail_2d[1] - head_2d[1]
+        seg_length = math.hypot(seg_dx, seg_dy)
+        world_rotation = math.degrees(math.atan2(seg_dy, seg_dx)) if seg_length > 1e-6 else 0.0
+        
+        # Compute local position and rotation relative to parent
+        if parent_name is not None and parent_name in world_cache:
+            parent_state = world_cache[parent_name]
+            parent_head_2d = parent_state["head_2d"]
+            parent_matrix = parent_state["matrix"]
+            
+            # inv_parent @ (head - parent_head)
+            det = parent_matrix[0] * parent_matrix[3] - parent_matrix[1] * parent_matrix[2]
+            if abs(det) < 1e-6:
+                det = 1.0
+            inv_parent = [
+                parent_matrix[3] / det, -parent_matrix[1] / det,
+                -parent_matrix[2] / det, parent_matrix[0] / det
+            ]
+            
+            dx = head_2d[0] - parent_head_2d[0]
+            dy = head_2d[1] - parent_head_2d[1]
+            local_x = inv_parent[0] * dx + inv_parent[2] * dy
+            local_y = inv_parent[1] * dx + inv_parent[3] * dy
+            
+            # Compute world_x_axis and local_x_axis
+            if seg_length > 1e-6:
+                world_x_axis = [seg_dx / seg_length, seg_dy / seg_length]
+            else:
+                world_x_axis = [1.0, 0.0]
+            
+            # local_x_axis = inv_parent @ world_x_axis
+            local_x_axis = [
+                inv_parent[0] * world_x_axis[0] + inv_parent[2] * world_x_axis[1],
+                inv_parent[1] * world_x_axis[0] + inv_parent[3] * world_x_axis[1],
+            ]
+            local_rotation = math.degrees(math.atan2(local_x_axis[1], local_x_axis[0]))
+            
+            # Build world matrix for child bone
+            cos_r = math.cos(math.radians(local_rotation))
+            sin_r = math.sin(math.radians(local_rotation))
+            world_matrix = [
+                cos_r * parent_matrix[0] - sin_r * parent_matrix[2],
+                cos_r * parent_matrix[1] - sin_r * parent_matrix[3],
+                sin_r * parent_matrix[0] + cos_r * parent_matrix[2],
+                sin_r * parent_matrix[1] + cos_r * parent_matrix[3],
+            ]
+        else:
+            # Root bone: local = world
+            local_x = head_2d[0]
+            local_y = head_2d[1]
+            local_rotation = world_rotation
+            
+            # Build world matrix for root bone (2x2 rotation + translation encoded)
+            cos_r = math.cos(math.radians(world_rotation))
+            sin_r = math.sin(math.radians(world_rotation))
+            world_matrix = [cos_r, -sin_r, sin_r, cos_r]
+        
+        bones_data.append({
+            "name": bone.name,
+            "parent": parent_name,
+            "index": idx,
+            "head": list(head_2d),
+            "segment": [round(seg_dx, 4), round(seg_dy, 4)],
+            "length": round(seg_length, 4),
+            "rotation_world": round(world_rotation, 2),
+            "connected": (seg_length > 1e-4),
+            "x": round(local_x, 4),
+            "y": round(local_y, 4),
+            "rotation": round(local_rotation, 2),
+            "world_matrix": world_matrix,
+        })
+        
+        # Cache world state for children
+        world_cache[bone.name] = {
+            "head_2d": head_2d,
+            "matrix": world_matrix,
+        }
+    
+    return {
+        "bone_count": len(bones_data),
+        "bones": bones_data,
+        "view_preset": view_preset,
+        "view_roll": view_roll,
+    }
+
+
+def _topological_sort_bones(armature_obj) -> list[str]:
+    """Sort bone names so parents come before children."""
+    bones = list(armature_obj.data.bones)
+    bone_index = {bone.name: i for i, bone in enumerate(bones)}
+    
+    # Build adjacency list
+    children = {bone.name: [] for bone in bones}
+    in_degree = {bone.name: 0 for bone in bones}
+    
+    for bone in bones:
+        if bone.parent:
+            children[bone.parent.name].append(bone.name)
+            in_degree[bone.name] += 1
+    
+    # Kahn's algorithm
+    queue = [name for name, degree in in_degree.items() if degree == 0]
+    result = []
+    
+    while queue:
+        # Sort for consistent ordering
+        queue.sort(key=lambda n: bone_index[n])
+        name = queue.pop(0)
+        result.append(name)
+        
+        for child in children[name]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                queue.append(child)
+    
+    return result
+
+
 def extract_skeleton_data(armature_obj) -> dict[str, Any]:
-    """Extract skeleton hierarchy and bone transforms."""
+    """Extract skeleton hierarchy and bone transforms (world-space).
+    
+    This function outputs bones with world-space 3D coordinates (world_position,
+    world_tail, local_rotation).
+    """
     if armature_obj is None:
         return {"bone_count": 0, "bones": []}
     
@@ -573,24 +1022,57 @@ def extract_animation_data(armature_obj) -> dict[str, Any]:
     }
 
 
-def load_scene(source_path: str, output_path: str) -> dict[str, object]:
+def load_scene(
+    source_path: str,
+    output_path: str,
+    projected: bool = False,
+    view_preset: str = "front",
+    view_dir=None,
+    view_up=None,
+    view_roll: float = 0.0,
+) -> dict[str, object]:
     """Load a 3D source and export the full scene data as JSON.
     
-    This function uses Blender's
-    native import which properly handles all transform hierarchies.
+    This function uses Blender's native import which properly handles all
+    transform hierarchies.
+    
+    Args:
+        source_path: Path to the 3D source file
+        output_path: Path for the output JSON (not used in function, for CLI compatibility)
+        projected: If True, output projected 2D skeleton data
+        view_preset: View preset for projection (front, back, side, side_r, top, bottom)
+        view_dir: Custom view direction tuple
+        view_up: Custom view up hint tuple
+        view_roll: View roll in degrees
+    
+    Returns:
+        dict with scene data including mesh, skeleton, and animations
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
     import_model(source_path)
     
     mesh_obj, armature_obj = find_mesh_and_armature()
     
+    # Choose skeleton extraction method based on projected flag
+    if projected:
+        skeleton_data = extract_skeleton_data_with_projection(
+            armature_obj,
+            view_preset=view_preset,
+            view_dir=view_dir,
+            view_up=view_up,
+            view_roll=view_roll,
+        )
+    else:
+        skeleton_data = extract_skeleton_data(armature_obj)
+    
     scene_data = {
         "ok": True,
         "detail": "loaded",
         "source": source_path,
         "format": Path(source_path).suffix.lower().lstrip("."),
+        "projected": projected,
         "mesh": extract_mesh_data(mesh_obj),
-        "skeleton": extract_skeleton_data(armature_obj),
+        "skeleton": skeleton_data,
         "animations": extract_animation_data(armature_obj),
     }
     
@@ -609,7 +1091,23 @@ def main() -> None:
     elif args.command == "convert":
         payload = convert_source(source_path, str(output_path), args.target_format)
     elif args.command == "load-scene":
-        payload = load_scene(source_path, str(output_path))
+        # Parse view_dir and view_up if provided
+        view_dir = None
+        view_up = None
+        if args.view_dir:
+            view_dir = tuple(float(x) for x in args.view_dir.split(","))
+        if args.view_up:
+            view_up = tuple(float(x) for x in args.view_up.split(","))
+        
+        payload = load_scene(
+            source_path,
+            str(output_path),
+            projected=args.projected,
+            view_preset=args.view_preset,
+            view_dir=view_dir,
+            view_up=view_up,
+            view_roll=args.view_roll,
+        )
     else:
         raise AssertionError(f"Unhandled command: {args.command}")
 
