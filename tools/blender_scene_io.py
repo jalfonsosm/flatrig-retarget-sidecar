@@ -1254,6 +1254,7 @@ def get_action_fcurves(action) -> list:
         return list(fcurves)
     
     # Blender 5.0+ layered animation system
+    all_fcurves = []
     if hasattr(action, "layers"):
         for layer in action.layers:
             if hasattr(layer, "strips"):
@@ -1262,9 +1263,8 @@ def get_action_fcurves(action) -> list:
                         for channelbag in strip.channelbags:
                             fc = getattr(channelbag, "fcurves", None)
                             if fc is not None and len(fc) > 0:
-                                return list(fc)
-    
-    return []
+                                all_fcurves.extend(list(fc))
+    return all_fcurves
 
 
 def extract_animation_data(armature_obj) -> dict[str, Any]:
