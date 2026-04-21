@@ -12,9 +12,11 @@ from typing import Any, Optional
 try:
     import bpy
     import mathutils
+    import bmesh
 except ImportError:
     bpy = None
     mathutils = None
+    bmesh = None
 import numpy as np
 
 # ============================================================================
@@ -187,6 +189,139 @@ def _transform_point_to_projection_space(point_3d, projection_inverse=None):
     return transformed
 
 
+def point_depth(point_3d, view_cfg, projection_inverse=None):
+    """Return a scalar depth where larger values are closer to the camera."""
+    projected = _transform_point_to_projection_space(
+        point_3d,
+        projection_inverse=projection_inverse,
+    )
+    return float(np.dot(projected, np.asarray(view_cfg["depth_axis"], dtype=np.float64)))
+
+
+def compute_projection_frame(points_2d, margin=0.06):
+    """Build a square projection frame around a set of 2D points."""
+    points_2d = np.asarray(points_2d, dtype=np.float64)
+    if points_2d.ndim == 1:
+        points_2d = points_2d[np.newaxis, :]
+    
+    min_x = float(np.min(points_2d[:, 0]))
+    max_x = float(np.max(points_2d[:, 0]))
+    min_y = float(np.min(points_2d[:, 1]))
+    max_y = float(np.max(points_2d[:, 1]))
+    
+    width = max_x - min_x
+    height = max_y - min_y
+    size = max(width, height)
+    half = size * 0.5 * (1.0 + margin)
+    
+    center_x = (min_x + max_x) * 0.5
+    center_y = (min_y + max_y) * 0.5
+    
+    return {
+        "min_x": round(center_x - half, 6),
+        "min_y": round(center_y - half, 6),
+        "size": round(size * (1.0 + margin), 6),
+    }
+
+
+def project_points_to_uv(points_2d, frame):
+    """Map projected 2D points to UVs inside the given projection frame."""
+    points_2d = np.asarray(points_2d, dtype=np.float64)
+    if points_2d.ndim == 1:
+        points_2d = points_2d[np.newaxis, :]
+    
+    size = float(frame["size"])
+    if size < 1e-6:
+        return np.zeros((len(points_2d), 2), dtype=np.float64)
+    
+    u = (points_2d[:, 0] - frame["min_x"]) / size
+    v = (points_2d[:, 1] - frame["min_y"]) / size
+    
+    uvs = np.column_stack((u, v))
+    return uvs
+
+
+def extract_2d_mesh(
+    mesh_obj,
+    view_cfg,
+    projection_frame=None,
+    source_frame=None,
+    projection_inverse=None,
+):
+    """Extract the bind-pose mesh projected to 2D.∫
+    """
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    if source_frame is None:
+        source_frame = scene.frame_start
+    scene.frame_set(source_frame)
+    depsgraph.update()
+    
+    eval_obj = mesh_obj.evaluated_get(depsgraph)
+    eval_mesh = eval_obj.to_mesh()
+    world_mat = eval_obj.matrix_world
+    
+    # Extract vertices in world space
+    vertices_3d = np.empty((len(eval_mesh.vertices), 3), dtype=np.float64)
+    for index, vert in enumerate(eval_mesh.vertices):
+        world_co = world_mat @ vert.co
+        vertices_3d[index] = (world_co.x, world_co.y, world_co.z)
+    
+    # Project to 2D
+    vertices_2d_list = []
+    for i in range(len(vertices_3d)):
+        pt = vertices_3d[i]
+        projected = _transform_point_to_projection_space(pt, projection_inverse=projection_inverse)
+        basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
+        proj_2d = basis_2d @ projected
+        vertices_2d_list.append([proj_2d[0], proj_2d[1]])
+    vertices_2d = np.array(vertices_2d_list, dtype=np.float64)
+    
+    if projection_frame is None:
+        projection_frame = compute_projection_frame(vertices_2d)
+    uvs = project_points_to_uv(vertices_2d, projection_frame)
+    
+    # Compute depths
+    depths = np.array(
+        [point_depth(vertices_3d[i], view_cfg, projection_inverse=projection_inverse) for i in range(len(vertices_3d))],
+        dtype=np.float64,
+    )
+    
+    # Triangulate mesh
+    bm = bmesh.new()
+    bm.from_mesh(eval_mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    
+    triangles = []
+    triangle_keys = []
+    for face in bm.faces:
+        tri = [vert.index for vert in face.verts]
+        triangles.append(tri)
+        triangle_keys.append(tuple(sorted(tri)))
+    bm.free()
+    eval_obj.to_mesh_clear()
+    
+    # Extract vertex groups (weights)
+    vertex_groups = {}
+    group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
+    
+    for vert in mesh_obj.data.vertices:
+        for group in vert.groups:
+            group_name = group_names.get(group.group, f"group_{group.group}")
+            vertex_groups.setdefault(group_name, []).append((vert.index, group.weight))
+    
+    return {
+        "vertices_2d": vertices_2d.tolist(),
+        "vertices_3d": vertices_3d.tolist(),
+        "triangles": triangles,
+        "triangle_keys": triangle_keys,
+        "uvs": uvs.tolist(),
+        "depths": depths.tolist(),
+        "vertex_groups": vertex_groups,
+        "projection_frame": projection_frame,
+    }
+
+
 def parse_args() -> argparse.Namespace:
     try:
         separator_index = sys.argv.index("--")
@@ -195,7 +330,7 @@ def parse_args() -> argparse.Namespace:
         script_args = []
 
     parser = argparse.ArgumentParser(description="Inspect or convert 3D sources for flatRig.")
-    parser.add_argument("command", choices=("inspect", "convert", "extract-bone-hierarchy"))
+    parser.add_argument("command", choices=("inspect", "convert", "extract-bone-hierarchy", "extract-2d-mesh"))
     parser.add_argument("source")
     parser.add_argument("--output", required=True)
     parser.add_argument("--target-format", default="glb", choices=("glb",))
@@ -1002,6 +1137,53 @@ def extract_bone_hierarchy(
 
     return bones
 
+
+def extract_2d_mesh_cli(
+    source_path: str,
+    output_path: str,
+    view_preset: str = "front",
+    view_dir=None,
+    view_up=None,
+    view_roll: float = 0.0,
+    source_frame: int = None,
+) -> dict[str, object]:
+    """CLI wrapper for extract_2d_mesh that matches Python's pipeline.
+    
+    This function imports the model, finds the mesh and armature, and calls extract_2d_mesh
+    to get the proper 2D mesh projection that Python uses.
+    """
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+    
+    mesh_obj, armature_obj = find_mesh_and_armature()
+    if mesh_obj is None:
+        return {"ok": False, "detail": "No mesh found in scene"}
+    
+    # Build view configuration
+    view_cfg = _build_view_config(
+        view_preset=view_preset,
+        view_dir=view_dir,
+        view_up=view_up,
+        view_roll=view_roll,
+    )
+    
+    # Call extract_2d_mesh (same as Python pipeline)
+    mesh_data = extract_2d_mesh(
+        mesh_obj,
+        view_cfg,
+        source_frame=source_frame,
+    )
+    
+    return {
+        "ok": True,
+        "detail": "extracted",
+        "source": source_path,
+        "view_preset": view_preset,
+        "view_roll": view_roll,
+        "mesh": mesh_data,
+    }
+
+
 def extract_bone_hierarchy_cli(
     source_path: str,
     output_path: str,
@@ -1072,6 +1254,24 @@ def main() -> None:
             view_up = tuple(float(x) for x in args.view_up.split(","))
         
         payload = extract_bone_hierarchy_cli(
+            source_path,
+            str(output_path),
+            view_preset=args.view_preset,
+            view_dir=view_dir,
+            view_up=view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+        )
+    elif args.command == "extract-2d-mesh":
+        # Parse view_dir and view_up if provided
+        view_dir = None
+        view_up = None
+        if args.view_dir:
+            view_dir = tuple(float(x) for x in args.view_dir.split(","))
+        if args.view_up:
+            view_up = tuple(float(x) for x in args.view_up.split(","))
+        
+        payload = extract_2d_mesh_cli(
             source_path,
             str(output_path),
             view_preset=args.view_preset,
