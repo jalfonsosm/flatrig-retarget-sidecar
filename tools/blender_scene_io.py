@@ -9,8 +9,12 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-import bpy
-import mathutils
+try:
+    import bpy
+    import mathutils
+except ImportError:
+    bpy = None
+    mathutils = None
 import numpy as np
 
 # ============================================================================
