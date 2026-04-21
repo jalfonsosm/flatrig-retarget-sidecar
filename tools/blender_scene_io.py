@@ -11,11 +11,18 @@ from typing import Any, Optional
 
 import bpy
 import mathutils
-
+import numpy as np
 
 # ============================================================================
-# View Configuration and Projection Helpers
+# Constants
 # ============================================================================
+
+SEGMENT_EPSILON = 1e-8
+TERMINAL_CHAIN_ROOT_RATIO = 0.6
+TERMINAL_CHAIN_MAX_LENGTH_RATIO = 0.8
+TERMINAL_CHAIN_PARENT_RATIO = 1.5
+TERMINAL_CHAIN_MAX_SPAN = 6
+VECTOR_EPSILON = 1e-8
 
 VIEW_PRESETS = {
     "front": {
@@ -139,20 +146,33 @@ def _project_projection_space_direction(direction_3d, view_cfg):
     )
 
 
-def project_point_ortho(point_3d, view_cfg):
-    """Project a 3D point onto the 2D view plane (orthographic projection)."""
-    # Subtract projection reference (origin) - for now we project directly
-    # The view_cfg contains basis vectors for the projection plane
-    basis_3d = view_cfg["basis_3d"]
+def project_point_ortho(point_3d, view_cfg, projection_inverse=None):
+    """Project a 3D point into the configured 2D plane.
+    """
+    projected = _transform_point_to_projection_space(
+        point_3d,
+        projection_inverse=projection_inverse,
+    )
+    projected_2d = _project_projection_space_direction(projected, view_cfg)
+    return (float(projected_2d[0]), float(projected_2d[1]))
+
+
+def _transform_point_to_projection_space(point_3d, projection_inverse=None):
+    """Transform world-space point into projection space."""
+    point_3d = np.asarray(point_3d, dtype=np.float64)
+    if projection_inverse is None:
+        return point_3d
     
-    # Transform point using the basis (like getting coordinates in the view space)
-    px, py, pz = point_3d[0], point_3d[1], point_3d[2]
-    
-    # Project onto 2D using the basis vectors (ignoring depth axis)
-    x = basis_3d[0][0] * px + basis_3d[0][1] * py + basis_3d[0][2] * pz
-    y = basis_3d[1][0] * px + basis_3d[1][1] * py + basis_3d[1][2] * pz
-    
-    return (float(x), float(y))
+    point_h = np.concatenate(
+        (point_3d, np.array((1.0,), dtype=np.float64)),
+        axis=0,
+    )
+    projection_inverse = np.asarray(projection_inverse, dtype=np.float64)
+    if projection_inverse.ndim == 2:
+        transformed = projection_inverse @ point_h
+    else:
+        transformed = np.einsum("ij,j->i", projection_inverse, point_h)
+    return transformed[:3]
 
 
 def parse_args() -> argparse.Namespace:
@@ -547,6 +567,318 @@ def extract_base_color_texture(mesh_obj) -> dict[str, Any] | None:
     return None
 
 
+# ============================================================================
+# Projection Helpers
+# ============================================================================
+
+def _find_root_bone_name(armature):
+    """Find the root bone name (bone with no parent)."""
+    for bone in armature.data.bones:
+        if bone.parent is None:
+            return bone.name
+    return None
+
+
+def get_projection_reference_inverse(
+    armature,
+    projection_space="world",
+    use_rest_pose=False,
+    root_bone_name=None,
+    reference_root_matrix=None,
+):
+    """Return the inverse transform for the requested projection space."""
+    if projection_space != "root" or armature is None:
+        return None
+    
+    if root_bone_name is None:
+        root_bone_name = _find_root_bone_name(armature)
+    if root_bone_name is None:
+        return None
+    
+    if use_rest_pose:
+        root_bone = armature.data.bones[root_bone_name]
+        current_matrix = armature.matrix_world @ root_bone.matrix_local
+    else:
+        root_bone = armature.pose.bones[root_bone_name]
+        current_matrix = armature.matrix_world @ root_bone.matrix
+    
+    current_matrix = np.array(current_matrix, dtype=np.float64)
+    
+    if reference_root_matrix is None:
+        reference_root_matrix = current_matrix
+    else:
+        reference_root_matrix = np.asarray(reference_root_matrix, dtype=np.float64)
+    
+    current_rotation = _orthonormalize_3x3(current_matrix[:3, :3])
+    reference_rotation = _orthonormalize_3x3(reference_root_matrix[:3, :3])
+    projection_matrix = np.eye(4, dtype=np.float64)
+    projection_matrix[:3, :3] = current_rotation @ reference_rotation.T
+    projection_matrix[:3, 3] = current_matrix[:3, 3]
+    
+    return np.linalg.inv(projection_matrix)
+
+
+def _orthonormalize_3x3(matrix):
+    """Extract the closest rigid rotation from a 3x3 transform."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    x_axis = matrix[:3, 0]
+    y_axis = matrix[:3, 1]
+    
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm <= VECTOR_EPSILON:
+        x_axis = np.array((1.0, 0.0, 0.0), dtype=np.float64)
+    else:
+        x_axis = x_axis / x_norm
+    
+    z_axis = np.cross(x_axis, y_axis)
+    z_norm = float(np.linalg.norm(z_axis))
+    if z_norm <= VECTOR_EPSILON:
+        z_axis = np.array((0.0, 0.0, 1.0), dtype=np.float64)
+    else:
+        z_axis = z_axis / z_norm
+    
+    y_axis = np.cross(z_axis, x_axis)
+    det = float(np.linalg.norm(y_axis))
+    if det <= VECTOR_EPSILON:
+        y_axis = np.array((0.0, 1.0, 0.0), dtype=np.float64)
+    
+    orthonormal = np.eye(3, dtype=np.float64)
+    orthonormal[:3, 0] = x_axis
+    orthonormal[:3, 1] = y_axis
+    orthonormal[:3, 2] = z_axis
+    
+    return orthonormal
+
+
+# ============================================================================
+# Skeleton Helpers
+# ============================================================================
+
+def _safe_inverse_2x2(matrix):
+    """Invert a 2x2 matrix, falling back to the identity for degenerate cases."""
+    det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
+    if abs(det) <= SEGMENT_EPSILON:
+        return np.eye(2, dtype=np.float64)
+    return np.linalg.inv(matrix)
+
+
+def _orthonormalize_2x2(matrix):
+    """Orthonormalize a 2x2 matrix preserving handedness."""
+    det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
+    x_axis = np.array((matrix[0, 0], matrix[1, 0]), dtype=np.float64)
+    x_norm = float(np.linalg.norm(x_axis))
+    if x_norm <= SEGMENT_EPSILON:
+        x_axis = np.array((1.0, 0.0), dtype=np.float64)
+    else:
+        x_axis = x_axis / x_norm
+    y_axis = np.array((-x_axis[1], x_axis[0]), dtype=np.float64)
+    if det < 0.0:
+        y_axis = -y_axis
+    return np.array(
+        [[x_axis[0], y_axis[0]], [x_axis[1], y_axis[1]]],
+        dtype=np.float64,
+    )
+
+
+def _build_2d_basis(rotation_deg, scale_x=1.0, scale_y=1.0):
+    """Build the 2x2 matrix for a local bone transform."""
+    rotation_rad = math.radians(rotation_deg)
+    cos_r = math.cos(rotation_rad)
+    sin_r = math.sin(rotation_rad)
+    return np.array(
+        [[cos_r * scale_x, -sin_r * scale_y], [sin_r * scale_x, cos_r * scale_y]],
+        dtype=np.float64,
+    )
+
+
+def _normalize_angle(angle):
+    """Normalize an angle to the [-180, 180] range."""
+    while angle > 180:
+        angle -= 360
+    while angle < -180:
+        angle += 360
+    return angle
+
+
+def _bone_is_connected(rest_bone, epsilon=1e-4):
+    """Return True when a child bone is effectively attached to its parent's tail."""
+    if rest_bone.parent is None:
+        return False
+    if getattr(rest_bone, "use_connect", False):
+        return True
+    return (rest_bone.head_local - rest_bone.parent.tail_local).length <= epsilon
+
+
+def _topological_sort(armature):
+    """Sort bone names so parents always come before children."""
+    sorted_bones = []
+    visited = set()
+    
+    def visit(bone):
+        if bone.name in visited:
+            return
+        if bone.parent:
+            visit(bone.parent)
+        visited.add(bone.name)
+        sorted_bones.append(bone.name)
+    
+    for bone in armature.data.bones:
+        visit(bone)
+    
+    return sorted_bones
+
+
+def _default_inherit_mode(record):
+    """Determine inherit mode based on terminal chain status."""
+    if record.get("terminal_chain"):
+        return "NoScale"
+    return "Normal"
+
+
+def _basis_inverse_for_inherit(parent_state, inherit_mode):
+    """Get the basis inverse considering inherit mode."""
+    basis = parent_state["matrix"]
+    if inherit_mode == "NoScale":
+        basis = parent_state["rigid_matrix"]
+    return _safe_inverse_2x2(basis)
+
+
+def _compose_world_matrix(parent_state, local_rotation, scale_x, inherit_mode):
+    """Compose world matrix from parent state and local transform."""
+    parent_basis = parent_state["matrix"]
+    if inherit_mode == "NoScale":
+        parent_basis = parent_state["rigid_matrix"]
+    return parent_basis @ _build_2d_basis(local_rotation, scale_x=scale_x)
+
+
+def _should_start_terminal_chain(record, by_name, children):
+    """Determine if a bone should start a terminal chain."""
+    if record["parent"] is None:
+        return False
+    if record["child_count"] > 1:
+        return False
+    if record["linear_chain_length"] < 2:
+        return False
+    if record["length_ratio"] > TERMINAL_CHAIN_ROOT_RATIO:
+        return False
+    
+    parent = by_name[record["parent"]]
+    if record["parent_child_count"] <= 1 and record["parent_length_ratio"] < TERMINAL_CHAIN_PARENT_RATIO:
+        return False
+    if parent["length_ratio"] <= record["length_ratio"] and record["parent_child_count"] <= 1:
+        return False
+    return True
+
+
+def _annotate_bone_topology(records):
+    """Attach generic topology metadata to bone records."""
+    by_name = {record["name"]: record for record in records}
+    children = {record["name"]: [] for record in records}
+    for record in records:
+        if record["parent"]:
+            children[record["parent"]].append(record["name"])
+    
+    positive_lengths = sorted(record["length"] for record in records if record["length"] > SEGMENT_EPSILON)
+    median_length = float(np.median(positive_lengths)) if positive_lengths else 1.0
+    median_length = max(median_length, SEGMENT_EPSILON)
+    best_path_cache = {}
+    
+    leaf_cache = {}
+    linear_cache = {}
+    
+    def leaf_distance(name):
+        if name in leaf_cache:
+            return leaf_cache[name]
+        kids = children[name]
+        if not kids:
+            leaf_cache[name] = 0
+        else:
+            leaf_cache[name] = 1 + min(leaf_distance(child) for child in kids)
+        return leaf_cache[name]
+    
+    def linear_chain_length(name):
+        if name in linear_cache:
+            return linear_cache[name]
+        kids = children[name]
+        if len(kids) != 1:
+            linear_cache[name] = 1
+        else:
+            linear_cache[name] = 1 + linear_chain_length(kids[0])
+        return linear_cache[name]
+    
+    def best_path(name):
+        if name in best_path_cache:
+            return best_path_cache[name]
+        own_length = max(float(by_name[name]["length"]), 0.0)
+        kids = children[name]
+        if not kids:
+            best_path_cache[name] = ([name], own_length)
+            return best_path_cache[name]
+        
+        best_child_path = []
+        best_child_score = -1.0
+        for child_name in kids:
+            child_path, child_score = best_path(child_name)
+            if child_score > best_child_score:
+                best_child_path = child_path
+                best_child_score = child_score
+        best_path_cache[name] = ([name] + best_child_path, own_length + max(best_child_score, 0.0))
+        return best_path_cache[name]
+    
+    for record in records:
+        name = record["name"]
+        parent = by_name.get(record["parent"])
+        record["child_count"] = len(children[name])
+        record["parent_child_count"] = len(children[parent["name"]]) if parent else 0
+        record["leaf_distance"] = leaf_distance(name)
+        record["linear_chain_length"] = linear_chain_length(name)
+        record["length_ratio"] = record["length"] / median_length if median_length else 1.0
+        if parent and record["length"] > SEGMENT_EPSILON:
+            record["parent_length_ratio"] = parent["length"] / record["length"]
+        else:
+            record["parent_length_ratio"] = 1.0
+        record["main_chain"] = False
+        record["terminal_chain"] = False
+        record["terminal_chain_root"] = False
+        record["terminal_chain_order"] = -1
+    
+    roots = [record["name"] for record in records if record["parent"] is None]
+    best_root_path = []
+    best_root_score = -1.0
+    for root_name in roots:
+        path, score = best_path(root_name)
+        if score > best_root_score:
+            best_root_path = path
+            best_root_score = score
+    main_chain_names = set(best_root_path)
+    for record in records:
+        record["main_chain"] = record["name"] in main_chain_names
+    
+    for record in records:
+        if record["terminal_chain"]:
+            continue
+        if not _should_start_terminal_chain(record, by_name, children):
+            continue
+        current_name = record["name"]
+        order = 0
+        while True:
+            current = by_name[current_name]
+            current["terminal_chain"] = True
+            current["terminal_chain_root"] = order == 0
+            current["terminal_chain_order"] = order
+            kids = children[current_name]
+            if len(kids) != 1 or order + 1 >= TERMINAL_CHAIN_MAX_SPAN:
+                break
+            next_record = by_name[kids[0]]
+            if next_record["length_ratio"] > TERMINAL_CHAIN_MAX_LENGTH_RATIO:
+                break
+            current_name = next_record["name"]
+            order += 1
+    
+    for record in records:
+        record["inherit"] = _default_inherit_mode(record)
+
+
 def extract_bone_hierarchy(
     armature,
     view_cfg,
@@ -554,97 +886,125 @@ def extract_bone_hierarchy(
     use_rest_pose=False,
     projection_space="world",
     projection_reference_root=None,
-) -> list[dict]:
-    """Extract bone hierarchy with projected 2D transforms
+):
+    """Extract bones in setup pose and project to 2D.
 
-    Args:
-        armature: Blender armature object
-        view_cfg: View configuration object (has view_preset attribute or get method)
-        source_frame: Frame to extract at (optional, for pose mode)
-        use_rest_pose: Use rest pose instead of current pose
-        projection_space: Projection space ("world" or custom preset/direction)
-        projection_reference_root: Reference root matrix for projection
-
-    Returns:
-        list of bone dicts with name, parent, index, head, segment, length,
-        rotation_world, connected, inherit, and topology annotations
+    Returns a list of bone dicts ordered so parents come before children.
     """
-    # Determine view preset from view_cfg
-    view_preset = "front"
-    view_roll = 0.0
-    view_dir = None
-    
-    if hasattr(view_cfg, 'view_preset'):
-        view_preset = view_cfg.view_preset
-    elif hasattr(view_cfg, 'get'):
-        view_preset = view_cfg.get('view_preset', 'front')
-    
-    # Get projection direction from projection_space
-    if projection_space != "world" and projection_space:
-        if isinstance(projection_space, str) and projection_space not in ("world", "local"):
-            view_preset = projection_space
-        elif isinstance(projection_space, (list, tuple)):
-            view_dir = projection_space
-    
-    # Use the internal projection extraction
-    skeleton_data = extract_skeleton_data_with_projection(
+    scene = bpy.context.scene
+    if source_frame is None:
+        source_frame = scene.frame_start
+    scene.frame_set(source_frame)
+    bpy.context.view_layer.update()
+    projection_inverse = get_projection_reference_inverse(
         armature,
-        view_preset=view_preset,
-        view_dir=view_dir,
-        view_up=None,
-        view_roll=view_roll,
+        projection_space=projection_space,
+        use_rest_pose=use_rest_pose,
+        reference_root_matrix=projection_reference_root,
     )
-    
-    bones = skeleton_data.get("bones", [])
-    
-    # Build parent index map
-    bone_index_map = {}
-    for i, bone in enumerate(bones):
-        bone_index_map[bone["name"]] = i
-    
-    # Annotate topology
-    bones_by_name = {bone["name"]: bone for bone in bones}
-    
-    # Build children map
-    children_map = {}
-    for bone in bones:
-        parent = bone.get("parent")
-        if parent and parent in bones_by_name:
-            if parent not in children_map:
-                children_map[parent] = []
-            children_map[parent].append(bone["name"])
-    
-    # Annotate each bone with topology info
-    for bone in bones:
-        bone_name = bone["name"]
-        
-        # Count children
-        children = children_map.get(bone_name, [])
-        bone["child_count"] = len(children)
-        
-        # Parent child count
-        parent = bone.get("parent")
-        if parent and parent in bones_by_name:
-            parent_children = children_map.get(parent, [])
-            bone["parent_child_count"] = len(parent_children)
+
+    bone_order = _topological_sort(armature)
+    records = []
+
+    for idx, bone_name in enumerate(bone_order):
+        pose_bone = armature.pose.bones[bone_name]
+        rest_bone = armature.data.bones[bone_name]
+
+        if use_rest_pose:
+            head_world = armature.matrix_world @ rest_bone.head_local
+            tail_world = armature.matrix_world @ rest_bone.tail_local
         else:
-            bone["parent_child_count"] = 0
-        
-        # Main chain and terminal chain
-        bone["main_chain"] = True
-        bone["terminal_chain"] = len(children) == 0
-        bone["terminal_chain_root"] = bone["terminal_chain"]
-        bone["terminal_chain_order"] = 0
-        
-        # Topology metrics
-        bone["leaf_distance"] = 0 if bone["terminal_chain"] else 1
-        bone["linear_chain_length"] = 1
-        bone["length_ratio"] = 1.0
-        bone["parent_length_ratio"] = 1.0
-        
-        # Set inherit mode
-        bone["inherit"] = "normal"
-    
+            head_world = armature.matrix_world @ pose_bone.head
+            tail_world = armature.matrix_world @ pose_bone.tail
+
+        head_2d = np.array(
+            project_point_ortho(head_world, view_cfg, projection_inverse=projection_inverse),
+            dtype=np.float64,
+        )
+        tail_2d = np.array(
+            project_point_ortho(tail_world, view_cfg, projection_inverse=projection_inverse),
+            dtype=np.float64,
+        )
+        segment = tail_2d - head_2d
+        length = float(np.linalg.norm(segment))
+        parent_name = rest_bone.parent.name if rest_bone.parent else None
+
+        records.append(
+            {
+                "name": bone_name,
+                "parent": parent_name,
+                "index": idx,
+                "head": head_2d,
+                "segment": segment,
+                "length": length,
+                "rotation_world": math.degrees(math.atan2(segment[1], segment[0]))
+                if length > SEGMENT_EPSILON
+                else 0.0,
+                "connected": _bone_is_connected(rest_bone),
+            }
+        )
+
+    _annotate_bone_topology(records)
+
+    bones = []
+    world_cache = {}
+
+    for record in records:
+        bone_name = record["name"]
+        head_vector = record["head"]
+        segment = record["segment"]
+        length = record["length"]
+        inherit_mode = record["inherit"]
+        parent_name = record["parent"]
+
+        if parent_name:
+            parent_state = world_cache[parent_name]
+            inv_parent = _safe_inverse_2x2(parent_state["matrix"])
+            local_position = inv_parent @ (head_vector - parent_state["head"])
+            if length > SEGMENT_EPSILON:
+                world_x_axis = segment / length
+            else:
+                world_x_axis = np.array((1.0, 0.0), dtype=np.float64)
+            local_basis_inverse = _basis_inverse_for_inherit(parent_state, inherit_mode)
+            local_x_axis = local_basis_inverse @ world_x_axis
+            local_rotation = math.degrees(math.atan2(local_x_axis[1], local_x_axis[0]))
+            local_x = float(local_position[0])
+            local_y = float(local_position[1])
+            world_matrix = _compose_world_matrix(parent_state, local_rotation, 1.0, inherit_mode)
+        else:
+            local_x = float(head_vector[0])
+            local_y = float(head_vector[1])
+            local_rotation = record["rotation_world"]
+            world_matrix = _build_2d_basis(local_rotation, scale_x=1.0)
+
+        bone = {
+            "name": bone_name,
+            "parent": parent_name,
+            "index": record["index"],
+            "x": round(local_x, 4),
+            "y": round(local_y, 4),
+            "rotation": round(local_rotation, 2),
+            "length": round(length, 4),
+            "connected": record["connected"],
+            "inherit": inherit_mode,
+            "child_count": record["child_count"],
+            "parent_child_count": record["parent_child_count"],
+            "leaf_distance": record["leaf_distance"],
+            "linear_chain_length": record["linear_chain_length"],
+            "length_ratio": round(record["length_ratio"], 4),
+            "parent_length_ratio": round(record["parent_length_ratio"], 4),
+            "main_chain": bool(record["main_chain"]),
+            "terminal_chain": record["terminal_chain"],
+            "terminal_chain_root": record["terminal_chain_root"],
+            "terminal_chain_order": record["terminal_chain_order"],
+        }
+        bones.append(bone)
+        world_cache[bone_name] = {
+            "head": head_vector,
+            "matrix": world_matrix,
+            "rigid_matrix": _orthonormalize_2x2(world_matrix),
+        }
+
     return bones
 
 
