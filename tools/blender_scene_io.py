@@ -339,7 +339,7 @@ def parse_args() -> argparse.Namespace:
         script_args = []
 
     parser = argparse.ArgumentParser(description="Inspect or convert 3D sources for flatRig.")
-    parser.add_argument("command", choices=("inspect", "convert", "extract-bone-hierarchy", "extract-2d-mesh"))
+    parser.add_argument("command", choices=("inspect", "inspect-3d-source", "convert", "extract-bone-hierarchy", "extract-2d-mesh"))
     parser.add_argument("source")
     parser.add_argument("--output", required=True)
     parser.add_argument("--target-format", default="glb", choices=("glb",))
@@ -1249,7 +1249,7 @@ def main() -> None:
 
     payload: dict[str, object]
     
-    if args.command == "inspect":
+    if args.command == "inspect" or args.command == "inspect-3d-source":
         payload = inspect_source(source_path)
     elif args.command == "convert":
         payload = convert_source(source_path, str(output_path), args.target_format)
