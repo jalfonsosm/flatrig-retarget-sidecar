@@ -61,85 +61,212 @@ VIEW_PRESETS = {
         "right_axis": (1.0, 0.0, 0.0),
         "up_axis": (0.0, 1.0, 0.0),
     },
+    "three_quarter": {
+        "view_dir": (1.0, 1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_r": {
+        "view_dir": (-1.0, 1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back": {
+        "view_dir": (1.0, -1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back_r": {
+        "view_dir": (-1.0, -1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "isometric": {
+        "view_dir": (-1.0, -1.0, -1.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "isometric_r": {
+        "view_dir": (1.0, -1.0, -1.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
 }
 
+VIEW_ALIASES = {
+    "3q": "three_quarter",
+    "3q_r": "three_quarter_r",
+    "3q_back": "three_quarter_back",
+    "3q_back_r": "three_quarter_back_r",
+    "3/4": "three_quarter",
+    "3/4_r": "three_quarter_r",
+    "iso": "isometric",
+    "iso_r": "isometric_r",
+}
 
-def _normalize_vector_3d(vector, label="vector"):
-    """Normalize a 3D vector."""
-    v = mathutils.Vector(vector)
-    length = v.length
-    if length < 1e-10:
-        raise ValueError(f"{label} cannot be zero vector")
-    return v.normalized()
+VIEW_PRESET_NAMES = frozenset(VIEW_PRESETS.keys())
+
+VECTOR_EPSILON = 1e-8
+WORLD_UP = np.array((0.0, 0.0, 1.0), dtype=np.float64)
+WORLD_Y = np.array((0.0, 1.0, 0.0), dtype=np.float64)
+WORLD_X = np.array((1.0, 0.0, 0.0), dtype=np.float64)
 
 
-def _build_view_config(
-    view_preset: str = "front",
-    view_dir: Optional[tuple] = None,
-    view_up: Optional[tuple] = None,
-    view_roll: float = 0.0,
-) -> dict:
-    """Build a view configuration dict compatible with projection helpers."""
-    if view_dir is not None:
-        view_dir = _normalize_vector_3d(view_dir, "view_dir")
-        right_axis = view_dir.orthogonal()
-        up_axis = view_dir.cross(right_axis)
-    else:
-        preset = VIEW_PRESETS.get(view_preset, VIEW_PRESETS["front"])
-        view_dir = mathutils.Vector(preset["view_dir"])
-        right_axis = mathutils.Vector(preset["right_axis"])
-        up_axis = mathutils.Vector(preset["up_axis"])
-    
-    if view_up is not None:
-        up_hint = mathutils.Vector(view_up).normalized()
-        right_axis_vec = np.cross(view_dir, up_hint)
-        right_axis = mathutils.Vector(right_axis_vec / np.linalg.norm(right_axis_vec))
-        if right_axis.length < 1e-6:
-            right_axis = view_dir.orthogonal()
-        up_axis_vec = np.cross(right_axis, view_dir)
-        up_axis = mathutils.Vector(up_axis_vec / np.linalg.norm(up_axis_vec))
-    
-    # Apply roll
-    if abs(view_roll) > 1e-6:
-        roll_rad = math.radians(view_roll)
-        cos_r, sin_r = math.cos(roll_rad), math.sin(roll_rad)
-        new_right = mathutils.Vector([
-            cos_r * right_axis.x - sin_r * up_axis.x,
-            cos_r * right_axis.y - sin_r * up_axis.y,
-            cos_r * right_axis.z - sin_r * up_axis.z,
-        ])
-        new_up = mathutils.Vector([
-            sin_r * right_axis.x + cos_r * up_axis.x,
-            sin_r * right_axis.y + cos_r * up_axis.y,
-            sin_r * right_axis.z + cos_r * up_axis.z,
-        ])
-        right_axis = new_right.normalized()
-        up_axis = new_up.normalized()
-    
-    # Build 3D basis matrix (right, up, -view)
-    basis_3d = mathutils.Matrix([
-        [right_axis.x, right_axis.y, right_axis.z],
-        [up_axis.x, up_axis.y, up_axis.z],
-        [-view_dir.x, -view_dir.y, -view_dir.z],
-    ])
-    
-    # Build 2D basis (x, y) from right and up
-    basis_2d = mathutils.Matrix([
-        [right_axis.x, right_axis.y],
-        [up_axis.x, up_axis.y],
-    ])
-    
+def _normalize_vector(vector, *, label):
+    """Normalize a numpy vector."""
+    vector = np.asarray(vector, dtype=np.float64)
+    if vector.shape != (3,):
+        raise ValueError(f"{label} must contain exactly 3 values.")
+    length = float(np.linalg.norm(vector))
+    if length <= VECTOR_EPSILON:
+        raise ValueError(f"{label} must be non-zero.")
+    return vector / length
+
+
+def _axis_angle_rotation(axis, angle_degrees):
+    """Compute 3x3 rotation matrix from axis-angle."""
+    axis = _normalize_vector(axis, label="axis")
+    angle_radians = math.radians(float(angle_degrees))
+    cos_value = math.cos(angle_radians)
+    sin_value = math.sin(angle_radians)
+    outer = np.outer(axis, axis)
+    cross = np.array(
+        (
+            (0.0, -axis[2], axis[1]),
+            (axis[2], 0.0, -axis[0]),
+            (-axis[1], axis[0], 0.0),
+        ),
+        dtype=np.float64,
+    )
+    return cos_value * np.eye(3) + sin_value * cross + (1.0 - cos_value) * outer
+
+
+def _finalize_view_config(view_name, preset_name, view_dir, right_axis, up_axis, roll_degrees):
+    """Finalize and return a view configuration dict."""
+    view_dir = _normalize_vector(view_dir, label="view_dir")
+    right_axis = _normalize_vector(right_axis, label="right_axis")
+    up_axis = _normalize_vector(up_axis, label="up_axis")
+    depth_axis = _normalize_vector(-view_dir, label="depth_axis")
+    basis_2d = np.stack((right_axis, up_axis), axis=0)
+    basis_3d = np.stack((right_axis, up_axis, depth_axis), axis=0)
     return {
-        "view_dir": (view_dir.x, view_dir.y, view_dir.z),
-        "right_axis": (right_axis.x, right_axis.y, right_axis.z),
-        "up_axis": (up_axis.x, up_axis.y, up_axis.z),
-        "depth_axis": (-view_dir.x, -view_dir.y, -view_dir.z),
-        "basis_2d": [[basis_2d[0][0], basis_2d[0][1]], [basis_2d[1][0], basis_2d[1][1]]],
-        "basis_3d": [[basis_3d[0][0], basis_3d[0][1], basis_3d[0][2]],
-                     [basis_3d[1][0], basis_3d[1][1], basis_3d[1][2]],
-                     [basis_3d[2][0], basis_3d[2][1], basis_3d[2][2]]],
-        "roll_degrees": view_roll,
+        "name": str(view_name or preset_name or "view"),
+        "preset": preset_name,
+        "mode": "preset" if preset_name is not None else "custom",
+        "view_dir": view_dir,
+        "right_axis": right_axis,
+        "up_axis": up_axis,
+        "depth_axis": depth_axis,
+        "basis_2d": basis_2d,
+        "basis_3d": basis_3d,
+        "roll_degrees": float(roll_degrees),
     }
+
+
+def _resolve_view_preset_name(view_name):
+    """Resolve view name to preset name."""
+    resolved = str(view_name or "side").strip().lower()
+    if not resolved:
+        return "side"
+    resolved = VIEW_ALIASES.get(resolved, resolved)
+    if resolved == "custom":
+        raise ValueError("view 'custom' requires --view-dir to be provided.")
+    if resolved not in VIEW_PRESETS:
+        available = ", ".join(sorted(VIEW_PRESET_NAMES | set(VIEW_ALIASES)))
+        raise ValueError(f"Unknown view '{view_name}'. Available presets: {available}")
+    return resolved
+
+
+def _build_explicit_view_config(view_name, view_dir, right_axis, up_axis, preset_name=None):
+    """Build view config from explicitly provided vectors."""
+    view_dir = _normalize_vector(view_dir, label="view_dir")
+    right_axis = _normalize_vector(right_axis, label="right_axis")
+    up_axis = _normalize_vector(up_axis, label="up_axis")
+    if abs(float(np.dot(view_dir, right_axis))) > 1e-6:
+        raise ValueError(f"View '{view_name}' has non-orthogonal view_dir/right_axis.")
+    if abs(float(np.dot(view_dir, up_axis))) > 1e-6:
+        raise ValueError(f"View '{view_name}' has non-orthogonal view_dir/up_axis.")
+    if abs(float(np.dot(right_axis, up_axis))) > 1e-6:
+        raise ValueError(f"View '{view_name}' has non-orthogonal right_axis/up_axis.")
+    return _finalize_view_config(
+        view_name=view_name,
+        preset_name=preset_name,
+        view_dir=view_dir,
+        right_axis=right_axis,
+        up_axis=up_axis,
+        roll_degrees=0.0,
+    )
+
+
+def _build_view_config_from_direction(view_name, view_dir, up_hint=None, preset_name=None):
+    """Build view config from direction vectors."""
+    view_dir = _normalize_vector(view_dir, label="view_dir")
+    up_hint_vec = _normalize_vector(
+        up_hint if up_hint is not None else WORLD_UP, label="up_hint"
+    )
+    if abs(float(np.dot(view_dir, up_hint_vec))) >= 1.0 - 1e-5:
+        for fallback in (WORLD_Y, WORLD_X, -WORLD_X):
+            fallback_norm = _normalize_vector(fallback, label="fallback_up")
+            if abs(float(np.dot(view_dir, fallback_norm))) < 1.0 - 1e-5:
+                up_hint_vec = fallback_norm
+                break
+    right_axis = np.cross(view_dir, up_hint_vec)
+    right_axis = _normalize_vector(right_axis, label="right_axis")
+    up_axis = np.cross(right_axis, view_dir)
+    up_axis = _normalize_vector(up_axis, label="up_axis")
+    return _finalize_view_config(
+        view_name=view_name,
+        preset_name=preset_name,
+        view_dir=view_dir,
+        right_axis=right_axis,
+        up_axis=up_axis,
+        roll_degrees=0.0,
+    )
+
+
+def _apply_roll_to_view_config(view_cfg, roll_degrees):
+    """Apply roll rotation to view config."""
+    roll_degrees = float(roll_degrees)
+    if abs(roll_degrees) <= VECTOR_EPSILON:
+        return dict(view_cfg)
+    rotation = _axis_angle_rotation(view_cfg["view_dir"], roll_degrees)
+    right_axis = rotation @ np.asarray(view_cfg["right_axis"], dtype=np.float64)
+    up_axis = rotation @ np.asarray(view_cfg["up_axis"], dtype=np.float64)
+    return _finalize_view_config(
+        view_name=str(view_cfg.get("name") or "view"),
+        preset_name=view_cfg.get("preset"),
+        view_dir=view_cfg["view_dir"],
+        right_axis=right_axis,
+        up_axis=up_axis,
+        roll_degrees=float(view_cfg.get("roll_degrees", 0.0)) + roll_degrees,
+    )
+
+
+def get_view_config(view_name="side", *, view_dir=None, up_hint=None, roll_degrees=0.0):
+    """Return a normalized view configuration for preset or custom directions."""
+    roll_degrees = float(roll_degrees or 0.0)
+    if view_dir is not None:
+        config = _build_view_config_from_direction(
+            view_name="custom" if not str(view_name or "").strip() else str(view_name).strip(),
+            view_dir=view_dir,
+            up_hint=up_hint,
+            preset_name=None,
+        )
+    else:
+        preset_name = _resolve_view_preset_name(view_name)
+        preset = VIEW_PRESETS[preset_name]
+        if "right_axis" in preset and "up_axis" in preset:
+            config = _build_explicit_view_config(
+                view_name=preset_name,
+                view_dir=np.array(preset["view_dir"], dtype=np.float64),
+                right_axis=np.array(preset["right_axis"], dtype=np.float64),
+                up_axis=np.array(preset["up_axis"], dtype=np.float64),
+                preset_name=preset_name,
+            )
+        else:
+            config = _build_view_config_from_direction(
+                view_name=preset_name,
+                view_dir=np.array(preset["view_dir"], dtype=np.float64),
+                up_hint=np.array(preset["up_hint"], dtype=np.float64) if "up_hint" in preset else None,
+                preset_name=preset_name,
+            )
+    if abs(roll_degrees) > VECTOR_EPSILON:
+        config = _apply_roll_to_view_config(config, roll_degrees)
+    return config
 
 
 def _project_projection_space_direction(direction_3d, view_cfg):
@@ -1169,11 +1296,11 @@ def extract_2d_mesh_cli(
         return {"ok": False, "detail": "No mesh found in scene"}
     
     # Build view configuration
-    view_cfg = _build_view_config(
-        view_preset=view_preset,
-        view_dir=view_dir,
-        view_up=view_up,
-        view_roll=view_roll,
+    view_cfg = get_view_config(
+        view_name=view_preset,
+        view_dir=tuple(view_dir) if view_dir is not None else None,
+        up_hint=tuple(view_up) if view_up is not None else None,
+        roll_degrees=view_roll,
     )
     
     # Call extract_2d_mesh (same as Python pipeline)
@@ -1215,11 +1342,11 @@ def extract_bone_hierarchy_cli(
         return {"ok": False, "detail": "No armature found in scene"}
     
     # Build view configuration
-    view_cfg = _build_view_config(
-        view_preset=view_preset,
-        view_dir=view_dir,
-        view_up=view_up,
-        view_roll=view_roll,
+    view_cfg = get_view_config(
+        view_name=view_preset,
+        view_dir=tuple(view_dir) if view_dir is not None else None,
+        up_hint=tuple(view_up) if view_up is not None else None,
+        roll_degrees=view_roll,
     )
     
     # Call extract_bone_hierarchy (same as Python pipeline)
