@@ -200,45 +200,54 @@ def point_depth(point_3d, view_cfg, projection_inverse=None):
 
 def compute_projection_frame(points_2d, margin=0.06):
     """Build a square projection frame around a set of 2D points."""
+    if len(points_2d) == 0:
+        return {
+            "center_x": 0.0,
+            "center_y": 0.0,
+            "span": 1.0,
+            "min_x": -0.5,
+            "max_x": 0.5,
+            "min_y": -0.5,
+            "max_y": 0.5,
+            "margin": margin,
+        }
+
     points_2d = np.asarray(points_2d, dtype=np.float64)
     if points_2d.ndim == 1:
         points_2d = points_2d[np.newaxis, :]
-    
-    min_x = float(np.min(points_2d[:, 0]))
-    max_x = float(np.max(points_2d[:, 0]))
-    min_y = float(np.min(points_2d[:, 1]))
-    max_y = float(np.max(points_2d[:, 1]))
-    
-    width = max_x - min_x
-    height = max_y - min_y
-    size = max(width, height)
-    half = size * 0.5 * (1.0 + margin)
-    
+
+    xs = points_2d[:, 0]
+    ys = points_2d[:, 1]
+    min_x = float(xs.min())
+    max_x = float(xs.max())
+    min_y = float(ys.min())
+    max_y = float(ys.max())
+
+    width = max(max_x - min_x, 1e-6)
+    height = max(max_y - min_y, 1e-6)
+    span = max(width, height) * (1.0 + margin * 2.0)
     center_x = (min_x + max_x) * 0.5
     center_y = (min_y + max_y) * 0.5
-    
+    half = span * 0.5
+
     return {
-        "min_x": round(center_x - half, 6),
-        "min_y": round(center_y - half, 6),
-        "size": round(size * (1.0 + margin), 6),
+        "center_x": center_x,
+        "center_y": center_y,
+        "span": span,
+        "min_x": center_x - half,
+        "max_x": center_x + half,
+        "min_y": center_y - half,
+        "max_y": center_y + half,
+        "margin": margin,
     }
 
 
 def project_points_to_uv(points_2d, frame):
     """Map projected 2D points to UVs inside the given projection frame."""
-    points_2d = np.asarray(points_2d, dtype=np.float64)
-    if points_2d.ndim == 1:
-        points_2d = points_2d[np.newaxis, :]
-    
-    size = float(frame["size"])
-    if size < 1e-6:
-        return np.zeros((len(points_2d), 2), dtype=np.float64)
-    
-    u = (points_2d[:, 0] - frame["min_x"]) / size
-    v = (points_2d[:, 1] - frame["min_y"]) / size
-    
-    uvs = np.column_stack((u, v))
-    return uvs
+    span = max(frame["span"], 1e-6)
+    u = (points_2d[:, 0] - frame["min_x"]) / span
+    v = 1.0 - ((points_2d[:, 1] - frame["min_y"]) / span)
+    return np.stack((u, v), axis=1)
 
 
 def extract_2d_mesh(
@@ -248,7 +257,7 @@ def extract_2d_mesh(
     source_frame=None,
     projection_inverse=None,
 ):
-    """Extract the bind-pose mesh projected to 2D.∫
+    """Extract the bind-pose mesh projected to 2D.
     """
     scene = bpy.context.scene
     depsgraph = bpy.context.evaluated_depsgraph_get()
