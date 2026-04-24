@@ -29,6 +29,7 @@ TERMINAL_CHAIN_MAX_LENGTH_RATIO = 0.8
 TERMINAL_CHAIN_PARENT_RATIO = 1.5
 TERMINAL_CHAIN_MAX_SPAN = 6
 VECTOR_EPSILON = 1e-8
+VISIBILITY_RASTER_EPSILON = 1e-6
 
 VIEW_PRESETS = {
     "front": {
@@ -289,6 +290,17 @@ def project_point_ortho(point_3d, view_cfg, projection_inverse=None):
     return (float(projected_2d[0]), float(projected_2d[1]))
 
 
+def project_points_ortho(points_3d, view_cfg, projection_inverse=None):
+    """Vectorized orthographic projection for an array of 3D points."""
+    projected = transform_points_to_projection_space(
+        points_3d,
+        projection_inverse=projection_inverse,
+    )
+    right_axis = np.asarray(view_cfg["right_axis"], dtype=np.float64)
+    up_axis = np.asarray(view_cfg["up_axis"], dtype=np.float64)
+    return np.stack((projected @ right_axis, projected @ up_axis), axis=1)
+
+
 def _transform_point_to_projection_space(point_3d, projection_inverse=None):
     """Transform world-space point into projection space."""
     point_3d = np.asarray(point_3d, dtype=np.float64)
@@ -314,6 +326,42 @@ def _transform_point_to_projection_space(point_3d, projection_inverse=None):
     if squeeze:
         return transformed[0]
     return transformed
+
+
+def transform_points_to_projection_space(points_3d, projection_inverse=None):
+    """Transform world-space points into projection space."""
+    return _transform_point_to_projection_space(
+        points_3d,
+        projection_inverse=projection_inverse,
+    )
+
+
+def transform_point_from_projection_space(point_3d, projection_matrix=None):
+    """Transform a point from projection-local space back to world space."""
+    point_3d = np.asarray(point_3d, dtype=np.float64)
+    if projection_matrix is None:
+        return point_3d
+
+    point_h = np.concatenate((point_3d, np.array((1.0,), dtype=np.float64)))
+    return (np.asarray(projection_matrix, dtype=np.float64) @ point_h)[:3]
+
+
+def transform_direction_to_projection_space(direction_3d, projection_inverse=None):
+    """Transform a direction vector into projection-local space."""
+    direction_3d = np.asarray(direction_3d, dtype=np.float64)
+    if projection_inverse is None:
+        return direction_3d
+    rotation = np.asarray(projection_inverse, dtype=np.float64)[:3, :3]
+    return rotation @ direction_3d
+
+
+def transform_direction_from_projection_space(direction_3d, projection_matrix=None):
+    """Transform a direction vector from projection-local space to world space."""
+    direction_3d = np.asarray(direction_3d, dtype=np.float64)
+    if projection_matrix is None:
+        return direction_3d
+    rotation = np.asarray(projection_matrix, dtype=np.float64)[:3, :3]
+    return rotation @ direction_3d
 
 
 def point_depth(point_3d, view_cfg, projection_inverse=None):
@@ -375,6 +423,779 @@ def project_points_to_uv(points_2d, frame):
     u = (points_2d[:, 0] - frame["min_x"]) / span
     v = 1.0 - ((points_2d[:, 1] - frame["min_y"]) / span)
     return np.stack((u, v), axis=1)
+
+
+def compose_projection_plane_point(x, y, depth, view_cfg):
+    """Build a 3D point in projection space from 2D screen coordinates plus depth."""
+    return (
+        np.asarray(view_cfg["right_axis"], dtype=np.float64) * float(x)
+        + np.asarray(view_cfg["up_axis"], dtype=np.float64) * float(y)
+        + np.asarray(view_cfg["depth_axis"], dtype=np.float64) * float(depth)
+    )
+
+
+def get_evaluated_mesh(obj, depsgraph):
+    """Get the evaluated deformed mesh after Blender modifiers."""
+    eval_obj = obj.evaluated_get(depsgraph)
+    mesh = eval_obj.to_mesh()
+    return eval_obj, mesh
+
+
+def get_evaluated_vertex_positions(obj, depsgraph):
+    """Get world-space vertex positions after armature deformation."""
+    eval_obj, mesh = get_evaluated_mesh(obj, depsgraph)
+    world_mat = eval_obj.matrix_world
+
+    positions = np.empty((len(mesh.vertices), 3), dtype=np.float64)
+    for index, vert in enumerate(mesh.vertices):
+        world_co = world_mat @ vert.co
+        positions[index] = (world_co.x, world_co.y, world_co.z)
+
+    eval_obj.to_mesh_clear()
+    return positions
+
+
+def ensure_polygon_normals(mesh):
+    """Populate polygon normals when running on Blender versions that need it."""
+    if hasattr(mesh, "calc_normals"):
+        mesh.calc_normals()
+
+
+def compute_vertex_visibility(obj, depsgraph, view_cfg, projection_inverse=None):
+    """Cheap visibility estimate based on front-facing polygons."""
+    eval_obj, mesh = get_evaluated_mesh(obj, depsgraph)
+    world_mat = eval_obj.matrix_world
+    view_dir = mathutils.Vector(np.asarray(view_cfg["view_dir"], dtype=np.float64))
+
+    visible = np.zeros(len(mesh.vertices), dtype=bool)
+    ensure_polygon_normals(mesh)
+
+    for poly in mesh.polygons:
+        world_normal = (world_mat.to_3x3() @ poly.normal).normalized()
+        if projection_inverse is not None:
+            world_normal = mathutils.Vector(
+                transform_direction_to_projection_space(world_normal, projection_inverse)
+            ).normalized()
+        if world_normal.dot(view_dir) < 0:
+            for vertex_index in poly.vertices:
+                visible[vertex_index] = True
+
+    eval_obj.to_mesh_clear()
+    return visible
+
+
+def compute_front_facing_vertex_visibility_from_triangles(
+    positions_projection_space,
+    triangles,
+    view_cfg,
+):
+    """Mark vertices that belong to any front-facing triangle."""
+    projected_positions = np.asarray(positions_projection_space, dtype=np.float64)
+    triangle_array = np.asarray(triangles, dtype=np.int32)
+    visible = np.zeros(projected_positions.shape[0], dtype=bool)
+    if triangle_array.size == 0:
+        return visible
+
+    p0 = projected_positions[triangle_array[:, 0]]
+    p1 = projected_positions[triangle_array[:, 1]]
+    p2 = projected_positions[triangle_array[:, 2]]
+    normals = np.cross(p1 - p0, p2 - p0)
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    view_dir = np.asarray(view_cfg["view_dir"], dtype=np.float64)
+    facing = (normal_lengths > VISIBILITY_RASTER_EPSILON) & (
+        np.einsum("ij,j->i", normals, view_dir) < -VISIBILITY_RASTER_EPSILON
+    )
+    if np.any(facing):
+        visible[np.unique(triangle_array[facing].reshape(-1))] = True
+    return visible
+
+
+def compute_surface_vertex_visibility_from_triangles(
+    positions_projection_space,
+    positions_2d,
+    triangles,
+    view_cfg,
+    *,
+    triangle_groups=None,
+    raster_size=256,
+):
+    """Approximate visible-surface vertices with a small orthographic z-buffer."""
+    projected_positions = np.asarray(positions_projection_space, dtype=np.float64)
+    projected_points_2d = np.asarray(positions_2d, dtype=np.float64)
+    triangle_array = np.asarray(triangles, dtype=np.int32)
+    raster_size = max(16, int(raster_size))
+    visible = np.zeros(projected_positions.shape[0], dtype=bool)
+    if triangle_array.size == 0 or projected_points_2d.size == 0:
+        return visible
+
+    front_facing = compute_front_facing_vertex_visibility_from_triangles(
+        projected_positions,
+        triangles,
+        view_cfg,
+    )
+    if not np.any(front_facing):
+        return visible
+
+    p0 = projected_positions[triangle_array[:, 0]]
+    p1 = projected_positions[triangle_array[:, 1]]
+    p2 = projected_positions[triangle_array[:, 2]]
+    normals = np.cross(p1 - p0, p2 - p0)
+    normal_lengths = np.linalg.norm(normals, axis=1)
+    view_dir = np.asarray(view_cfg["view_dir"], dtype=np.float64)
+    front_triangle_mask = (normal_lengths > VISIBILITY_RASTER_EPSILON) & (
+        np.einsum("ij,j->i", normals, view_dir) < -VISIBILITY_RASTER_EPSILON
+    )
+    if not np.any(front_triangle_mask):
+        return visible
+
+    depth_axis = np.asarray(view_cfg["depth_axis"], dtype=np.float64)
+    depths = projected_positions @ depth_axis
+    frame = compute_projection_frame(projected_points_2d, margin=0.02)
+    span = max(float(frame["span"]), VISIBILITY_RASTER_EPSILON)
+    raster_points = np.empty_like(projected_points_2d, dtype=np.float64)
+    raster_points[:, 0] = (
+        (projected_points_2d[:, 0] - float(frame["min_x"])) / span * (raster_size - 1)
+    )
+    raster_points[:, 1] = (
+        (projected_points_2d[:, 1] - float(frame["min_y"])) / span * (raster_size - 1)
+    )
+
+    if triangle_groups:
+        groups = [np.asarray(group, dtype=np.int32) for group in triangle_groups if len(group) > 0]
+    else:
+        groups = [np.nonzero(front_triangle_mask)[0].astype(np.int32)]
+
+    for group in groups:
+        visible_indices = _raster_visible_triangle_indices(
+            raster_points,
+            depths,
+            triangle_array,
+            group[front_triangle_mask[group]],
+            raster_size=raster_size,
+        )
+        if visible_indices.size <= 0:
+            continue
+        visible[np.unique(triangle_array[visible_indices].reshape(-1))] = True
+
+    return visible
+
+
+def _raster_visible_triangle_indices(
+    raster_points,
+    depths,
+    triangle_array,
+    triangle_indices,
+    *,
+    raster_size,
+):
+    triangle_indices = np.asarray(triangle_indices, dtype=np.int32)
+    if triangle_indices.size <= 0:
+        return np.empty(0, dtype=np.int32)
+
+    depth_buffer = np.full((raster_size, raster_size), -np.inf, dtype=np.float64)
+    triangle_buffer = np.full((raster_size, raster_size), -1, dtype=np.int32)
+
+    for triangle_index in triangle_indices:
+        i0, i1, i2 = triangle_array[int(triangle_index)]
+        x0, y0 = raster_points[i0]
+        x1, y1 = raster_points[i1]
+        x2, y2 = raster_points[i2]
+        z0 = float(depths[i0])
+        z1 = float(depths[i1])
+        z2 = float(depths[i2])
+
+        min_x = max(0, int(math.floor(min(x0, x1, x2))))
+        max_x = min(raster_size - 1, int(math.ceil(max(x0, x1, x2))))
+        min_y = max(0, int(math.floor(min(y0, y1, y2))))
+        max_y = min(raster_size - 1, int(math.ceil(max(y0, y1, y2))))
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        denominator = ((y1 - y2) * (x0 - x2)) + ((x2 - x1) * (y0 - y2))
+        if abs(denominator) <= VISIBILITY_RASTER_EPSILON:
+            _mark_triangle_centroid_visibility(
+                triangle_buffer,
+                depth_buffer,
+                triangle_index=int(triangle_index),
+                points=((x0, y0), (x1, y1), (x2, y2)),
+                depths=(z0, z1, z2),
+            )
+            continue
+
+        xs = np.arange(min_x, max_x + 1, dtype=np.float64) + 0.5
+        ys = np.arange(min_y, max_y + 1, dtype=np.float64) + 0.5
+        grid_x, grid_y = np.meshgrid(xs, ys)
+
+        w0 = (((y1 - y2) * (grid_x - x2)) + ((x2 - x1) * (grid_y - y2))) / denominator
+        w1 = (((y2 - y0) * (grid_x - x2)) + ((x0 - x2) * (grid_y - y2))) / denominator
+        w2 = 1.0 - w0 - w1
+        inside = (
+            (w0 >= -VISIBILITY_RASTER_EPSILON)
+            & (w1 >= -VISIBILITY_RASTER_EPSILON)
+            & (w2 >= -VISIBILITY_RASTER_EPSILON)
+        )
+
+        if not np.any(inside):
+            _mark_triangle_centroid_visibility(
+                triangle_buffer,
+                depth_buffer,
+                triangle_index=int(triangle_index),
+                points=((x0, y0), (x1, y1), (x2, y2)),
+                depths=(z0, z1, z2),
+            )
+            continue
+
+        patch_depth = depth_buffer[min_y : max_y + 1, min_x : max_x + 1]
+        patch_triangles = triangle_buffer[min_y : max_y + 1, min_x : max_x + 1]
+        depth_values = (w0 * z0) + (w1 * z1) + (w2 * z2)
+        update = inside & (depth_values > patch_depth + VISIBILITY_RASTER_EPSILON)
+        if np.any(update):
+            patch_depth[update] = depth_values[update]
+            patch_triangles[update] = int(triangle_index)
+
+    return np.unique(triangle_buffer[triangle_buffer >= 0])
+
+
+def _mark_triangle_centroid_visibility(
+    triangle_buffer,
+    depth_buffer,
+    *,
+    triangle_index,
+    points,
+    depths,
+):
+    centroid_x = int(round(sum(point[0] for point in points) / 3.0))
+    centroid_y = int(round(sum(point[1] for point in points) / 3.0))
+    if (
+        centroid_x < 0
+        or centroid_y < 0
+        or centroid_y >= depth_buffer.shape[0]
+        or centroid_x >= depth_buffer.shape[1]
+    ):
+        return
+    centroid_depth = float(sum(depths) / 3.0)
+    if centroid_depth > depth_buffer[centroid_y, centroid_x] + VISIBILITY_RASTER_EPSILON:
+        depth_buffer[centroid_y, centroid_x] = centroid_depth
+        triangle_buffer[centroid_y, centroid_x] = int(triangle_index)
+
+
+def build_visibility_map(
+    obj,
+    frame_start,
+    frame_end,
+    view_cfg,
+    frame_step=1,
+    projection_space="world",
+    armature_obj=None,
+    projection_reference_root=None,
+    triangles=None,
+    visibility_mode="all",
+    visibility_triangle_groups=None,
+    visibility_raster_size=256,
+):
+    """Build a per-vertex, per-frame visibility and position map in Blender."""
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    frame_step = max(1, int(frame_step))
+    frames = list(range(frame_start, frame_end + 1, frame_step))
+    if frames[-1] != frame_end:
+        frames.append(frame_end)
+
+    scene.frame_set(frames[0])
+    depsgraph.update()
+    positions_3d_0 = get_evaluated_vertex_positions(obj, depsgraph)
+    num_frames = len(frames)
+    num_verts = positions_3d_0.shape[0]
+
+    projection_inverses = None
+    if projection_space == "root":
+        projection_inverses = np.zeros((num_frames, 4, 4), dtype=np.float64)
+
+    visibility = np.zeros((num_frames, num_verts), dtype=bool)
+    positions_3d = np.zeros((num_frames, num_verts, 3), dtype=np.float64)
+    positions_2d = np.zeros((num_frames, num_verts, 2), dtype=np.float64)
+
+    for frame_index, frame in enumerate(frames):
+        scene.frame_set(frame)
+        depsgraph.update()
+        projection_inverse = get_projection_reference_inverse(
+            armature_obj,
+            projection_space=projection_space,
+            reference_root_matrix=projection_reference_root,
+        )
+        if projection_inverses is not None and projection_inverse is not None:
+            projection_inverses[frame_index] = projection_inverse
+
+        frame_positions_3d = get_evaluated_vertex_positions(obj, depsgraph)
+        positions_3d[frame_index] = frame_positions_3d
+        projection_space_positions = transform_points_to_projection_space(
+            frame_positions_3d,
+            projection_inverse=projection_inverse,
+        )
+        frame_positions_2d = np.stack(
+            (
+                projection_space_positions @ np.asarray(view_cfg["right_axis"], dtype=np.float64),
+                projection_space_positions @ np.asarray(view_cfg["up_axis"], dtype=np.float64),
+            ),
+            axis=1,
+        )
+        positions_2d[frame_index] = frame_positions_2d
+
+        resolved_mode = str(visibility_mode or "all").strip().lower()
+        if resolved_mode == "all":
+            visibility[frame_index] = True
+        elif resolved_mode == "mesh_surface":
+            visibility[frame_index] = compute_surface_vertex_visibility_from_triangles(
+                projection_space_positions,
+                frame_positions_2d,
+                triangles if triangles is not None else [],
+                view_cfg,
+                raster_size=visibility_raster_size,
+            )
+        elif resolved_mode == "sprite_surface":
+            visibility[frame_index] = compute_surface_vertex_visibility_from_triangles(
+                projection_space_positions,
+                frame_positions_2d,
+                triangles if triangles is not None else [],
+                view_cfg,
+                triangle_groups=visibility_triangle_groups,
+                raster_size=visibility_raster_size,
+            )
+        elif triangles is not None:
+            visibility[frame_index] = compute_front_facing_vertex_visibility_from_triangles(
+                projection_space_positions,
+                triangles,
+                view_cfg,
+            )
+        else:
+            visibility[frame_index] = compute_vertex_visibility(
+                obj,
+                depsgraph,
+                view_cfg,
+                projection_inverse=projection_inverse,
+            )
+
+    return {
+        "frames": frames,
+        "visible": visibility,
+        "positions_2d": positions_2d,
+        "positions_3d": positions_3d,
+        "projection_inverses": projection_inverses,
+    }
+
+
+def get_bind_pose_2d(obj, view_cfg, projection_inverse=None):
+    """Get the bind-pose vertex positions projected to 2D."""
+    scene = bpy.context.scene
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    scene.frame_set(scene.frame_start)
+    depsgraph.update()
+
+    positions_3d = get_evaluated_vertex_positions(obj, depsgraph)
+    return project_points_ortho(positions_3d, view_cfg, projection_inverse=projection_inverse)
+
+
+def _pick_render_engine(scene):
+    engine_property = scene.render.bl_rna.properties.get("engine")
+    available = {
+        item.identifier
+        for item in (engine_property.enum_items if engine_property is not None else [])
+    }
+    for candidate in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH", "CYCLES"):
+        if candidate in available:
+            return candidate
+    return scene.render.engine
+
+
+def _frame_to_world_center(projection_frame, view_cfg, depth_center=0.0, projection_matrix=None):
+    coords = compose_projection_plane_point(
+        projection_frame["center_x"],
+        projection_frame["center_y"],
+        depth_center,
+        view_cfg,
+    )
+    world_coords = transform_point_from_projection_space(
+        coords,
+        projection_matrix=projection_matrix,
+    )
+    return mathutils.Vector(np.asarray(world_coords, dtype=np.float64))
+
+
+def setup_orthographic_camera(
+    view_cfg,
+    projection_frame,
+    depth_center=0.0,
+    distance=10.0,
+    camera_name="flatRig_Camera",
+    projection_matrix=None,
+):
+    """Create an orthographic camera that matches a projection frame."""
+    center = _frame_to_world_center(
+        projection_frame,
+        view_cfg,
+        depth_center=depth_center,
+        projection_matrix=projection_matrix,
+    )
+    right_axis = mathutils.Vector(
+        transform_direction_from_projection_space(
+            view_cfg["right_axis"],
+            projection_matrix=projection_matrix,
+        )
+    ).normalized()
+    up_axis = mathutils.Vector(
+        transform_direction_from_projection_space(
+            view_cfg["up_axis"],
+            projection_matrix=projection_matrix,
+        )
+    ).normalized()
+    view_dir = mathutils.Vector(
+        transform_direction_from_projection_space(
+            view_cfg["view_dir"],
+            projection_matrix=projection_matrix,
+        )
+    ).normalized()
+    camera_location = center - view_dir * distance
+
+    z_axis = (-view_dir).normalized()
+    camera_matrix = mathutils.Matrix(
+        (
+            (right_axis.x, up_axis.x, z_axis.x, camera_location.x),
+            (right_axis.y, up_axis.y, z_axis.y, camera_location.y),
+            (right_axis.z, up_axis.z, z_axis.z, camera_location.z),
+            (0.0, 0.0, 0.0, 1.0),
+        )
+    )
+
+    bpy.ops.object.camera_add(location=camera_location)
+    camera = bpy.context.object
+    camera.name = camera_name
+    camera.matrix_world = camera_matrix
+    camera.data.type = "ORTHO"
+    camera.data.ortho_scale = projection_frame["span"]
+    bpy.context.scene.camera = camera
+    return camera
+
+
+def render_projected_sprite(scene, output_path, resolution=2048):
+    """Render the current scene from its active orthographic camera."""
+    print(f"[flatrig_texture] Rendering sprite at {resolution}x{resolution}...")
+
+    scene.render.engine = _pick_render_engine(scene)
+    scene.render.resolution_x = resolution
+    scene.render.resolution_y = resolution
+    scene.render.resolution_percentage = 100
+    scene.render.film_transparent = True
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+    scene.render.filepath = output_path
+
+    try:
+        bpy.ops.render.render(write_still=True)
+        print(f"[flatrig_texture] Sprite rendered to: {output_path}")
+        return True
+    except Exception as exc:
+        print(f"[flatrig_texture] Render failed: {exc}")
+        _create_placeholder_atlas(output_path, resolution)
+        return True
+
+
+def _build_unlit_material(original_material):
+    """Create a temporary emission-only copy that preserves base-color textures."""
+    material = original_material.copy()
+    material.use_nodes = True
+    if hasattr(material, "use_backface_culling"):
+        material.use_backface_culling = True
+    if hasattr(material, "show_transparent_back"):
+        material.show_transparent_back = False
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    output_node = next(
+        (node for node in nodes if node.bl_idname == "ShaderNodeOutputMaterial"),
+        None,
+    )
+    principled_node = next(
+        (node for node in nodes if node.bl_idname == "ShaderNodeBsdfPrincipled"),
+        None,
+    )
+
+    if output_node is None:
+        output_node = nodes.new("ShaderNodeOutputMaterial")
+
+    emission_node = nodes.new("ShaderNodeEmission")
+    emission_node.name = "_flatrig_emission"
+    emission_node.inputs["Strength"].default_value = 1.0
+
+    if principled_node is not None:
+        base_input = principled_node.inputs["Base Color"]
+        if base_input.links:
+            source_socket = base_input.links[0].from_socket
+            links.new(source_socket, emission_node.inputs["Color"])
+        else:
+            emission_node.inputs["Color"].default_value = base_input.default_value
+    else:
+        emission_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+
+    for link in list(output_node.inputs["Surface"].links):
+        links.remove(link)
+    links.new(emission_node.outputs["Emission"], output_node.inputs["Surface"])
+    return material
+
+
+def _apply_unlit_materials(objects):
+    """Swap materials to temporary unlit copies and return a restore token."""
+    restore_info = []
+    created_materials = []
+
+    for obj in objects:
+        if obj.type != "MESH":
+            continue
+
+        original_materials = list(obj.data.materials)
+        replacement_materials = []
+        for material in original_materials:
+            if material is None:
+                replacement_materials.append(None)
+                continue
+            unlit_material = _build_unlit_material(material)
+            replacement_materials.append(unlit_material)
+            created_materials.append(unlit_material)
+
+        obj.data.materials.clear()
+        for material in replacement_materials:
+            obj.data.materials.append(material)
+        restore_info.append((obj, original_materials))
+
+    return restore_info, created_materials
+
+
+def _restore_materials(restore_info, created_materials):
+    """Restore original materials and delete temporary unlit copies."""
+    for obj, original_materials in restore_info:
+        obj.data.materials.clear()
+        for material in original_materials:
+            obj.data.materials.append(material)
+
+    for material in created_materials:
+        bpy.data.materials.remove(material, do_unlink=True)
+
+
+def render_preview_sprite(
+    obj,
+    view_cfg,
+    projection_frame,
+    output_path,
+    resolution=2048,
+    depth_center=0.0,
+    bind_frame=None,
+    projection_matrix=None,
+):
+    """Render a full-body preview that matches the exported projection."""
+    scene = bpy.context.scene
+    if bind_frame is not None:
+        scene.frame_set(bind_frame)
+        bpy.context.view_layer.update()
+    armatures = [scene_obj for scene_obj in scene.objects if scene_obj.type == "ARMATURE"]
+    mesh_objects = [scene_obj for scene_obj in scene.objects if scene_obj.type == "MESH"]
+    hidden_armatures = []
+
+    for armature in armatures:
+        hidden_armatures.append((armature, armature.hide_render))
+        armature.hide_render = True
+
+    camera = setup_orthographic_camera(
+        view_cfg,
+        projection_frame,
+        depth_center=depth_center,
+        camera_name="flatRig_PreviewCamera",
+        projection_matrix=projection_matrix,
+    )
+    restore_info, created_materials = _apply_unlit_materials(mesh_objects)
+
+    try:
+        return render_projected_sprite(scene, output_path, resolution=resolution)
+    finally:
+        _restore_materials(restore_info, created_materials)
+        bpy.data.objects.remove(camera, do_unlink=True)
+        for armature, previous_state in hidden_armatures:
+            armature.hide_render = previous_state
+
+
+def render_part_sprite(
+    source_obj,
+    view_cfg,
+    triangle_keys,
+    projection_frame,
+    output_path,
+    resolution=1024,
+    depth_center=0.0,
+    bind_frame=None,
+    projection_matrix=None,
+):
+    """Render a cropped sprite for one body part."""
+    scene = bpy.context.scene
+    if bind_frame is not None:
+        scene.frame_set(bind_frame)
+        bpy.context.view_layer.update()
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    eval_obj = source_obj.evaluated_get(depsgraph)
+    render_mesh = bpy.data.meshes.new_from_object(
+        eval_obj,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+    )
+
+    bm = bmesh.new()
+    bm.from_mesh(render_mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces[:])
+
+    wanted = {tuple(key) for key in triangle_keys}
+    delete_faces = []
+    for face in bm.faces:
+        tri = tuple(sorted(vert.index for vert in face.verts))
+        if tri not in wanted:
+            delete_faces.append(face)
+
+    if delete_faces:
+        bmesh.ops.delete(bm, geom=delete_faces, context="FACES")
+
+    fill_holes = False
+
+    if fill_holes:
+        boundary_edges = [edge for edge in bm.edges if len(edge.link_faces) == 1]
+        hole_faces = []
+        if boundary_edges:
+            res = bmesh.ops.holes_fill(bm, edges=boundary_edges)
+            if "faces" in res and res["faces"]:
+                hole_faces = res["faces"]
+                geom_to_hull = list({v for f in hole_faces for v in f.verts})
+                hull_res = bmesh.ops.convex_hull(bm, input=geom_to_hull, use_existing_faces=True)
+                new_hull_faces = [f for f in hull_res.get("geom", []) if isinstance(f, bmesh.types.BMFace)]
+                for face in new_hull_faces:
+                    if face not in hole_faces:
+                        hole_faces.append(face)
+
+    if not bm.faces:
+        bm.free()
+        bpy.data.meshes.remove(render_mesh, do_unlink=True)
+        return False
+
+    bm.to_mesh(render_mesh)
+    bm.free()
+
+    render_obj = bpy.data.objects.new(f"{source_obj.name}_flatrig_part", render_mesh)
+    render_obj.matrix_world = source_obj.matrix_world.copy()
+    scene.collection.objects.link(render_obj)
+
+    if fill_holes:
+        hole_mat_index = len(render_obj.data.materials)
+        hole_mat = bpy.data.materials.new(name="flatrig_hole_mask")
+        render_obj.data.materials.append(hole_mat)
+
+        for polygon in render_obj.data.polygons:
+            if polygon.index >= len(render_obj.data.polygons) - len(hole_faces):
+                polygon.material_index = hole_mat_index
+
+    restore_info, created_materials = _apply_unlit_materials([render_obj])
+
+    camera = setup_orthographic_camera(
+        view_cfg,
+        projection_frame,
+        depth_center=depth_center,
+        camera_name="flatRig_PartCamera",
+        projection_matrix=projection_matrix,
+    )
+
+    hidden_objects = []
+    for scene_obj in scene.objects:
+        if scene_obj in (render_obj, camera):
+            continue
+        hidden_objects.append((scene_obj, scene_obj.hide_render))
+        scene_obj.hide_render = True
+
+    try:
+        if fill_holes:
+            success = render_projected_sprite(scene, output_path, resolution=resolution)
+            mask_path = str(output_path).rsplit(".", 1)[0] + "_mask.png"
+
+            mask_materials = []
+            for index, material in enumerate(render_obj.data.materials):
+                if material is None:
+                    mask_materials.append(None)
+                    continue
+
+                mask_mat = bpy.data.materials.new(name=f"flatrig_mask_mat_{index}")
+                mask_mat.use_nodes = True
+                if hasattr(mask_mat, "use_backface_culling"):
+                    mask_mat.use_backface_culling = True
+                if hasattr(mask_mat, "show_transparent_back"):
+                    mask_mat.show_transparent_back = False
+                nodes = mask_mat.node_tree.nodes
+                links = mask_mat.node_tree.links
+                nodes.clear()
+
+                output_node = nodes.new("ShaderNodeOutputMaterial")
+                emission_node = nodes.new("ShaderNodeEmission")
+                emission_node.inputs["Strength"].default_value = 1.0
+
+                if index == hole_mat_index:
+                    emission_node.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+                else:
+                    emission_node.inputs["Color"].default_value = (0.0, 0.0, 0.0, 0.0)
+
+                links.new(emission_node.outputs["Emission"], output_node.inputs["Surface"])
+
+                mass_blend = getattr(mask_mat, "blend_method", None)
+                if mass_blend is not None:
+                    mask_mat.blend_method = "CLIP"
+
+                mask_materials.append(mask_mat)
+
+            render_obj.data.materials.clear()
+            for material in mask_materials:
+                render_obj.data.materials.append(material)
+
+            scene.render.film_transparent = False
+            original_bg_color = None
+            bg_node = None
+            if scene.world is not None:
+                scene.world.use_nodes = True
+                bg_node = scene.world.node_tree.nodes.get("Background")
+                if bg_node:
+                    original_bg_color = tuple(bg_node.inputs["Color"].default_value)
+                    bg_node.inputs["Color"].default_value = (0.0, 0.0, 0.0, 1.0)
+
+            render_projected_sprite(scene, mask_path, resolution=resolution)
+
+            scene.render.film_transparent = True
+            if bg_node and original_bg_color is not None:
+                bg_node.inputs["Color"].default_value = original_bg_color
+
+            for material in mask_materials:
+                if material:
+                    bpy.data.materials.remove(material, do_unlink=True)
+
+            return success
+
+        return render_projected_sprite(scene, output_path, resolution=resolution)
+    finally:
+        _restore_materials(restore_info, created_materials)
+        bpy.data.objects.remove(render_obj, do_unlink=True)
+        bpy.data.meshes.remove(render_mesh, do_unlink=True)
+        bpy.data.objects.remove(camera, do_unlink=True)
+        for scene_obj, previous_state in hidden_objects:
+            scene_obj.hide_render = previous_state
+
+
+def _create_placeholder_atlas(output_path, resolution=2048):
+    """Create a plain placeholder image if rendering fails."""
+    print("[flatrig_texture] Creating placeholder atlas...")
+    image = bpy.data.images.new("placeholder", width=resolution, height=resolution)
+    image.pixels = [1.0] * (resolution * resolution * 4)
+    image.filepath_raw = output_path
+    image.file_format = "PNG"
+    image.save()
+    print(f"[flatrig_texture] Placeholder saved to: {output_path}")
 
 
 def extract_2d_mesh(
@@ -496,6 +1317,42 @@ def import_model(filepath: str) -> None:
     raise ValueError(f"Unsupported format: {extension}. Use .fbx, .glb, or .gltf.")
 
 
+def reset_blender_scene() -> None:
+    """Reset Blender to an empty scene."""
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+
+def get_blender_scene():
+    """Return the active Blender scene."""
+    return bpy.context.scene
+
+
+def get_blender_depsgraph():
+    """Return the active evaluated dependency graph."""
+    return bpy.context.evaluated_depsgraph_get()
+
+
+def update_blender_view_layer() -> None:
+    """Update the active Blender view layer."""
+    bpy.context.view_layer.update()
+
+
+def get_blender_action(action_name: str):
+    """Return a Blender action by name."""
+    return bpy.data.actions.get(action_name)
+
+
+def import_extra_animation_source(filepath: str) -> list[str]:
+    """Import an animation source and return newly created action names."""
+    existing_action_names = {action.name for action in bpy.data.actions}
+    import_model(filepath)
+    return [
+        action.name
+        for action in bpy.data.actions
+        if action.name not in existing_action_names
+    ]
+
+
 def find_mesh_and_armature():
     mesh_obj = None
     armature_obj = None
@@ -540,6 +1397,22 @@ def is_pose_action(action) -> bool:
         }:
             return True
     return False
+
+
+def list_armature_action_objects(armature_obj):
+    """Return Blender action objects relevant to an armature, active action first."""
+    actions = []
+    seen = set()
+    if armature_obj and armature_obj.animation_data and armature_obj.animation_data.action:
+        active = armature_obj.animation_data.action
+        actions.append(active)
+        seen.add(active.name)
+    for action in bpy.data.actions:
+        if action.name in seen or not is_pose_action(action):
+            continue
+        actions.append(action)
+        seen.add(action.name)
+    return actions
 
 
 def list_actions(armature_obj) -> list[dict[str, object]]:
@@ -670,6 +1543,80 @@ def get_bone_world_matrix(armature_obj, bone_name: str) -> list[list[float]]:
         [world_matrix[2][0], world_matrix[2][1], world_matrix[2][2], world_matrix[2][3]],
         [world_matrix[3][0], world_matrix[3][1], world_matrix[3][2], world_matrix[3][3]]
     ]
+
+
+def sample_bone_world_matrices(armature, frames, bone_names=None):
+    """Sample per-bone world matrices for a specific list of frames."""
+    scene = bpy.context.scene
+    if bone_names is None:
+        bone_names = [bone.name for bone in armature.pose.bones]
+    result = np.zeros((len(frames), len(bone_names), 4, 4), dtype=np.float64)
+
+    for frame_index, frame in enumerate(frames):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+
+        for bone_index, bone_name in enumerate(bone_names):
+            pose_bone = armature.pose.bones[bone_name]
+            world_matrix = armature.matrix_world @ pose_bone.matrix
+            result[frame_index, bone_index] = np.array(world_matrix, dtype=np.float64)
+
+    return result
+
+
+def sample_projected_bone_segments_2d(
+    armature,
+    view_cfg,
+    frame_start,
+    frame_end,
+    bone_names=None,
+    projection_space="world",
+    projection_reference_root=None,
+):
+    """Sample projected 2D head/tail segments for each bone on every frame."""
+    scene = bpy.context.scene
+    if bone_names is None:
+        bone_names = [bone.name for bone in armature.pose.bones]
+
+    frames = []
+    fps = scene.render.fps
+
+    for frame in range(frame_start, frame_end + 1):
+        scene.frame_set(frame)
+        bpy.context.view_layer.update()
+        projection_inverse = get_projection_reference_inverse(
+            armature,
+            projection_space=projection_space,
+            reference_root_matrix=projection_reference_root,
+        )
+
+        heads = []
+        tails = []
+        for bone_name in bone_names:
+            pose_bone = armature.pose.bones[bone_name]
+            head_world = armature.matrix_world @ pose_bone.head
+            tail_world = armature.matrix_world @ pose_bone.tail
+            head_2d = project_point_ortho(head_world, view_cfg, projection_inverse=projection_inverse)
+            tail_2d = project_point_ortho(tail_world, view_cfg, projection_inverse=projection_inverse)
+            heads.append([round(head_2d[0], 4), round(head_2d[1], 4)])
+            tails.append([round(tail_2d[0], 4), round(tail_2d[1], 4)])
+
+        frames.append(
+            {
+                "frame": frame,
+                "time": round((frame - frame_start) / fps, 4),
+                "heads": heads,
+                "tails": tails,
+            }
+        )
+
+    return {
+        "fps": fps,
+        "frame_start": frame_start,
+        "frame_end": frame_end,
+        "bones": list(bone_names),
+        "frames": frames,
+    }
 
 
 def extract_mesh_data(mesh_obj) -> dict[str, Any]:

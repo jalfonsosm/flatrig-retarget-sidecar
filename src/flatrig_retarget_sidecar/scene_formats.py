@@ -12,10 +12,9 @@ from importlib import util as importlib_util
 from pathlib import Path
 from typing import Any
 
-from flatrig_retarget_sidecar.spine_import import ROOT_DIR
-
 ENV_BLENDER = "FLATRIG_RETARGET_BLENDER"
 ENV_SCENE_BACKEND = "FLATRIG_RETARGET_SCENE_BACKEND"
+ROOT_DIR = Path(__file__).resolve().parents[2]
 DEFAULT_MACOS_BLENDER = Path("/Applications/Blender.app/Contents/MacOS/Blender")
 BLENDER_SCRIPT = ROOT_DIR / "tools" / "blender_scene_io.py"
 
@@ -368,6 +367,31 @@ def load_3d_scene(source: str, output: str) -> SceneCommandResult:
         payload=payload,
         command=argv,
     )
+
+
+def run_scene_job(request: str, output: str) -> SceneCommandResult:
+    """Run a scene command described by a request JSON file."""
+    request_path = Path(request).expanduser().resolve()
+    output_path = Path(output).expanduser().resolve()
+    payload = json.loads(request_path.read_text(encoding="utf-8"))
+    command = str(payload.get("command") or "").strip()
+    source = str(payload.get("source") or "").strip()
+    if not command:
+        raise ValueError("scene job request requires 'command'.")
+    if not source:
+        raise ValueError("scene job request requires 'source'.")
+
+    if command in {"inspect", "inspect-3d-source"}:
+        return inspect_3d_source(source, str(output_path))
+    if command in {"convert", "convert-3d-source"}:
+        return convert_3d_source(
+            source,
+            str(output_path),
+            target_format=str(payload.get("target_format") or "glb"),
+        )
+    if command == "load-scene":
+        return load_3d_scene(source, str(output_path))
+    raise ValueError(f"Unsupported scene job command: {command}")
 
 
 def probe_scene_backend() -> dict[str, Any]:

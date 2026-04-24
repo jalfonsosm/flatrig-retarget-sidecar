@@ -18,6 +18,7 @@ from flatrig_retarget_sidecar.scene_formats import (
     inspect_3d_source,
     load_3d_scene,
     probe_scene_backend,
+    run_scene_job,
 )
 from flatrig_retarget_sidecar.spine_import import load_spine_package
 
@@ -84,6 +85,13 @@ def main() -> None:
     )
     load_scene_parser.add_argument("source")
     load_scene_parser.add_argument("--output", required=True)
+
+    scene_job_parser = subparsers.add_parser(
+        "scene-job",
+        help="run a scene command from a JSON request file",
+    )
+    scene_job_parser.add_argument("--request", required=True)
+    scene_job_parser.add_argument("--output", required=True)
 
     args = parser.parse_args()
 
@@ -170,6 +178,13 @@ def main() -> None:
 
     if args.command == "load-scene":
         result = load_3d_scene(args.source, args.output)
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "scene-job":
+        result = run_scene_job(args.request, args.output)
         print(json.dumps(result.payload, indent=2))
         if not result.ok:
             raise SystemExit(1)
