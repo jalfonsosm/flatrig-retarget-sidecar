@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -49,11 +51,48 @@ def ensure_shared_venv(python_executable: str) -> Path:
 
 
 def install_deps(python_path: Path, checkout_dir: Path) -> None:
+    print("[install_motion2motion_backend] Upgrading pip...")
     run([str(python_path), "-m", "pip", "install", "--upgrade", "pip"])
-    run([str(python_path), "-m", "pip", "install", "-e", f"{ROOT_DIR}[motion2motion]"])
-    run([str(python_path), "-m", "pip", "install", "-r", str(checkout_dir / "requirements.txt")])
+    print("[install_motion2motion_backend] Installing sidecar package...")
+    run([
+        str(python_path), "-m", "pip", "install", "-e",
+        f"{ROOT_DIR}[motion2motion]"
+    ])
+    print("[install_motion2motion_backend] Installing M2M requirements...")
+    run([
+        str(python_path), "-m", "pip", "install", "-r",
+        str(checkout_dir / "requirements.txt")
+    ])
     if TORCH_INSTALLER.exists():
+        print("[install_motion2motion_backend] Installing torch runtime...")
         run([str(python_path), str(TORCH_INSTALLER)])
+    
+    # Install Spine binary runtime node_modules if Node.js is available
+    spine_runtime_dir = ROOT_DIR / "workflow" / ".spine_binary_runtime"
+    node_executable = shutil.which("node")
+    npm_executable = shutil.which("npm")
+    if node_executable and npm_executable:
+        print("[install_motion2motion_backend] Installing Spine runtime")
+        spine_runtime_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = spine_runtime_dir / "package.json"
+        if not manifest_path.exists():
+            manifest_content = json.dumps({
+                "name": "flatrig-spine-binary-runtime",
+                "private": True,
+                "dependencies": {
+                    "@pixi-spine/runtime-3.8": "4.0.6",
+                    "@pixi-spine/runtime-4.0": "4.0.6",
+                    "@pixi-spine/runtime-4.1": "4.0.6",
+                    "@esotericsoftware/spine-core": "4.2.106",
+                },
+            }, indent=2) + "\n"
+            manifest_path.write_text(manifest_content, encoding="utf-8")
+        run([
+            npm_executable, "install", "--no-audit", "--no-fund"
+        ], cwd=spine_runtime_dir)
+    else:
+        print("[install_motion2motion_backend] WARNING: Node.js not found, "
+              "Spine binary runtime will need npm install at runtime")
 
 
 def main() -> None:
@@ -61,12 +100,12 @@ def main() -> None:
     parser.add_argument(
         "--python",
         required=True,
-        help="Python executable to use for creating the venv and installing dependencies.",
+        help="Python executable to use for creating the venv.",
     )
     parser.add_argument(
         "--install-deps",
         action="store_true",
-        help="Install sidecar and Motion2Motion requirements into the shared .venv.",
+        help="Install requirements into the shared .venv.",
     )
     args = parser.parse_args()
 
@@ -83,16 +122,10 @@ def main() -> None:
     print(f"Shared Python: {venv_python}")
     print()
     print("Notes:")
-    print("- The sidecar and host client use the sidecar root .venv as the single shared runtime.")
-    print("- Device auto-selection prefers CUDA, then CPU based on the torch runtime in that venv.")
-    print(
-        "- Upstream recommends CPU execution for lightweight interactive runs, "
-        "but the sidecar will use acceleration when torch exposes it."
-    )
-    print(
-        "- If auto-detection is wrong for your machine, "
-        "override it with FLATRIG_M2M_DEVICE=cuda, mps or cpu."
-    )
+    print("- The sidecar and host client share .venv as the single runtime.")
+    print("- Device auto-selection prefers CUDA, then CPU.")
+    print("    - Upstream recommends CPU for lightweight runs")
+    print("- If auto-detection is wrong, set FLATRIG_M2M_DEVICE")
 
 
 if __name__ == "__main__":
