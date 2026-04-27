@@ -84,6 +84,8 @@ function runtimePackageFor(version) {
       return "@pixi-spine/runtime-4.1";
     case "4.2":
       return "@esotericsoftware/spine-core";
+    case "4.3":
+      return "@esotericsoftware/spine-core";
     default:
       throw new Error(`Unsupported Spine binary version family: ${version || "<unknown>"}`);
   }

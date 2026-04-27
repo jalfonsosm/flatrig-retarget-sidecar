@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -41,18 +40,6 @@ def ensure_checkout(path: Path) -> None:
     run(["git", "clone", "--depth", "1", M2M_REPO_URL, str(path)])
 
 
-def find_bootstrap_python(preferred: str | None) -> str:
-    candidates = [preferred] if preferred else []
-    candidates.extend(["python3.10", "python3.11", "python3.12", "python3"])
-    for candidate in candidates:
-        if not candidate:
-            continue
-        resolved = shutil.which(candidate)
-        if resolved:
-            return resolved
-    raise RuntimeError("No suitable Python interpreter was found. Install python3.10-3.12.")
-
-
 def ensure_shared_venv(python_executable: str) -> Path:
     python_path = venv_python_path(SHARED_VENV_DIR)
     if python_path.exists():
@@ -73,8 +60,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Bootstrap Motion2Motion.")
     parser.add_argument(
         "--python",
-        default=None,
-        help="Python executable used only to create the shared .venv when it does not exist.",
+        required=True,
+        help="Python executable to use for creating the venv and installing dependencies.",
     )
     parser.add_argument(
         "--install-deps",
@@ -84,7 +71,7 @@ def main() -> None:
     args = parser.parse_args()
 
     checkout_dir = M2M_CHECKOUT_DIR.resolve()
-    python_executable = find_bootstrap_python(args.python)
+    python_executable = args.python
     ensure_checkout(checkout_dir)
     venv_python = ensure_shared_venv(python_executable)
 
@@ -99,10 +86,12 @@ def main() -> None:
     print("- The sidecar and host client use the sidecar root .venv as the single shared runtime.")
     print("- Device auto-selection prefers CUDA, then CPU based on the torch runtime in that venv.")
     print(
-        "- Upstream recommends CPU execution for lightweight interactive runs, but the sidecar will use acceleration when torch exposes it."
+        "- Upstream recommends CPU execution for lightweight interactive runs, "
+        "but the sidecar will use acceleration when torch exposes it."
     )
     print(
-        "- If auto-detection is wrong for your machine, override it with FLATRIG_M2M_DEVICE=cuda, mps or cpu."
+        "- If auto-detection is wrong for your machine, "
+        "override it with FLATRIG_M2M_DEVICE=cuda, mps or cpu."
     )
 
 
