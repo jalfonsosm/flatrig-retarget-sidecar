@@ -32,11 +32,15 @@ from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
 )
 
 M2M_LABEL = "Motion2Motion"
-DEFAULT_M2M_DIR = ROOT_DIR / "workflow" / "external" / "Motion2Motion_codes"
+M2M_DIR = (ROOT_DIR / "workflow" / "external" / "Motion2Motion_codes").resolve()
+SHARED_VENV_DIR = (ROOT_DIR / ".venv").resolve()
+SHARED_VENV_PYTHON = (
+    SHARED_VENV_DIR / "Scripts" / "python.exe"
+    if sys.platform.startswith("win")
+    else SHARED_VENV_DIR / "bin" / "python"
+)
 M2M_RUNNER = "run_M2M.py"
 M2M_DEFAULT_CONFIG = "configs/default.yaml"
-ENV_M2M_DIR = "FLATRIG_M2M_DIR"
-ENV_M2M_PYTHON = "FLATRIG_M2M_PYTHON"
 ENV_M2M_DEVICE = "FLATRIG_M2M_DEVICE"
 ENV_M2M_ALLOW_MPS = "FLATRIG_M2M_ALLOW_MPS"
 ENV_M2M_MATCHING_ALPHA = "FLATRIG_M2M_MATCHING_ALPHA"
@@ -140,64 +144,32 @@ class NormalizedBvhSource:
     matching_to_bvh: dict[str, str]
 
 
-def resolve_motion2motion_dir() -> Path:
-    raw = os.environ.get(ENV_M2M_DIR)
-    if raw:
-        return Path(raw).expanduser().resolve()
-    return DEFAULT_M2M_DIR.resolve()
-
-
-def resolve_motion2motion_python(m2m_dir: Path | None = None) -> Path | None:
-    raw = os.environ.get(ENV_M2M_PYTHON)
-    if raw:
-        candidate = Path(raw).expanduser()
-        if candidate.exists():
-            return candidate
-
-    checkout_dir = m2m_dir or resolve_motion2motion_dir()
-    for candidate in (
-        ROOT_DIR / ".venv" / "bin" / "python",
-        ROOT_DIR / ".venv" / "Scripts" / "python.exe",
-        ROOT_DIR / "env" / "bin" / "python",
-        ROOT_DIR / "env" / "Scripts" / "python.exe",
-        checkout_dir / ".venv312" / "bin" / "python",
-        checkout_dir / ".venv312" / "Scripts" / "python.exe",
-        checkout_dir / ".venv" / "bin" / "python",
-        checkout_dir / ".venv" / "Scripts" / "python.exe",
-    ):
-        if candidate.exists():
-            return candidate
-
-    for executable_name in ("python3.10", "python3.11", "python3.12", "python3.9", "python3"):
-        resolved = shutil.which(executable_name)
-        if resolved:
-            return Path(resolved)
-    return None
-
-
 def _probe_torch_runtime(python_executable: Path, cwd: Path) -> dict[str, Any] | None:
-    completed = subprocess.run(
-        [
-            str(python_executable),
-            "-c",
-            (
-                "import json, torch; "
-                "payload = {"
-                "'torch': torch.__version__, "
-                "'cuda': bool(getattr(torch, 'cuda', None) and torch.cuda.is_available()), "
-                "'mps': bool(("
-                "getattr(getattr(torch, 'backends', None), 'mps', None) "
-                "and torch.backends.mps.is_available()"
-                ") or (getattr(torch, 'mps', None) and torch.mps.is_available()))"
-                "}; "
-                "print(json.dumps(payload))"
-            ),
-        ],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                str(python_executable),
+                "-c",
+                (
+                    "import json, torch; "
+                    "payload = {"
+                    "'torch': torch.__version__, "
+                    "'cuda': bool(getattr(torch, 'cuda', None) and torch.cuda.is_available()), "
+                    "'mps': bool(("
+                    "getattr(getattr(torch, 'backends', None), 'mps', None) "
+                    "and torch.backends.mps.is_available()"
+                    ") or (getattr(torch, 'mps', None) and torch.mps.is_available()))"
+                    "}; "
+                    "print(json.dumps(payload))"
+                ),
+            ],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
     if completed.returncode != 0:
         return None
 
@@ -218,18 +190,14 @@ def _motion2motion_can_use_mps() -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
-def resolve_motion2motion_device(
-    m2m_dir: Path | None = None,
-    python_executable: Path | None = None,
-) -> str:
+def resolve_motion2motion_device(python_executable: Path | None = None) -> str:
     raw = str(os.environ.get(ENV_M2M_DEVICE) or "").strip()
     if raw:
         return raw
 
-    checkout_dir = m2m_dir or resolve_motion2motion_dir()
-    resolved_python = python_executable or resolve_motion2motion_python(checkout_dir)
-    if resolved_python is not None:
-        runtime = _probe_torch_runtime(resolved_python, checkout_dir)
+    resolved_python = python_executable or SHARED_VENV_PYTHON
+    if python_executable is not None or resolved_python.exists():
+        runtime = _probe_torch_runtime(resolved_python, M2M_DIR if M2M_DIR.exists() else ROOT_DIR)
         if runtime:
             if runtime.get("cuda"):
                 return "cuda"
@@ -256,13 +224,13 @@ def resolve_matching_alpha(default: float = 0.9) -> float:
 
 
 def probe_motion2motion_backend() -> Motion2MotionProbe:
-    m2m_dir = resolve_motion2motion_dir()
+    m2m_dir = M2M_DIR
     if not m2m_dir.exists():
         return Motion2MotionProbe(
             available=False,
             detail=(
                 f"{M2M_LABEL} checkout not found at {m2m_dir}. "
-                "Run tools/install_motion2motion_backend.py or set FLATRIG_M2M_DIR."
+                "Run tools/install_motion2motion_backend.py."
             ),
             metadata={"m2m_dir": str(m2m_dir)},
         )
@@ -281,15 +249,19 @@ def probe_motion2motion_backend() -> Motion2MotionProbe:
             metadata={"m2m_dir": str(m2m_dir)},
         )
 
-    python_executable = resolve_motion2motion_python(m2m_dir)
-    if python_executable is None:
+    python_executable = SHARED_VENV_PYTHON
+    if not python_executable.exists():
         return Motion2MotionProbe(
             available=False,
             detail=(
-                f"No compatible Python executable was found for {M2M_LABEL}. "
-                "Install Python 3.10 or 3.12 and re-run the backend installer."
+                f"The shared Python environment was not found at {python_executable}. "
+                "Run tools/install_motion2motion_backend.py --install-deps."
             ),
-            metadata={"m2m_dir": str(m2m_dir)},
+            metadata={
+                "m2m_dir": str(m2m_dir),
+                "venv_dir": str(SHARED_VENV_DIR),
+                "python": str(python_executable),
+            },
         )
 
     runtime = _probe_torch_runtime(python_executable, m2m_dir)
@@ -314,6 +286,7 @@ def probe_motion2motion_backend() -> Motion2MotionProbe:
             ),
             metadata={
                 "m2m_dir": str(m2m_dir),
+                "venv_dir": str(SHARED_VENV_DIR),
                 "python": str(python_executable),
             },
         )
@@ -329,11 +302,12 @@ def probe_motion2motion_backend() -> Motion2MotionProbe:
         ),
         metadata={
             "m2m_dir": str(m2m_dir),
+            "venv_dir": str(SHARED_VENV_DIR),
             "python": str(python_executable),
             "torch": torch_version,
             "cuda_available": cuda_available,
             "mps_available": mps_available,
-            "device": resolve_motion2motion_device(m2m_dir, python_executable),
+            "device": resolve_motion2motion_device(python_executable),
             "mps_auto_disabled": mps_available and not _motion2motion_can_use_mps(),
             "device_policy": (
                 "auto prefers CUDA, then CPU. Apple MPS stays opt-in for Motion2Motion because "
@@ -373,11 +347,12 @@ def retarget_bvh_pair(
     if not probe.available:
         raise RuntimeError(f"{M2M_LABEL} backend unavailable: {probe.detail}")
 
-    m2m_dir = resolve_motion2motion_dir()
-    python_executable = resolve_motion2motion_python(m2m_dir)
-    if python_executable is None:
+    m2m_dir = M2M_DIR
+    python_executable = SHARED_VENV_PYTHON
+    if not python_executable.exists():
         raise RuntimeError(
-            f"{M2M_LABEL} backend probe passed, but the Python executable could not be resolved."
+            f"{M2M_LABEL} backend probe passed, but the shared Python executable is missing "
+            f"at {python_executable}."
         )
 
     source_path = Path(source_bvh).expanduser().resolve()
@@ -451,6 +426,7 @@ def retarget_bvh_pair(
                 "device": resolved_device,
                 "matching_alpha": resolved_matching_alpha,
                 "runner": str((m2m_dir / M2M_RUNNER).resolve()),
+                "venv_dir": str(SHARED_VENV_DIR),
                 "python": str(python_executable),
                 "stdout_tail": _tail_lines(completed.stdout, 40),
             },
@@ -1629,7 +1605,7 @@ def _prepended_sys_path(path: Path) -> Iterator[None]:
 
 @functools.lru_cache(maxsize=1)
 def _load_m2m_bvh_io_module():
-    m2m_dir = resolve_motion2motion_dir()
+    m2m_dir = M2M_DIR
     if not m2m_dir.exists():
         raise RuntimeError(
             f"{M2M_LABEL} checkout not found at {m2m_dir}. "

@@ -9,10 +9,10 @@ import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_CHECKOUT_DIR = ROOT_DIR / "workflow" / "external" / "Motion2Motion_codes"
+M2M_CHECKOUT_DIR = ROOT_DIR / "workflow" / "external" / "Motion2Motion_codes"
 M2M_REPO_URL = "https://github.com/LinghaoChan/Motion2Motion_codes.git"
 TORCH_INSTALLER = ROOT_DIR / "tools" / "install_torch_runtime.py"
-DEFAULT_SHARED_VENV_DIR = ROOT_DIR / ".venv"
+SHARED_VENV_DIR = ROOT_DIR / ".venv"
 
 
 def venv_python_path(venv_dir: Path) -> Path:
@@ -41,9 +41,9 @@ def ensure_checkout(path: Path) -> None:
     run(["git", "clone", "--depth", "1", M2M_REPO_URL, str(path)])
 
 
-def resolve_python(preferred: str | None) -> str:
+def find_bootstrap_python(preferred: str | None) -> str:
     candidates = [preferred] if preferred else []
-    candidates.extend(["python3.10", "python3.11", "python3.12", "python3.9", "python3"])
+    candidates.extend(["python3.10", "python3.11", "python3.12", "python3"])
     for candidate in candidates:
         if not candidate:
             continue
@@ -53,76 +53,51 @@ def resolve_python(preferred: str | None) -> str:
     raise RuntimeError("No suitable Python interpreter was found. Install python3.10-3.12.")
 
 
-def resolve_venv_dir(checkout_dir: Path, python_executable: str, dedicated: bool) -> Path:
-    if not dedicated:
-        return DEFAULT_SHARED_VENV_DIR
-    executable_name = Path(python_executable).name
-    if "3.12" in executable_name:
-        return checkout_dir / ".venv312"
-    return checkout_dir / ".venv"
-
-
-def ensure_venv(checkout_dir: Path, python_executable: str, dedicated: bool) -> Path:
-    venv_dir = resolve_venv_dir(checkout_dir, python_executable, dedicated)
-    python_path = venv_python_path(venv_dir)
+def ensure_shared_venv(python_executable: str) -> Path:
+    python_path = venv_python_path(SHARED_VENV_DIR)
     if python_path.exists():
         return python_path
-    run([python_executable, "-m", "venv", str(venv_dir)])
+    run([python_executable, "-m", "venv", str(SHARED_VENV_DIR)])
     return python_path
 
 
 def install_deps(python_path: Path, checkout_dir: Path) -> None:
     run([str(python_path), "-m", "pip", "install", "--upgrade", "pip"])
+    run([str(python_path), "-m", "pip", "install", "-e", f"{ROOT_DIR}[motion2motion]"])
     run([str(python_path), "-m", "pip", "install", "-r", str(checkout_dir / "requirements.txt")])
     if TORCH_INSTALLER.exists():
-        run([str(python_path), str(TORCH_INSTALLER), "--python", str(python_path)])
+        run([str(python_path), str(TORCH_INSTALLER)])
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Bootstrap Motion2Motion.")
     parser.add_argument(
-        "--checkout",
-        default=str(DEFAULT_CHECKOUT_DIR),
-        help="Directory where Motion2Motion will be cloned.",
-    )
-    parser.add_argument(
         "--python",
         default=None,
-        help="Python executable to use for the dedicated venv.",
+        help="Python executable used only to create the shared .venv when it does not exist.",
     )
     parser.add_argument(
         "--install-deps",
         action="store_true",
-        help="Install Motion2Motion requirements into the dedicated venv.",
-    )
-    parser.add_argument(
-        "--dedicated-venv",
-        action="store_true",
-        help="Use a Motion2Motion-local virtual environment instead of the shared sidecar .venv.",
+        help="Install sidecar and Motion2Motion requirements into the shared .venv.",
     )
     args = parser.parse_args()
 
-    checkout_dir = Path(args.checkout).expanduser().resolve()
-    python_executable = resolve_python(args.python)
+    checkout_dir = M2M_CHECKOUT_DIR.resolve()
+    python_executable = find_bootstrap_python(args.python)
     ensure_checkout(checkout_dir)
-    venv_python = ensure_venv(checkout_dir, python_executable, args.dedicated_venv)
+    venv_python = ensure_shared_venv(python_executable)
 
     if args.install_deps:
         install_deps(venv_python, checkout_dir)
 
     print(f"Motion2Motion checkout: {checkout_dir}")
-    print(f"Motion2Motion venv python: {venv_python}")
-    print(f"Set FLATRIG_M2M_DIR={checkout_dir}")
-    print(f"Set FLATRIG_M2M_PYTHON={venv_python}")
+    print(f"Shared venv: {SHARED_VENV_DIR.resolve()}")
+    print(f"Shared Python: {venv_python}")
     print()
     print("Notes:")
-    print("- The default path reuses the sidecar root .venv so callers share one Torch runtime.")
-    print(
-        "- Pass --dedicated-venv if you explicitly want a Motion2Motion-local environment instead."
-    )
-    print(
-        "- Device auto-selection now prefers CUDA, then MPS, then CPU based on the torch runtime in that venv."
-    )
+    print("- The sidecar and host client use the sidecar root .venv as the single shared runtime.")
+    print("- Device auto-selection prefers CUDA, then CPU based on the torch runtime in that venv.")
     print(
         "- Upstream recommends CPU execution for lightweight interactive runs, but the sidecar will use acceleration when torch exposes it."
     )

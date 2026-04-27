@@ -15,7 +15,7 @@ The sidecar is designed around optional backends:
 
 - Base package: public CLI, Spine parsing, sparse mapping, and scene-backend orchestration.
 - Motion2Motion backend: optional. Installed through `tools/install_motion2motion_backend.py`.
-- Torch runtime: provisioned separately through `tools/install_torch_runtime.py` because the correct wheel flavor depends on the host platform.
+- Torch runtime: installed into the shared `.venv` by the Motion2Motion installer through `tools/install_torch_runtime.py` because the correct wheel flavor depends on the host platform.
 
 That separation keeps the package importable in CI without forcing heavyweight GPU runtimes.
 
@@ -26,7 +26,6 @@ python3.10 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .[dev]
-python tools/install_torch_runtime.py --python .venv/bin/python
 python tools/install_motion2motion_backend.py --install-deps
 pre-commit install
 ```
@@ -44,7 +43,7 @@ python -m pip install -e .[all]
 - Windows/Linux: CUDA wheels by default
 - CPU-only override: `FLATRIG_TORCH_FLAVOR=cpu`
 
-`tools/install_motion2motion_backend.py` reuses the root `.venv` by default so host clients and Motion2Motion resolve the same Torch runtime. Pass `--dedicated-venv` only if you explicitly want a separate backend environment.
+`tools/install_motion2motion_backend.py` uses the sidecar root `.venv` as the single shared runtime for the host client and Motion2Motion. It clones Motion2Motion to `workflow/external/Motion2Motion_codes` and, with `--install-deps`, installs the sidecar package, Motion2Motion requirements, and the pinned Torch runtime into that shared environment.
 
 ## CLI
 
