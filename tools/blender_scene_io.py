@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ TERMINAL_CHAIN_MAX_LENGTH_RATIO = 0.8
 TERMINAL_CHAIN_PARENT_RATIO = 1.5
 TERMINAL_CHAIN_MAX_SPAN = 6
 VECTOR_EPSILON = 1e-8
+M2M_SUFFIX_RE = re.compile(r"__[^\\s]{3}$")
 
 VIEW_PRESETS = {
     "front": {
@@ -469,7 +471,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the public 3D scene worker.")
     parser.add_argument(
         "command",
-        choices=("inspect", "convert", "extract-scene", "extract-animations", "render-sprites"),
+        choices=(
+            "inspect",
+            "convert",
+            "extract-scene",
+            "extract-animations",
+            "render-sprites",
+            "export-3d-animation-bvh",
+            "export-3d-rest-bvh",
+        ),
     )
     parser.add_argument("source")
     parser.add_argument("--output", required=True)
@@ -502,6 +512,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=30.0, help="Target animation FPS")
     parser.add_argument("--frame-start", type=int, default=None, help="First frame to sample")
     parser.add_argument("--frame-end", type=int, default=None, help="Last frame to sample")
+    parser.add_argument("--frame-count", type=int, default=None, help="Frame count for rest BVH export")
     parser.add_argument("--sample-substeps", type=int, default=2, help="Subsamples per frame")
     parser.add_argument(
         "--no-optimize-animation-keys",
@@ -534,6 +545,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drop-problematic-frames", action="store_true", default=False)
     parser.add_argument("--preserve-root-motion", action="store_true", default=False)
     parser.add_argument("--preserve-root-rotation", action="store_true", default=False)
+    parser.add_argument("--bvh-output", help="Path where a BVH export should be written")
     # Sprite rendering parameters
     parser.add_argument(
         "--parts-json", help="JSON file with part triangle keys and projection frames"
@@ -1044,6 +1056,408 @@ def _topological_sort(armature):
         visit(bone)
 
     return sorted_bones
+
+
+def _sanitize_motion2motion_name(name, used_names):
+    """Build a stable Motion2Motion matching name from a Blender bone name."""
+    base = M2M_SUFFIX_RE.sub("", str(name or "")).strip()
+    base = re.sub(r"[^A-Za-z0-9_]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("_")
+    if not base:
+        base = "joint"
+    if base[0].isdigit():
+        base = f"joint_{base}"
+
+    candidate = base
+    suffix = 2
+    while candidate in used_names:
+        candidate = f"{base}_{suffix}"
+        suffix += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def _motion2motion_export_name(matching_name, index):
+    return f"{matching_name}__{int(index):03d}"
+
+
+def _vector_to_json(vector):
+    return [float(vector[0]), float(vector[1]), float(vector[2])]
+
+
+def _view_config_to_json(view_cfg):
+    return {
+        "name": str(view_cfg.get("name") or ""),
+        "preset": view_cfg.get("preset"),
+        "mode": view_cfg.get("mode"),
+        "view_dir": _vector_to_json(view_cfg["view_dir"]),
+        "right_axis": _vector_to_json(view_cfg["right_axis"]),
+        "up_axis": _vector_to_json(view_cfg["up_axis"]),
+        "depth_axis": _vector_to_json(view_cfg["depth_axis"]),
+        "basis_2d": np.asarray(view_cfg["basis_2d"], dtype=np.float64).tolist(),
+        "basis_3d": np.asarray(view_cfg["basis_3d"], dtype=np.float64).tolist(),
+        "roll_degrees": float(view_cfg.get("roll_degrees", 0.0)),
+    }
+
+
+def _build_3d_bvh_layout(armature_obj):
+    """Return Motion2Motion-friendly BVH joints for a Blender armature."""
+    bone_order = _topological_sort(armature_obj)
+    bone_order_index = {name: index for index, name in enumerate(bone_order)}
+    root_bones = [
+        bone
+        for bone in armature_obj.data.bones
+        if bone.parent is None and bone.name in bone_order_index
+    ]
+    root_bones.sort(key=lambda bone: bone_order_index[bone.name])
+    use_synthetic_root = len(root_bones) > 1
+
+    used_names = set()
+    joints = []
+    original_to_bvh = {}
+    bvh_to_original = {}
+    original_to_matching = {}
+    matching_to_bvh = {}
+    name_to_index = {}
+
+    if use_synthetic_root:
+        matching_name = _sanitize_motion2motion_name("sidecar_root", used_names)
+        bvh_name = _motion2motion_export_name(matching_name, 0)
+        joints.append(
+            {
+                "index": 0,
+                "name": None,
+                "matching_name": matching_name,
+                "bvh_name": bvh_name,
+                "parent_index": -1,
+                "parent_bvh_name": None,
+                "offset": [0.0, 0.0, 0.0],
+                "head": [0.0, 0.0, 0.0],
+                "tail": [0.0, 0.0, 0.0],
+                "tail_offset": [1.0, 0.0, 0.0],
+                "length": 0.0,
+                "synthetic": True,
+            }
+        )
+        matching_to_bvh[matching_name] = bvh_name
+        bvh_to_original[bvh_name] = None
+
+    for bone_name in bone_order:
+        rest_bone = armature_obj.data.bones[bone_name]
+        index = len(joints)
+        matching_name = _sanitize_motion2motion_name(rest_bone.name, used_names)
+        bvh_name = _motion2motion_export_name(matching_name, index)
+        parent_index = -1
+        parent_bvh_name = None
+        if rest_bone.parent is not None:
+            parent_index = name_to_index.get(rest_bone.parent.name, -1)
+        elif use_synthetic_root:
+            parent_index = 0
+        if parent_index >= 0:
+            parent_bvh_name = joints[parent_index]["bvh_name"]
+
+        if rest_bone.parent is None:
+            offset_vec = rest_bone.head_local if use_synthetic_root else mathutils.Vector((0.0, 0.0, 0.0))
+        else:
+            offset_vec = rest_bone.head_local - rest_bone.parent.head_local
+        tail_offset_vec = rest_bone.tail_local - rest_bone.head_local
+        length = float(tail_offset_vec.length)
+
+        joint = {
+            "index": index,
+            "name": rest_bone.name,
+            "matching_name": matching_name,
+            "bvh_name": bvh_name,
+            "parent_index": int(parent_index),
+            "parent_bvh_name": parent_bvh_name,
+            "offset": _vector_to_json(offset_vec),
+            "head": _vector_to_json(rest_bone.head_local),
+            "tail": _vector_to_json(rest_bone.tail_local),
+            "tail_offset": _vector_to_json(tail_offset_vec),
+            "length": length,
+            "synthetic": False,
+        }
+        joints.append(joint)
+        name_to_index[rest_bone.name] = index
+        original_to_bvh[rest_bone.name] = bvh_name
+        bvh_to_original[bvh_name] = rest_bone.name
+        original_to_matching[rest_bone.name] = matching_name
+        matching_to_bvh[matching_name] = bvh_name
+
+    return {
+        "joints": joints,
+        "original_to_bvh": original_to_bvh,
+        "bvh_to_original": bvh_to_original,
+        "original_to_matching": original_to_matching,
+        "matching_to_bvh": matching_to_bvh,
+        "root_bvh_name": joints[0]["bvh_name"] if joints else None,
+        "root_matching_name": joints[0]["matching_name"] if joints else None,
+    }
+
+
+def _build_joint_children(joints):
+    children = {int(joint["index"]): [] for joint in joints}
+    for joint in joints:
+        parent_index = int(joint.get("parent_index", -1))
+        if parent_index >= 0:
+            children.setdefault(parent_index, []).append(int(joint["index"]))
+    return children
+
+
+def _write_3d_joint_hierarchy(lines, joints, joint_children, joint_index, depth):
+    joint = joints[joint_index]
+    indent = "\t" * depth
+    label = "ROOT" if int(joint.get("parent_index", -1)) < 0 else "JOINT"
+    lines.append(f"{indent}{label} {joint['bvh_name']}")
+    lines.append(f"{indent}{{")
+    channel_indent = f"{indent}\t"
+    offset = joint.get("offset") or [0.0, 0.0, 0.0]
+    lines.append(f"{channel_indent}OFFSET {offset[0]:.6f} {offset[1]:.6f} {offset[2]:.6f}")
+    lines.append(
+        f"{channel_indent}CHANNELS 6 Xposition Yposition Zposition Xrotation Yrotation Zrotation"
+    )
+
+    children = joint_children.get(joint_index) or []
+    if children:
+        for child_index in children:
+            _write_3d_joint_hierarchy(lines, joints, joint_children, child_index, depth + 1)
+    else:
+        tail_offset = joint.get("tail_offset") or [1.0, 0.0, 0.0]
+        lines.append(f"{channel_indent}End Site")
+        lines.append(f"{channel_indent}{{")
+        lines.append(
+            f"{channel_indent}\tOFFSET {tail_offset[0]:.6f} {tail_offset[1]:.6f} {tail_offset[2]:.6f}"
+        )
+        lines.append(f"{channel_indent}}}")
+
+    lines.append(f"{indent}}}")
+
+
+def _write_3d_bvh(output_path, joints, positions, rotations, fps):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if not joints:
+        raise ValueError("Cannot write BVH without joints.")
+
+    joint_children = _build_joint_children(joints)
+    lines = ["HIERARCHY"]
+    _write_3d_joint_hierarchy(lines, joints, joint_children, 0, 0)
+    lines.append("MOTION")
+    lines.append(f"Frames: {len(positions)}")
+    lines.append(f"Frame Time: {1.0 / fps:.8f}")
+
+    for frame_positions, frame_rotations in zip(positions, rotations, strict=True):
+        values = []
+        cursor = 0
+        for _joint in joints:
+            position_triplet = frame_positions[cursor : cursor + 3]
+            rotation_triplet = frame_rotations[cursor : cursor + 3]
+            cursor += 3
+            values.extend(f"{value:.6f}" for value in position_triplet)
+            values.extend(f"{value:.6f}" for value in rotation_triplet)
+        lines.append(" ".join(values))
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _pose_bone_basis_euler_degrees(pose_bone):
+    euler = pose_bone.matrix_basis.to_euler("XYZ")
+    return [math.degrees(float(euler.x)), math.degrees(float(euler.y)), math.degrees(float(euler.z))]
+
+
+def _sample_action_frames(action, scene, fps, frame_start=None, frame_end=None):
+    scene_fps = float(scene.render.fps) / max(float(scene.render.fps_base), VECTOR_EPSILON)
+    start, end = action.frame_range if action is not None else (scene.frame_start, scene.frame_end)
+    if frame_start is not None:
+        start = float(frame_start)
+    if frame_end is not None:
+        end = float(frame_end)
+    if end < start:
+        end = start
+    duration_seconds = max((float(end) - float(start)) / max(scene_fps, VECTOR_EPSILON), 1.0 / fps)
+    frame_count = max(2, int(math.floor(duration_seconds * fps)) + 1)
+    frame_step = scene_fps / fps
+    return [float(start) + index * frame_step for index in range(frame_count)]
+
+
+def _set_scene_frame_float(scene, frame_value):
+    frame_int = int(math.floor(float(frame_value)))
+    subframe = float(frame_value) - float(frame_int)
+    scene.frame_set(frame_int, subframe=subframe)
+    bpy.context.view_layer.update()
+
+
+def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
+    scene = bpy.context.scene
+    positions = []
+    rotations = []
+    for frame_value in sample_frames:
+        _set_scene_frame_float(scene, frame_value)
+        frame_positions = []
+        frame_rotations = []
+        for joint in layout["joints"]:
+            if joint.get("synthetic"):
+                frame_positions.extend((0.0, 0.0, 0.0))
+                frame_rotations.extend((0.0, 0.0, 0.0))
+                continue
+            pose_bone = armature_obj.pose.bones.get(joint["name"])
+            if pose_bone is None:
+                frame_positions.extend((0.0, 0.0, 0.0))
+                frame_rotations.extend((0.0, 0.0, 0.0))
+                continue
+            location = pose_bone.location
+            frame_positions.extend((float(location.x), float(location.y), float(location.z)))
+            frame_rotations.extend(_pose_bone_basis_euler_degrees(pose_bone))
+        positions.append(frame_positions)
+        rotations.append(frame_rotations)
+    return positions, rotations
+
+
+def _rest_3d_bvh_frames(layout, frame_count=2):
+    frame_count = max(2, int(frame_count or 2))
+    frame_positions = []
+    frame_rotations = []
+    for _joint in layout["joints"]:
+        frame_positions.extend((0.0, 0.0, 0.0))
+        frame_rotations.extend((0.0, 0.0, 0.0))
+    return (
+        [list(frame_positions) for _ in range(frame_count)],
+        [list(frame_rotations) for _ in range(frame_count)],
+    )
+
+
+def _resolve_action_for_export(armature_obj, animation_names):
+    requested = [str(name) for name in (animation_names or []) if str(name).strip()]
+    actions = [action for action in bpy.data.actions if is_pose_action(action)]
+    if requested:
+        wanted = requested[0]
+        for action in actions:
+            if action.name == wanted:
+                return action
+        wanted_lower = wanted.lower()
+        for action in actions:
+            action_name_lower = str(action.name).lower()
+            action_tokens = [token.lower() for token in str(action.name).split("|")]
+            if wanted_lower == action_name_lower or wanted_lower in action_tokens:
+                return action
+            if action_name_lower.endswith("|" + wanted_lower) or wanted_lower in action_name_lower:
+                return action
+        available = ", ".join(sorted(action.name for action in actions)) or "<none>"
+        raise ValueError(f"Animation '{wanted}' not found. Available animations: {available}")
+    if armature_obj.animation_data and armature_obj.animation_data.action:
+        return armature_obj.animation_data.action
+    if actions:
+        return sorted(actions, key=lambda action: str(action.name).lower())[0]
+    return None
+
+
+def export_3d_animation_bvh_cli(
+    source_path: str,
+    output_path: str,
+    bvh_output: str,
+    animation_names: list = None,
+    fps: float = 30.0,
+    frame_start: int = None,
+    frame_end: int = None,
+) -> dict[str, object]:
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+    _mesh_obj, armature_obj = find_mesh_and_armature()
+    if armature_obj is None:
+        return {"ok": False, "detail": "No armature found in scene"}
+    if fps <= 0.0:
+        return {"ok": False, "detail": "fps must be > 0"}
+
+    action = _resolve_action_for_export(armature_obj, animation_names)
+    if action is None:
+        return {"ok": False, "detail": "No pose animation actions found in scene"}
+    if armature_obj.animation_data is None:
+        armature_obj.animation_data_create()
+    armature_obj.animation_data.action = action
+
+    layout = _build_3d_bvh_layout(armature_obj)
+    sample_frames = _sample_action_frames(
+        action,
+        bpy.context.scene,
+        fps,
+        frame_start=frame_start,
+        frame_end=frame_end,
+    )
+    positions, rotations = _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps)
+    _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
+
+    payload = {
+        "ok": True,
+        "detail": "exported",
+        "source": source_path,
+        "output": str(Path(output_path)),
+        "bvh_output": str(Path(bvh_output)),
+        "animation_name": action.name,
+        "duration": round((len(sample_frames) - 1) / fps, 4),
+        "fps": float(fps),
+        "frame_count": len(sample_frames),
+        "frame_time": 1.0 / fps,
+        "positions_mode": "all",
+        **layout,
+    }
+    return payload
+
+
+def export_3d_rest_bvh_cli(
+    source_path: str,
+    output_path: str,
+    bvh_output: str,
+    view_preset: str = "front",
+    view_dir=None,
+    view_up=None,
+    view_roll: float = 0.0,
+    source_frame: int = None,
+    projection_space: str = "world",
+    fps: float = 30.0,
+    frame_count: int = None,
+) -> dict[str, object]:
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+    _mesh_obj, armature_obj = find_mesh_and_armature()
+    if armature_obj is None:
+        return {"ok": False, "detail": "No armature found in scene"}
+    if fps <= 0.0:
+        return {"ok": False, "detail": "fps must be > 0"}
+
+    view_cfg = get_view_config(
+        view_name=view_preset,
+        view_dir=tuple(view_dir) if view_dir is not None else None,
+        up_hint=tuple(view_up) if view_up is not None else None,
+        roll_degrees=view_roll,
+    )
+    bones_2d = extract_bone_hierarchy(
+        armature_obj,
+        view_cfg,
+        source_frame=source_frame,
+        projection_space=projection_space,
+        projection_reference_root=None,
+    )
+    layout = _build_3d_bvh_layout(armature_obj)
+    positions, rotations = _rest_3d_bvh_frames(layout, frame_count=frame_count)
+    _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
+
+    return {
+        "ok": True,
+        "detail": "exported",
+        "source": source_path,
+        "output": str(Path(output_path)),
+        "bvh_output": str(Path(bvh_output)),
+        "animation_name": "__target_rest__",
+        "duration": round((len(positions) - 1) / fps, 4),
+        "fps": float(fps),
+        "frame_count": len(positions),
+        "frame_time": 1.0 / fps,
+        "positions_mode": "all",
+        "projection_space": projection_space,
+        "view": _view_config_to_json(view_cfg),
+        "bones_2d": bones_2d,
+        **layout,
+    }
 
 
 def _default_inherit_mode(record):
@@ -1741,6 +2155,41 @@ def main() -> None:
             drop_problematic_frames=args.drop_problematic_frames,
             preserve_root_motion=args.preserve_root_motion,
             preserve_root_rotation=args.preserve_root_rotation,
+        )
+    elif args.command == "export-3d-animation-bvh":
+        if not args.bvh_output:
+            raise ValueError("--bvh-output is required for export-3d-animation-bvh")
+        payload = export_3d_animation_bvh_cli(
+            source_path,
+            str(output_path),
+            bvh_output=args.bvh_output,
+            animation_names=args.animation_names,
+            fps=args.fps,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+        )
+    elif args.command == "export-3d-rest-bvh":
+        if not args.bvh_output:
+            raise ValueError("--bvh-output is required for export-3d-rest-bvh")
+        view_dir = None
+        view_up = None
+        if args.view_dir:
+            view_dir = tuple(float(x) for x in args.view_dir.split(","))
+        if args.view_up:
+            view_up = tuple(float(x) for x in args.view_up.split(","))
+
+        payload = export_3d_rest_bvh_cli(
+            source_path,
+            str(output_path),
+            bvh_output=args.bvh_output,
+            view_preset=args.view_preset,
+            view_dir=view_dir,
+            view_up=view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            projection_space=args.projection_space,
+            fps=args.fps,
+            frame_count=args.frame_count,
         )
     elif args.command == "render-sprites":
         view_dir = None

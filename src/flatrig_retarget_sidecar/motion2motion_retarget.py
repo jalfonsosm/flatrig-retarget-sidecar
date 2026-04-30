@@ -264,19 +264,19 @@ def probe_motion2motion_backend() -> Motion2MotionProbe:
             },
         )
 
+    completed = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            "import imageio, torch, unfoldNd, yaml; print(torch.__version__)",
+        ],
+        cwd=m2m_dir,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
     runtime = _probe_torch_runtime(python_executable, m2m_dir)
-    if runtime is None:
-        completed = subprocess.run(
-            [
-                str(python_executable),
-                "-c",
-                "import imageio, torch, unfoldNd, yaml; print(torch.__version__)",
-            ],
-            cwd=m2m_dir,
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+    if runtime is None or completed.returncode != 0:
         stderr = (completed.stderr or completed.stdout or "").strip()
         return Motion2MotionProbe(
             available=False,

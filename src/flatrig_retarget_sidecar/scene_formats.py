@@ -264,7 +264,7 @@ def _run_bpy_command_with_args(
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
-        detail = stderr or stdout or payload.get("detail") or "bpy worker command failed."
+        detail = payload.get("detail") or stderr or stdout or "bpy worker command failed."
         payload = {
             **payload,
             "ok": False,
@@ -330,7 +330,7 @@ def _run_blender_command(command: str, source: str, output: str) -> SceneCommand
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
-        detail = stderr or stdout or payload.get("detail") or "Blender command failed."
+        detail = payload.get("detail") or stderr or stdout or "Blender command failed."
         payload = {
             **payload,
             "ok": False,
@@ -415,7 +415,7 @@ def _run_blender_command_with_args(
     if completed.returncode != 0:
         stderr = (completed.stderr or "").strip()
         stdout = (completed.stdout or "").strip()
-        detail = stderr or stdout or payload.get("detail") or "Blender command failed."
+        detail = payload.get("detail") or stderr or stdout or "Blender command failed."
         payload = {
             **payload,
             "ok": False,
@@ -557,6 +557,78 @@ def extract_animations(
     if probe.mode == "bpy_module" and probe.available:
         return _run_bpy_command_with_args("extract-animations", source, output, extra_args)
     return _run_blender_command_with_args("extract-animations", source, output, extra_args)
+
+
+def export_3d_animation_bvh(
+    source: str,
+    output: str,
+    *,
+    bvh_output: str,
+    animation_name: str | None = None,
+    fps: float = 30.0,
+    frame_start: int | None = None,
+    frame_end: int | None = None,
+) -> SceneCommandResult:
+    """Export one 3D source action as a Motion2Motion-friendly BVH plus metadata."""
+    extra_args = [
+        "--bvh-output",
+        str(Path(bvh_output).expanduser().resolve()),
+        "--fps",
+        str(fps),
+    ]
+    if animation_name:
+        extra_args.extend(["--animation", animation_name])
+    if frame_start is not None:
+        extra_args.extend(["--frame-start", str(frame_start)])
+    if frame_end is not None:
+        extra_args.extend(["--frame-end", str(frame_end)])
+
+    probe = probe_scene_backend_impl()
+    if probe.mode == "bpy_module" and probe.available:
+        return _run_bpy_command_with_args("export-3d-animation-bvh", source, output, extra_args)
+    return _run_blender_command_with_args("export-3d-animation-bvh", source, output, extra_args)
+
+
+def export_3d_rest_bvh(
+    source: str,
+    output: str,
+    *,
+    bvh_output: str,
+    view_preset: str = "side",
+    view_dir: str | None = None,
+    view_up: str | None = None,
+    view_roll: float = 0.0,
+    source_frame: int | None = None,
+    projection_space: str = "world",
+    fps: float = 30.0,
+    frame_count: int | None = None,
+) -> SceneCommandResult:
+    """Export the target 3D rest/setup rig as BVH and projected 2D setup metadata."""
+    extra_args = [
+        "--bvh-output",
+        str(Path(bvh_output).expanduser().resolve()),
+        "--view-preset",
+        view_preset,
+        "--projection-space",
+        projection_space,
+        "--fps",
+        str(fps),
+    ]
+    if view_dir:
+        extra_args.extend(["--view-dir", view_dir])
+    if view_up:
+        extra_args.extend(["--view-up", view_up])
+    if view_roll != 0.0:
+        extra_args.extend(["--view-roll", str(view_roll)])
+    if source_frame is not None:
+        extra_args.extend(["--source-frame", str(source_frame)])
+    if frame_count is not None:
+        extra_args.extend(["--frame-count", str(frame_count)])
+
+    probe = probe_scene_backend_impl()
+    if probe.mode == "bpy_module" and probe.available:
+        return _run_bpy_command_with_args("export-3d-rest-bvh", source, output, extra_args)
+    return _run_blender_command_with_args("export-3d-rest-bvh", source, output, extra_args)
 
 
 def render_sprites(

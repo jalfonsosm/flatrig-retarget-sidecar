@@ -13,8 +13,11 @@ from flatrig_retarget_sidecar.motion2motion_retarget import (
     retarget_bvh_to_spine_animation,
     retarget_spine_animation,
 )
+from flatrig_retarget_sidecar.retarget_3d import retarget_3d_animations_to_model
 from flatrig_retarget_sidecar.scene_formats import (
     convert_3d_source,
+    export_3d_animation_bvh,
+    export_3d_rest_bvh,
     extract_animations,
     extract_scene,
     inspect_3d_source,
@@ -61,6 +64,22 @@ def main() -> None:
     bvh_to_spine_parser.add_argument("--target-animation", default=None)
     bvh_to_spine_parser.add_argument("--output", required=True)
     bvh_to_spine_parser.add_argument("--matching-alpha", type=float, default=None)
+
+    retarget_3d_parser = subparsers.add_parser(
+        "retarget-3d-animation-to-model",
+        help="retarget 3D source animations onto a target 3D model rig via Motion2Motion",
+    )
+    retarget_3d_parser.add_argument("source")
+    retarget_3d_parser.add_argument("target_model")
+    retarget_3d_parser.add_argument("--output", required=True)
+    _add_projection_args(retarget_3d_parser)
+    retarget_3d_parser.add_argument("--fps", type=float, default=30.0)
+    retarget_3d_parser.add_argument("--frame-start", type=int, default=None)
+    retarget_3d_parser.add_argument("--frame-end", type=int, default=None)
+    retarget_3d_parser.add_argument("--mapping-file", default=None)
+    retarget_3d_parser.add_argument("--matching-alpha", type=float, default=None)
+    retarget_3d_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
+    retarget_3d_parser.add_argument("--force-mapping-review", action="store_true", default=False)
 
     spine_to_json_parser = subparsers.add_parser(
         "spine-to-json",
@@ -139,6 +158,29 @@ def main() -> None:
         "--preserve-root-rotation", action="store_true", default=False
     )
 
+    export_3d_animation_bvh_parser = subparsers.add_parser(
+        "export-3d-animation-bvh",
+        help="export one 3D source animation as a Motion2Motion-friendly BVH",
+    )
+    export_3d_animation_bvh_parser.add_argument("source")
+    export_3d_animation_bvh_parser.add_argument("--output", required=True)
+    export_3d_animation_bvh_parser.add_argument("--bvh-output", required=True)
+    export_3d_animation_bvh_parser.add_argument("--animation", default=None)
+    export_3d_animation_bvh_parser.add_argument("--fps", type=float, default=30.0)
+    export_3d_animation_bvh_parser.add_argument("--frame-start", type=int, default=None)
+    export_3d_animation_bvh_parser.add_argument("--frame-end", type=int, default=None)
+
+    export_3d_rest_bvh_parser = subparsers.add_parser(
+        "export-3d-rest-bvh",
+        help="export a target 3D model rig as a Motion2Motion target BVH",
+    )
+    export_3d_rest_bvh_parser.add_argument("source")
+    export_3d_rest_bvh_parser.add_argument("--output", required=True)
+    export_3d_rest_bvh_parser.add_argument("--bvh-output", required=True)
+    _add_projection_args(export_3d_rest_bvh_parser)
+    export_3d_rest_bvh_parser.add_argument("--fps", type=float, default=30.0)
+    export_3d_rest_bvh_parser.add_argument("--frame-count", type=int, default=None)
+
     render_sprites_parser = subparsers.add_parser(
         "render-sprites",
         help="render sprites from a 3D source as PNG",
@@ -199,6 +241,31 @@ def main() -> None:
         print(json.dumps(asdict(result), indent=2))
         return
 
+    if args.command == "retarget-3d-animation-to-model":
+        result = retarget_3d_animations_to_model(
+            args.source,
+            args.target_model,
+            animation_names=args.animation_names,
+            output=args.output,
+            mapping_file=args.mapping_file,
+            matching_alpha=args.matching_alpha,
+            quality_threshold=args.mapping_quality_threshold,
+            force_mapping_review=args.force_mapping_review,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            projection_space=args.projection_space,
+            fps=args.fps,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+        )
+        print(json.dumps(result, indent=2))
+        if not result.get("ok"):
+            raise SystemExit(1)
+        return
+
     if args.command == "spine-to-json":
         package = load_spine_package(args.source)
         output_path = Path(args.output).expanduser().resolve()
@@ -228,6 +295,40 @@ def main() -> None:
 
     if args.command == "convert-3d-source":
         result = convert_3d_source(args.source, args.output)
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "export-3d-animation-bvh":
+        result = export_3d_animation_bvh(
+            args.source,
+            args.output,
+            bvh_output=args.bvh_output,
+            animation_name=args.animation,
+            fps=args.fps,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+        )
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "export-3d-rest-bvh":
+        result = export_3d_rest_bvh(
+            args.source,
+            args.output,
+            bvh_output=args.bvh_output,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            projection_space=args.projection_space,
+            fps=args.fps,
+            frame_count=args.frame_count,
+        )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:
             raise SystemExit(1)
