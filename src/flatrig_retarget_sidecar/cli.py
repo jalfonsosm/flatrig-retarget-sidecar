@@ -53,6 +53,7 @@ def main() -> None:
     spine_parser.add_argument("--target-animation", default=None)
     spine_parser.add_argument("--output", required=True)
     spine_parser.add_argument("--matching-alpha", type=float, default=None)
+    spine_parser.add_argument("--mapping-file", default=None)
 
     bvh_to_spine_parser = subparsers.add_parser(
         "retarget-bvh-to-spine",
@@ -64,6 +65,7 @@ def main() -> None:
     bvh_to_spine_parser.add_argument("--target-animation", default=None)
     bvh_to_spine_parser.add_argument("--output", required=True)
     bvh_to_spine_parser.add_argument("--matching-alpha", type=float, default=None)
+    bvh_to_spine_parser.add_argument("--mapping-file", default=None)
 
     retarget_3d_parser = subparsers.add_parser(
         "retarget-3d-animation-to-model",
@@ -213,6 +215,7 @@ def main() -> None:
             args.animation,
             target_animation_name=args.target_animation,
             matching_alpha=args.matching_alpha,
+            mapping_file=args.mapping_file,
         )
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +234,7 @@ def main() -> None:
             animation_name=args.animation_name,
             target_animation_name=args.target_animation,
             matching_alpha=args.matching_alpha,
+            mapping_file=args.mapping_file,
         )
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)

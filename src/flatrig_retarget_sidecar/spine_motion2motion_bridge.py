@@ -163,9 +163,19 @@ def build_exported_motion2motion_mapping(
     *,
     max_pairs: int = 12,
     min_chain_score: float = 0.38,
+    mapping_file: str | Path | None = None,
 ) -> dict[str, Any]:
     source_joints, _, _ = build_bvh_joint_layout(source)
     target_joints, _, _ = build_bvh_joint_layout(target)
+    if mapping_file:
+        return _build_user_exported_motion2motion_mapping(
+            mapping_file,
+            source,
+            target,
+            source_joints,
+            target_joints,
+        )
+
     source_original_to_matching = {
         joint.spine_name: joint.matching_name
         for joint in source_joints
@@ -215,6 +225,100 @@ def build_exported_motion2motion_mapping(
             "target_export_root_bvh_name": target_joints[0].bvh_name,
             "source_original_root": _select_primary_root(source).name,
             "target_original_root": _select_primary_root(target).name,
+            "source_bvh_joint_count": len(source_joints),
+            "target_bvh_joint_count": len(target_joints),
+        },
+    }
+
+
+def _strip_motion2motion_suffix(name: str) -> str:
+    return re.sub(r"__\d{3}$", "", str(name))
+
+
+def _exported_matching_lookup(joints: list[ExportedBvhJoint]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for joint in joints:
+        for key in (
+            joint.spine_name,
+            joint.matching_name,
+            joint.bvh_name,
+            _strip_motion2motion_suffix(joint.bvh_name),
+        ):
+            if key is not None and str(key):
+                lookup[str(key)] = joint.matching_name
+    return lookup
+
+
+def _build_user_exported_motion2motion_mapping(
+    mapping_file: str | Path,
+    source: SpinePackage,
+    target: SpinePackage,
+    source_joints: list[ExportedBvhJoint],
+    target_joints: list[ExportedBvhJoint],
+) -> dict[str, Any]:
+    raw_payload = json.loads(Path(mapping_file).expanduser().read_text(encoding="utf-8"))
+    raw_pairs = raw_payload.get("mapping")
+    if not isinstance(raw_pairs, list):
+        raw_pairs = raw_payload.get("pairs")
+    if not isinstance(raw_pairs, list):
+        raise ValueError("Mapping file must contain a 'mapping' or 'pairs' array.")
+
+    source_lookup = _exported_matching_lookup(source_joints)
+    target_lookup = _exported_matching_lookup(target_joints)
+    source_export_root = source_joints[0].matching_name
+    target_export_root = target_joints[0].matching_name
+    requested_root = raw_payload.get("root_joint") or raw_payload.get("target_root")
+    root_joint = target_lookup.get(str(requested_root), target_export_root) if requested_root else target_export_root
+
+    rewritten_mapping: list[dict[str, str]] = []
+    used_source: set[str] = set()
+    used_target: set[str] = set()
+
+    def add_pair(source_name: str, target_name: str) -> None:
+        if not source_name or not target_name:
+            return
+        if source_name in used_source or target_name in used_target:
+            return
+        rewritten_mapping.append({"source": source_name, "target": target_name})
+        used_source.add(source_name)
+        used_target.add(target_name)
+
+    add_pair(source_export_root, root_joint)
+    for raw_pair in raw_pairs:
+        if not isinstance(raw_pair, dict):
+            continue
+        raw_source = (
+            raw_pair.get("source")
+            or raw_pair.get("source_joint")
+            or raw_pair.get("from")
+            or raw_pair.get("source_bone")
+        )
+        raw_target = (
+            raw_pair.get("target")
+            or raw_pair.get("target_joint")
+            or raw_pair.get("to")
+            or raw_pair.get("target_bone")
+        )
+        if raw_source is None or raw_target is None:
+            continue
+        add_pair(
+            source_lookup.get(str(raw_source), str(raw_source)),
+            target_lookup.get(str(raw_target), str(raw_target)),
+        )
+
+    if not rewritten_mapping:
+        raise ValueError("Mapping file did not contain any usable source/target pairs.")
+
+    return {
+        "source_name": str(raw_payload.get("source_name") or source.source_label),
+        "target_name": str(raw_payload.get("target_name") or target.source_label),
+        "root_joint": root_joint,
+        "mapping": rewritten_mapping,
+        "metadata": {
+            "manual": True,
+            "mapping_file": str(Path(mapping_file).expanduser()),
+            "source_export_root": source_export_root,
+            "target_export_root": target_export_root,
             "source_bvh_joint_count": len(source_joints),
             "target_bvh_joint_count": len(target_joints),
         },

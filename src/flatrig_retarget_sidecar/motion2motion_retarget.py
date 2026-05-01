@@ -440,6 +440,7 @@ def retarget_spine_animation(
     *,
     target_animation_name: str | None = None,
     matching_alpha: float | None = None,
+    mapping_file: str | Path | None = None,
 ) -> Motion2MotionSpineRetargetResult:
     if animation_name not in source.animations:
         available = ", ".join(sorted(source.animations)) or "<none>"
@@ -482,7 +483,11 @@ def retarget_spine_animation(
             metadata_path=target_meta_path,
             positions_mode="all",
         )
-        mapping_payload = build_exported_motion2motion_mapping(source, target_package)
+        mapping_payload = build_exported_motion2motion_mapping(
+            source,
+            target_package,
+            mapping_file=mapping_file,
+        )
         mapping_path.write_text(json.dumps(mapping_payload, indent=2) + "\n", encoding="utf-8")
 
         bvh_result = retarget_bvh_pair(
@@ -513,6 +518,8 @@ def retarget_spine_animation(
             "target_frame_count": target_metadata.frame_count,
             "mapping_pair_count": len(mapping_payload.get("mapping") or []),
             "mapping_root_joint": mapping_payload.get("root_joint"),
+            "mapping_mode": "manual" if mapping_file else "auto",
+            "mapping_file": str(Path(mapping_file).expanduser()) if mapping_file else None,
             "output_bvh": bvh_result.output_bvh,
             "bvh_result": dict(bvh_result.diagnostics),
             "result_bone_count": len(clip.get("bones") or {}),
@@ -531,6 +538,7 @@ def retarget_bvh_to_spine_animation(
     animation_name: str | None = None,
     target_animation_name: str | None = None,
     matching_alpha: float | None = None,
+    mapping_file: str | Path | None = None,
 ) -> Motion2MotionSpineRetargetResult:
     source_path = Path(source_bvh).expanduser().resolve()
     if not source_path.exists():
@@ -572,11 +580,25 @@ def retarget_bvh_to_spine_animation(
             positions_mode="all",
         )
         target_skeleton = build_generic_skeleton_from_exported_spine_bvh(target_metadata)
-        mapping_payload, mapping_diagnostics = build_auto_sparse_mapping_payload(
-            normalized_source.skeleton,
-            target_skeleton,
-            root_joint=target_metadata.root_matching_name,
-        )
+        if mapping_file:
+            raw_mapping = json.loads(Path(mapping_file).expanduser().read_text(encoding="utf-8"))
+            mapping_payload = _normalize_generic_user_mapping_payload(
+                raw_mapping,
+                normalized_source.skeleton,
+                target_skeleton,
+                target_metadata.root_matching_name,
+            )
+            mapping_diagnostics = {
+                "manual": True,
+                "mapping_pair_count": len(mapping_payload.get("mapping") or []),
+                "source": str(Path(mapping_file).expanduser()),
+            }
+        else:
+            mapping_payload, mapping_diagnostics = build_auto_sparse_mapping_payload(
+                normalized_source.skeleton,
+                target_skeleton,
+                root_joint=target_metadata.root_matching_name,
+            )
         mapping_path.write_text(json.dumps(mapping_payload, indent=2) + "\n", encoding="utf-8")
 
         bvh_result = retarget_bvh_pair(
@@ -604,6 +626,8 @@ def retarget_bvh_to_spine_animation(
             "source_joint_count": int(source_inspection.get("joint_count") or 0),
             "mapping_pair_count": len(mapping_payload.get("mapping") or []),
             "mapping_root_joint": mapping_payload.get("root_joint"),
+            "mapping_mode": "manual" if mapping_file else "auto",
+            "mapping_file": str(Path(mapping_file).expanduser()) if mapping_file else None,
             "mapping_diagnostics": mapping_diagnostics,
             "output_bvh": bvh_result.output_bvh,
             "bvh_result": dict(bvh_result.diagnostics),
@@ -1374,6 +1398,82 @@ def build_generic_skeleton_from_exported_spine_bvh(
             dtype=np.float64,
         ),
     )
+
+
+def _generic_matching_lookup(skeleton: GenericSkeletonDescription) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for node in skeleton.nodes:
+        for key in (
+            node.name,
+            node.bvh_name,
+            _strip_motion2motion_suffix(node.bvh_name),
+        ):
+            if key is not None and str(key):
+                lookup[str(key)] = node.name
+    return lookup
+
+
+def _normalize_generic_user_mapping_payload(
+    raw_payload: dict[str, Any],
+    source_skeleton: GenericSkeletonDescription,
+    target_skeleton: GenericSkeletonDescription,
+    root_joint: str,
+) -> dict[str, Any]:
+    raw_pairs = raw_payload.get("mapping")
+    if not isinstance(raw_pairs, list):
+        raw_pairs = raw_payload.get("pairs")
+    if not isinstance(raw_pairs, list):
+        raise ValueError("Mapping file must contain a 'mapping' or 'pairs' array.")
+
+    source_lookup = _generic_matching_lookup(source_skeleton)
+    target_lookup = _generic_matching_lookup(target_skeleton)
+    requested_root = raw_payload.get("root_joint") or raw_payload.get("target_root") or root_joint
+
+    pairs: list[dict[str, str]] = []
+    used_source: set[str] = set()
+    used_target: set[str] = set()
+
+    def add_pair(source_name: str, target_name: str) -> None:
+        if not source_name or not target_name:
+            return
+        if source_name in used_source or target_name in used_target:
+            return
+        pairs.append({"source": source_name, "target": target_name})
+        used_source.add(source_name)
+        used_target.add(target_name)
+
+    add_pair(source_skeleton.root_name, target_lookup.get(str(requested_root), str(requested_root)))
+    for raw_pair in raw_pairs:
+        if not isinstance(raw_pair, dict):
+            continue
+        raw_source = (
+            raw_pair.get("source")
+            or raw_pair.get("source_joint")
+            or raw_pair.get("from")
+            or raw_pair.get("source_bone")
+        )
+        raw_target = (
+            raw_pair.get("target")
+            or raw_pair.get("target_joint")
+            or raw_pair.get("to")
+            or raw_pair.get("target_bone")
+        )
+        if raw_source is None or raw_target is None:
+            continue
+        add_pair(
+            source_lookup.get(str(raw_source), str(raw_source)),
+            target_lookup.get(str(raw_target), str(raw_target)),
+        )
+
+    if not pairs:
+        raise ValueError("Mapping file did not contain any usable source/target pairs.")
+
+    return {
+        "source_name": str(raw_payload.get("source_name") or source_skeleton.label),
+        "target_name": str(raw_payload.get("target_name") or target_skeleton.label),
+        "root_joint": target_lookup.get(str(requested_root), str(requested_root)),
+        "mapping": pairs,
+    }
 
 
 def build_auto_sparse_mapping_payload(
