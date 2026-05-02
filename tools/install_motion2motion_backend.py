@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ M2M_CHECKOUT_DIR = ROOT_DIR / "workflow" / "external" / "Motion2Motion_codes"
 M2M_REPO_URL = "https://github.com/LinghaoChan/Motion2Motion_codes.git"
 TORCH_INSTALLER = ROOT_DIR / "tools" / "install_torch_runtime.py"
 SHARED_VENV_DIR = ROOT_DIR / ".venv"
+REQUIRED_PYTHON = (3, 11)
 
 
 def venv_python_path(venv_dir: Path) -> Path:
@@ -35,6 +37,35 @@ def run(command: list[str], *, cwd: Path | None = None) -> None:
         raise RuntimeError(f"Command failed: {' '.join(command)}\n{stderr}")
 
 
+def python_major_minor(python_executable: str | Path) -> tuple[int, int]:
+    completed = subprocess.run(
+        [
+            str(python_executable),
+            "-c",
+            "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+        ],
+        check=False,
+        text=True,
+        capture_output=True,
+    )
+    if completed.returncode != 0:
+        stderr = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"Could not query Python version for {python_executable}\n{stderr}")
+    major, minor = completed.stdout.strip().split(".", 1)
+    return int(major), int(minor)
+
+
+def ensure_supported_python(python_executable: str | Path) -> None:
+    version = python_major_minor(python_executable)
+    if version != REQUIRED_PYTHON:
+        required = ".".join(str(part) for part in REQUIRED_PYTHON)
+        actual = ".".join(str(part) for part in version)
+        raise RuntimeError(
+            f"Motion2Motion sidecar requires Python {required}; got Python {actual} "
+            f"from {python_executable}"
+        )
+
+
 def ensure_checkout(path: Path) -> None:
     if path.exists():
         return
@@ -42,8 +73,42 @@ def ensure_checkout(path: Path) -> None:
     run(["git", "clone", "--depth", "1", M2M_REPO_URL, str(path)])
 
 
+def requirement_name(line: str) -> str:
+    requirement = line.split("#", 1)[0].strip()
+    if not requirement or requirement.startswith(("-", "git+", "http:", "https:")):
+        return ""
+    for separator in ("==", ">=", "<=", "~=", "!=", ">", "<", "[", ";"):
+        requirement = requirement.split(separator, 1)[0]
+    return requirement.strip().lower().replace("_", "-")
+
+
+def filtered_m2m_requirements(source: Path) -> Path:
+    blocked = {"numpy", "torch"}
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        prefix="flatrig-m2m-requirements-",
+        suffix=".txt",
+        delete=False,
+    ) as handle:
+        output_path = Path(handle.name)
+        for line in source.read_text(encoding="utf-8").splitlines():
+            if requirement_name(line) in blocked:
+                continue
+            handle.write(f"{line}\n")
+    return output_path
+
+
 def ensure_shared_venv(python_executable: str) -> Path:
+    ensure_supported_python(python_executable)
     python_path = venv_python_path(SHARED_VENV_DIR)
+    if python_path.exists():
+        try:
+            if python_major_minor(python_path) == REQUIRED_PYTHON:
+                return python_path
+        except RuntimeError:
+            pass
+        shutil.rmtree(SHARED_VENV_DIR)
     if python_path.exists():
         return python_path
     run([python_executable, "-m", "venv", str(SHARED_VENV_DIR)])
@@ -59,10 +124,14 @@ def install_deps(python_path: Path, checkout_dir: Path) -> None:
         f"{ROOT_DIR}[motion2motion]"
     ])
     print("[install_motion2motion_backend] Installing M2M requirements...")
-    run([
-        str(python_path), "-m", "pip", "install", "-r",
-        str(checkout_dir / "requirements.txt")
-    ])
+    filtered_requirements = filtered_m2m_requirements(checkout_dir / "requirements.txt")
+    try:
+        run([
+            str(python_path), "-m", "pip", "install", "-r",
+            str(filtered_requirements)
+        ])
+    finally:
+        filtered_requirements.unlink(missing_ok=True)
     if TORCH_INSTALLER.exists():
         print("[install_motion2motion_backend] Installing torch runtime...")
         run([str(python_path), str(TORCH_INSTALLER)])

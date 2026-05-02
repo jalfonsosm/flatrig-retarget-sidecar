@@ -468,6 +468,7 @@ def retarget_spine_animation(
         target_meta_path = temp_dir / "target.meta.json"
         mapping_path = temp_dir / "mapping.json"
         retargeted_bvh_path = temp_dir / "retargeted.bvh"
+        target_guide_diagnostics: dict[str, Any] | None = None
 
         source_metadata = export_spine_animation_to_bvh(
             source,
@@ -476,17 +477,42 @@ def retarget_spine_animation(
             metadata_path=source_meta_path,
             positions_mode="all",
         )
+        mapping_payload = build_exported_motion2motion_mapping(
+            source,
+            target_package,
+            mapping_file=mapping_file,
+        )
+        if synthesized_target_rest and mapping_file:
+            target_guide_clip, target_guide_diagnostics = _direct_spine_mapping_transfer(
+                source,
+                target_package,
+                animation_name,
+                mapping_file,
+                reason="manual_mapping_target_guide",
+            )
+            if _spine_clip_has_motion(target_guide_clip):
+                resolved_target_animation_name = "__sidecar_mapping_guide__"
+                target_payload = copy.deepcopy(target_package.payload)
+                target_animations = dict(target_payload.get("animations") or {})
+                target_animations[resolved_target_animation_name] = target_guide_clip
+                target_payload["animations"] = target_animations
+                target_package = build_spine_package(
+                    target_payload,
+                    source_label=target_package.source_label,
+                )
+                synthesized_target_rest = False
+                mapping_payload = build_exported_motion2motion_mapping(
+                    source,
+                    target_package,
+                    mapping_file=mapping_file,
+                )
+
         target_metadata = export_spine_animation_to_bvh(
             target_package,
             resolved_target_animation_name,
             target_bvh_path,
             metadata_path=target_meta_path,
             positions_mode="all",
-        )
-        mapping_payload = build_exported_motion2motion_mapping(
-            source,
-            target_package,
-            mapping_file=mapping_file,
         )
         mapping_path.write_text(json.dumps(mapping_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -524,11 +550,159 @@ def retarget_spine_animation(
             "bvh_result": dict(bvh_result.diagnostics),
             "result_bone_count": len(clip.get("bones") or {}),
         }
+        if target_guide_diagnostics is not None:
+            diagnostics["target_guide"] = target_guide_diagnostics
         return Motion2MotionSpineRetargetResult(
             animation_name=animation_name,
             animation=clip,
             diagnostics=diagnostics,
         )
+
+
+def _direct_spine_mapping_transfer(
+    source: SpinePackage,
+    target: SpinePackage,
+    animation_name: str,
+    mapping_file: str | Path,
+    *,
+    reason: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw_payload = json.loads(Path(mapping_file).expanduser().read_text(encoding="utf-8"))
+    raw_pairs = raw_payload.get("mapping")
+    if not isinstance(raw_pairs, list):
+        raw_pairs = raw_payload.get("pairs")
+    if not isinstance(raw_pairs, list):
+        raw_pairs = []
+
+    source_animation = source.animations.get(animation_name)
+    source_timelines = (
+        (source_animation or {}).get("bones")
+        if isinstance(source_animation, dict)
+        else None
+    )
+    if not isinstance(source_timelines, dict):
+        return {}, {
+            "mode": "direct_spine_mapping",
+            "reason": "source_animation_has_no_bone_timelines",
+            "mapping_file": str(Path(mapping_file).expanduser()),
+        }
+
+    source_lookup = _spine_bone_name_lookup(source)
+    target_lookup = _spine_bone_name_lookup(target)
+    pairs: list[tuple[str, str]] = []
+    used_source: set[str] = set()
+    used_target: set[str] = set()
+
+    def add_pair(raw_source: Any, raw_target: Any) -> None:
+        source_name = source_lookup.get(str(raw_source)) if raw_source is not None else None
+        target_name = target_lookup.get(str(raw_target)) if raw_target is not None else None
+        if not source_name or not target_name:
+            return
+        if source_name in used_source or target_name in used_target:
+            return
+        pairs.append((source_name, target_name))
+        used_source.add(source_name)
+        used_target.add(target_name)
+
+    if source.bones and target.bones:
+        requested_root = raw_payload.get("root_joint") or raw_payload.get("target_root")
+        add_pair(source.bones[0].name, requested_root or target.bones[0].name)
+
+    for raw_pair in raw_pairs:
+        if not isinstance(raw_pair, dict):
+            continue
+        add_pair(
+            raw_pair.get("source")
+            or raw_pair.get("source_joint")
+            or raw_pair.get("from")
+            or raw_pair.get("source_bone"),
+            raw_pair.get("target")
+            or raw_pair.get("target_joint")
+            or raw_pair.get("to")
+            or raw_pair.get("target_bone"),
+        )
+
+    transferred_bones: dict[str, Any] = {}
+    skipped_source_bones: list[str] = []
+    for source_name, target_name in pairs:
+        source_bone_timelines = source_timelines.get(source_name)
+        if not isinstance(source_bone_timelines, dict):
+            skipped_source_bones.append(source_name)
+            continue
+        copied = _copy_spine_transfer_timelines(source_bone_timelines)
+        if copied:
+            transferred_bones[target_name] = copied
+
+    clip = {"bones": transferred_bones} if transferred_bones else {}
+    diagnostics = {
+        "mode": "direct_spine_mapping",
+        "reason": reason,
+        "mapping_file": str(Path(mapping_file).expanduser()),
+        "mapping_pair_count": len(pairs),
+        "transferred_bone_count": len(transferred_bones),
+        "skipped_source_bones": skipped_source_bones,
+        "result_has_motion": _spine_clip_has_motion(clip),
+    }
+    return clip, diagnostics
+
+
+def _copy_spine_transfer_timelines(source_bone_timelines: dict[str, Any]) -> dict[str, Any]:
+    copied: dict[str, Any] = {}
+    for timeline_name in ("rotate", "translate", "shear"):
+        frames = source_bone_timelines.get(timeline_name)
+        if isinstance(frames, list) and frames:
+            copied[timeline_name] = copy.deepcopy(frames)
+    return copied
+
+
+def _spine_bone_name_lookup(package: SpinePackage) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for name in package.bones_by_name:
+        for key in {name, name.lower(), _spine_bone_lookup_key(name)}:
+            if key:
+                lookup.setdefault(key, name)
+    return lookup
+
+
+def _spine_bone_lookup_key(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(name).split(":")[-1].lower())
+
+
+def _spine_clip_has_motion(clip: dict[str, Any], tolerance: float = 1e-5) -> bool:
+    for timelines in (clip.get("bones") or {}).values():
+        if not isinstance(timelines, dict):
+            continue
+        for frames in timelines.values():
+            if not isinstance(frames, list) or len(frames) < 2:
+                continue
+            first = _timeline_numeric_values(frames[0])
+            for frame in frames[1:]:
+                current = _timeline_numeric_values(frame)
+                if len(current) != len(first):
+                    return True
+                if any(abs(a - b) > tolerance for a, b in zip(first, current)):
+                    return True
+    return False
+
+
+def _timeline_numeric_values(value: Any) -> list[float]:
+    if isinstance(value, bool):
+        return []
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, list):
+        values: list[float] = []
+        for item in value:
+            values.extend(_timeline_numeric_values(item))
+        return values
+    if isinstance(value, dict):
+        values: list[float] = []
+        for key, item in value.items():
+            if str(key).lower() in {"time", "curve", "c", "c2", "c3", "c4"}:
+                continue
+            values.extend(_timeline_numeric_values(item))
+        return values
+    return []
 
 
 def retarget_bvh_to_spine_animation(
