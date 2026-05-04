@@ -60,6 +60,7 @@ def retarget_3d_animations_to_model(
     fps: float = 30.0,
     frame_start: int | None = None,
     frame_end: int | None = None,
+    include_preview_3d: bool = False,
 ) -> dict[str, Any]:
     """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON."""
     source_path = Path(source).expanduser().resolve()
@@ -82,6 +83,7 @@ def retarget_3d_animations_to_model(
             )
 
         animations: list[dict[str, Any]] = []
+        preview_3d_animations: list[dict[str, Any]] = []
         clip_diagnostics: list[dict[str, Any]] = []
         review_required = False
         target_joint_count = 0
@@ -105,6 +107,7 @@ def retarget_3d_animations_to_model(
                 fps=fps,
                 frame_start=frame_start,
                 frame_end=frame_end,
+                include_preview_3d=include_preview_3d,
             )
             clip_diagnostics.append(clip_result["diagnostics"])
             target_joint_count = max(
@@ -113,6 +116,8 @@ def retarget_3d_animations_to_model(
             )
             if clip_result.get("animation"):
                 animations.append(clip_result["animation"])
+            if clip_result.get("preview_3d"):
+                preview_3d_animations.append(clip_result["preview_3d"])
             review_required = review_required or bool(
                 clip_result["diagnostics"].get("mapping_review_required")
             )
@@ -138,6 +143,8 @@ def retarget_3d_animations_to_model(
                 "clips": clip_diagnostics,
             },
         }
+        if include_preview_3d:
+            payload["preview_3d_animations"] = preview_3d_animations
         return _write_optional_output(output, payload)
 
 
@@ -160,6 +167,7 @@ def _retarget_one_3d_clip(
     fps: float,
     frame_start: int | None,
     frame_end: int | None,
+    include_preview_3d: bool,
 ) -> dict[str, Any]:
     safe_clip_name = _safe_file_stem(clip_name)
     source_bvh = temp_dir / f"source_{safe_clip_name}.bvh"
@@ -244,6 +252,15 @@ def _retarget_one_3d_clip(
             target_metadata,
             animation_name=clip_name,
         )
+        preview_3d = (
+            bvh_to_preview_3d_animation(
+                retargeted_bvh,
+                target_metadata,
+                animation_name=clip_name,
+            )
+            if include_preview_3d
+            else None
+        )
     except Exception as exc:
         diagnostics.update(
             {
@@ -257,7 +274,7 @@ def _retarget_one_3d_clip(
                 "target_joint_count": len(target_metadata.get("joints") or []),
             }
         )
-        return {"animation": None, "diagnostics": diagnostics}
+        return {"animation": None, "preview_3d": None, "diagnostics": diagnostics}
 
     diagnostics.update(
         {
@@ -279,7 +296,7 @@ def _retarget_one_3d_clip(
             "result_bone_count": len(animation.get("bones") or {}),
         }
     )
-    return {"animation": animation, "diagnostics": diagnostics}
+    return {"animation": animation, "preview_3d": preview_3d, "diagnostics": diagnostics}
 
 
 def build_generic_skeleton_from_exported_3d_metadata(
@@ -447,6 +464,95 @@ def bvh_to_flatrig_animation(
         "duration": round(max(0.0, (frame_count - 1) * frametime), 4),
         "bones": compressed_bones,
     }
+
+
+def bvh_to_preview_3d_animation(
+    bvh_path: str | Path,
+    target_metadata: dict[str, Any],
+    *,
+    animation_name: str,
+) -> dict[str, Any]:
+    """Convert retargeted BVH into compact 3D joint samples for the web preview."""
+    animation = _load_bvh_animation(bvh_path)
+    frame_count = int(animation.rotations.shape[0])
+    frametime = float(animation.frametime)
+    names = [str(name) for name in animation.names]
+    parents = [int(parent_index) for parent_index in animation.parents]
+    offsets = np.asarray(animation.offsets, dtype=np.float64)
+    positions = np.asarray(animation.positions, dtype=np.float64)
+    rotations = np.asarray(animation.rotations, dtype=np.float64)
+
+    joint_metadata_by_bvh_name = _joint_metadata_lookup(target_metadata)
+    children = _metadata_children(target_metadata)
+    frames: list[dict[str, Any]] = []
+
+    for frame_index in range(frame_count):
+        frame_bones: list[dict[str, Any]] = []
+        world_cache: list[dict[str, Any] | None] = [None] * len(names)
+
+        for joint_index, bvh_name in enumerate(names):
+            joint_metadata = joint_metadata_by_bvh_name.get(bvh_name) or joint_metadata_by_bvh_name.get(
+                _strip_motion2motion_suffix(bvh_name)
+            )
+
+            local_position = np.asarray(positions[frame_index, joint_index], dtype=np.float64)
+            local_offset = np.asarray(offsets[joint_index], dtype=np.float64)
+            local_rotation_3d = _euler_xyz_degrees_to_matrix(rotations[frame_index, joint_index])
+            parent_index = parents[joint_index]
+
+            if parent_index < 0:
+                head_3d = local_offset + local_position
+                world_rotation_3d = local_rotation_3d
+            else:
+                parent_state = world_cache[parent_index]
+                if parent_state is None:
+                    world_cache[joint_index] = None
+                    continue
+                head_3d = (
+                    parent_state["head_3d"]
+                    + parent_state["world_rotation_3d"] @ (local_offset + local_position)
+                )
+                world_rotation_3d = parent_state["world_rotation_3d"] @ local_rotation_3d
+
+            world_cache[joint_index] = {
+                "head_3d": head_3d,
+                "world_rotation_3d": world_rotation_3d,
+            }
+            if joint_metadata is None:
+                continue
+
+            tail_offset = _joint_tail_offset(joint_metadata, children)
+            tail_3d = head_3d + world_rotation_3d @ tail_offset
+            original_name = joint_metadata.get("name")
+            if original_name is None:
+                continue
+            frame_bones.append(
+                {
+                    "name": str(original_name),
+                    "head": _vector3_to_list(head_3d),
+                    "tail": _vector3_to_list(tail_3d),
+                }
+            )
+
+        frames.append(
+            {
+                "time": round(frame_index * frametime, 4),
+                "bones": frame_bones,
+            }
+        )
+
+    return {
+        "name": animation_name,
+        "duration": round(max(0.0, (frame_count - 1) * frametime), 4),
+        "fps": round((1.0 / frametime) if frametime > 0 else 30.0, 4),
+        "frame_count": frame_count,
+        "frames": frames,
+    }
+
+
+def _vector3_to_list(vector) -> list[float]:
+    arr = np.asarray(vector, dtype=np.float64).reshape(3)
+    return [round(float(arr[0]), 6), round(float(arr[1]), 6), round(float(arr[2]), 6)]
 
 
 def _inspect_source_action_names(source_path: Path, temp_dir: Path) -> list[str]:

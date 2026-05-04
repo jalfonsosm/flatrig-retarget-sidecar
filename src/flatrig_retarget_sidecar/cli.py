@@ -82,6 +82,7 @@ def main() -> None:
     retarget_3d_parser.add_argument("--matching-alpha", type=float, default=None)
     retarget_3d_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
     retarget_3d_parser.add_argument("--force-mapping-review", action="store_true", default=False)
+    retarget_3d_parser.add_argument("--include-preview-3d", action="store_true", default=False)
 
     spine_to_json_parser = subparsers.add_parser(
         "spine-to-json",
@@ -268,6 +269,7 @@ def main() -> None:
             fps=args.fps,
             frame_start=args.frame_start,
             frame_end=args.frame_end,
+            include_preview_3d=args.include_preview_3d,
         )
         print(json.dumps(result, indent=2))
         if not result.get("ok"):

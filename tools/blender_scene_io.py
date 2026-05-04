@@ -1892,6 +1892,40 @@ def _weights_to_json(weights):
     return serialized
 
 
+def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
+    """Extract 3D bone heads/tails in world space for preview/debug rendering."""
+    if armature is None:
+        return []
+
+    scene = bpy.context.scene
+    if source_frame is None:
+        source_frame = scene.frame_start
+    scene.frame_set(source_frame)
+    bpy.context.view_layer.update()
+
+    bones = []
+    for idx, bone_name in enumerate(_topological_sort(armature)):
+        rest_bone = armature.data.bones[bone_name]
+        pose_bone = armature.pose.bones.get(bone_name)
+        if use_rest_pose or pose_bone is None:
+            head_world = armature.matrix_world @ rest_bone.head_local
+            tail_world = armature.matrix_world @ rest_bone.tail_local
+        else:
+            head_world = armature.matrix_world @ pose_bone.head
+            tail_world = armature.matrix_world @ pose_bone.tail
+        bones.append(
+            {
+                "name": bone_name,
+                "parent": rest_bone.parent.name if rest_bone.parent else None,
+                "index": idx,
+                "head": _vector_to_json(head_world),
+                "tail": _vector_to_json(tail_world),
+                "length": float((tail_world - head_world).length),
+            }
+        )
+    return bones
+
+
 def _timeline_duration(timeline: dict[str, object]) -> float:
     duration = 0.0
     for key in ("rotate", "translate", "scale", "shear"):
@@ -1970,6 +2004,10 @@ def extract_scene_cli(
             projection_space=projection_space,
             projection_reference_root=None,
         )
+    bones_3d = extract_bone_hierarchy_3d(
+        armature_obj,
+        source_frame=source_frame,
+    )
 
     # Extract mesh
     mesh_data = extract_2d_mesh(
@@ -2026,6 +2064,7 @@ def extract_scene_cli(
         "source": source_path,
         "mesh": mesh_data,
         "bones": bones,
+        "bones_3d": bones_3d,
         "source_weights": _weights_to_json(source_weights),
         "mesh_reduction": mesh_reduction_report,
     }
