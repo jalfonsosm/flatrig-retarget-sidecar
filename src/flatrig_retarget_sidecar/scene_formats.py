@@ -443,6 +443,8 @@ def extract_scene(
     view_roll: float = 0.0,
     source_frame: int = None,
     projection_space: str = "world",
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
 ) -> SceneCommandResult:
     """Extract scene data (mesh, bones, weights) using projection."""
     extra_args = [
@@ -459,6 +461,10 @@ def extract_scene(
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
         extra_args.extend(["--source-frame", str(source_frame)])
+    if mesh_reduction:
+        extra_args.extend(["--mesh-target-vertices", str(mesh_target_vertices)])
+    else:
+        extra_args.append("--no-mesh-reduction")
 
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:

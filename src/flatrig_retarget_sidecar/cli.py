@@ -111,6 +111,10 @@ def main() -> None:
     extract_scene_parser.add_argument("source")
     extract_scene_parser.add_argument("--output", required=True)
     _add_projection_args(extract_scene_parser)
+    extract_scene_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
+    extract_scene_parser.add_argument(
+        "--no-mesh-reduction", dest="mesh_reduction", action="store_false", default=True
+    )
 
     extract_animations_parser = subparsers.add_parser(
         "extract-animations",
@@ -348,6 +352,8 @@ def main() -> None:
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             projection_space=args.projection_space,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
         )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:

@@ -415,7 +415,7 @@ def extract_2d_mesh(
 
     if projection_frame is None:
         projection_frame = compute_projection_frame(vertices_2d)
-    uvs = project_points_to_uv(vertices_2d, projection_frame)
+    fallback_uvs = project_points_to_uv(vertices_2d, projection_frame)
 
     # Compute depths
     depths = np.array(
@@ -426,15 +426,54 @@ def extract_2d_mesh(
         dtype=np.float64,
     )
 
-    # Triangulate mesh
     bm = bmesh.new()
     bm.from_mesh(eval_mesh)
     bmesh.ops.triangulate(bm, faces=bm.faces[:])
+    bm.faces.ensure_lookup_table()
+    uv_layer = bm.loops.layers.uv.active
 
+    output_vertices_2d = []
+    output_vertices_3d = []
+    output_uvs = []
+    output_depths = []
+    source_vertex_indices = []
     triangles = []
     triangle_keys = []
+    vertex_remap = {}
+
     for face in bm.faces:
-        tri = [vert.index for vert in face.verts]
+        if len(face.loops) != 3:
+            continue
+        tri = []
+        for loop in face.loops:
+            source_index = int(loop.vert.index)
+            if source_index < 0 or source_index >= len(vertices_2d):
+                continue
+            if uv_layer is not None:
+                loop_uv = loop[uv_layer].uv
+                source_uv = (float(loop_uv.x), float(loop_uv.y))
+            else:
+                source_uv = (
+                    float(fallback_uvs[source_index][0]),
+                    float(fallback_uvs[source_index][1]),
+                )
+            remap_key = (
+                source_index,
+                round(source_uv[0], 8),
+                round(source_uv[1], 8),
+            )
+            output_index = vertex_remap.get(remap_key)
+            if output_index is None:
+                output_index = len(output_vertices_2d)
+                vertex_remap[remap_key] = output_index
+                output_vertices_2d.append(vertices_2d[source_index].tolist())
+                output_vertices_3d.append(vertices_3d[source_index].tolist())
+                output_uvs.append([source_uv[0], source_uv[1]])
+                output_depths.append(float(depths[source_index]))
+                source_vertex_indices.append(source_index)
+            tri.append(output_index)
+        if len(tri) != 3 or len(set(tri)) != 3:
+            continue
         triangles.append(tri)
         triangle_keys.append(tuple(sorted(tri)))
     bm.free()
@@ -450,13 +489,14 @@ def extract_2d_mesh(
             vertex_groups.setdefault(group_name, []).append((vert.index, group.weight))
 
     return {
-        "vertices_2d": vertices_2d.tolist(),
-        "vertices_3d": vertices_3d.tolist(),
+        "vertices_2d": output_vertices_2d,
+        "vertices_3d": output_vertices_3d,
         "triangles": triangles,
         "triangle_keys": triangle_keys,
-        "uvs": uvs.tolist(),
-        "depths": depths.tolist(),
+        "uvs": output_uvs,
+        "depths": output_depths,
         "vertex_groups": vertex_groups,
+        "source_vertex_indices": source_vertex_indices,
         "projection_frame": projection_frame,
     }
 
@@ -556,6 +596,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--bind-frame", type=int, default=0, help="Frame to use for bind-pose sprite rendering"
+    )
+    parser.add_argument(
+        "--mesh-target-vertices",
+        type=int,
+        default=5000,
+        help="Target vertex count for source mesh reduction during extract-scene",
+    )
+    parser.add_argument(
+        "--no-mesh-reduction",
+        dest="mesh_reduction",
+        action="store_false",
+        default=True,
+        help="Disable source mesh reduction during extract-scene",
     )
     return parser.parse_args(script_args)
 
@@ -910,6 +963,89 @@ def extract_base_color_texture(mesh_obj) -> dict[str, Any] | None:
                         }
 
     return None
+
+
+def _mesh_triangle_count(mesh_obj) -> int:
+    mesh = mesh_obj.data
+    if hasattr(mesh, "calc_loop_triangles"):
+        mesh.calc_loop_triangles()
+    return int(len(getattr(mesh, "loop_triangles", []) or mesh.polygons))
+
+
+def reduce_mesh_object(mesh_obj, target_vertices=5000, enabled=True) -> dict[str, object]:
+    """Reduce the source mesh in Blender before extraction.
+
+    Decimate runs inside Blender so UV layers and vertex-group weights remain on
+    the mesh that the native pipeline receives.
+    """
+    source_vertex_count = int(len(mesh_obj.data.vertices)) if mesh_obj is not None else 0
+    source_triangle_count = _mesh_triangle_count(mesh_obj) if mesh_obj is not None else 0
+    target_vertices = int(target_vertices or 0)
+    report = {
+        "enabled": bool(enabled),
+        "applied": False,
+        "mode": "sidecar_blender_decimate",
+        "target_vertices": target_vertices,
+        "source_vertex_count": source_vertex_count,
+        "source_triangle_count": source_triangle_count,
+        "output_vertex_count": source_vertex_count,
+        "output_triangle_count": source_triangle_count,
+        "reason": "disabled" if not enabled else "not_run",
+    }
+
+    if not enabled:
+        return report
+    if mesh_obj is None:
+        report["reason"] = "no_mesh"
+        return report
+    if target_vertices <= 0:
+        report["reason"] = "no_target"
+        return report
+    if source_vertex_count <= target_vertices:
+        report["reason"] = "source_under_target"
+        return report
+
+    if bpy.ops.object.mode_set.poll():
+        bpy.ops.object.mode_set(mode="OBJECT")
+    for obj in bpy.context.scene.objects:
+        obj.select_set(False)
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+
+    current_vertices = source_vertex_count
+    try:
+        for pass_index in range(4):
+            if current_vertices <= target_vertices:
+                break
+            ratio = max(0.01, min(1.0, float(target_vertices) / max(float(current_vertices), 1.0)))
+            modifier = mesh_obj.modifiers.new(
+                name=f"FlatRig_SourceMeshReduction_{pass_index + 1}",
+                type="DECIMATE",
+            )
+            modifier.decimate_type = "COLLAPSE"
+            modifier.ratio = ratio
+            if hasattr(modifier, "use_collapse_triangulate"):
+                modifier.use_collapse_triangulate = True
+            bpy.ops.object.modifier_apply(modifier=modifier.name)
+            bpy.context.view_layer.update()
+            current_vertices = int(len(mesh_obj.data.vertices))
+    except Exception as exc:
+        raise RuntimeError(f"Source mesh reduction failed: {exc}") from exc
+
+    mesh_obj.data.update()
+    output_vertex_count = int(len(mesh_obj.data.vertices))
+    output_triangle_count = _mesh_triangle_count(mesh_obj)
+    report.update(
+        {
+            "applied": output_vertex_count < source_vertex_count,
+            "output_vertex_count": output_vertex_count,
+            "output_triangle_count": output_triangle_count,
+            "reason": "target_reached"
+            if output_vertex_count <= target_vertices
+            else "best_effort",
+        }
+    )
+    return report
 
 
 # ============================================================================
@@ -1796,6 +1932,8 @@ def extract_scene_cli(
     view_roll: float = 0.0,
     source_frame: int = None,
     projection_space: str = "world",
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
 ) -> dict[str, object]:
     """CLI wrapper for scene extraction (mesh + bones + weights).
 
@@ -1807,6 +1945,12 @@ def extract_scene_cli(
     mesh_obj, armature_obj = find_mesh_and_armature()
     if mesh_obj is None:
         return {"ok": False, "detail": "No mesh found in scene"}
+
+    mesh_reduction_report = reduce_mesh_object(
+        mesh_obj,
+        target_vertices=mesh_target_vertices,
+        enabled=mesh_reduction,
+    )
 
     # Build view configuration
     view_cfg = get_view_config(
@@ -1833,6 +1977,23 @@ def extract_scene_cli(
         view_cfg,
         source_frame=source_frame,
     )
+    mesh_reduction_report["output_vertex_count"] = len(mesh_data.get("vertices_2d") or [])
+    mesh_reduction_report["output_triangle_count"] = len(mesh_data.get("triangles") or [])
+    if (
+        mesh_reduction_report.get("applied")
+        and int(mesh_reduction_report.get("target_vertices") or 0) > 0
+        and int(mesh_reduction_report["output_vertex_count"])
+        > int(mesh_reduction_report["target_vertices"])
+        and mesh_reduction_report.get("reason") == "target_reached"
+    ):
+        mesh_reduction_report["reason"] = "target_reached_before_uv_split"
+    mesh_data["mesh_reduction"] = mesh_reduction_report
+    base_color_data = extract_base_color_texture(mesh_obj)
+    if base_color_data:
+        mesh_data["base_color_rgba"] = base_color_data["rgba"]
+        mesh_data["base_color_width"] = base_color_data["width"]
+        mesh_data["base_color_height"] = base_color_data["height"]
+        mesh_data["base_color_channels"] = base_color_data["channels"]
 
     # Transfer weights
     bone_name_to_index = {
@@ -1843,11 +2004,18 @@ def extract_scene_cli(
     try:
         from flatrig.mesh import transfer_3d_weights_to_2d
 
-        source_weights = (
+        base_source_weights = (
             transfer_3d_weights_to_2d(mesh_obj, bone_name_to_index)
             if bone_name_to_index
             else [{} for _ in range(len(mesh_data.get("vertices_2d") or []))]
         )
+        source_indices = mesh_data.get("source_vertex_indices") or list(range(len(base_source_weights)))
+        source_weights = [
+            base_source_weights[int(source_index)]
+            if 0 <= int(source_index) < len(base_source_weights)
+            else {}
+            for source_index in source_indices
+        ]
     except ImportError:
         # Fallback if transfer function not available
         source_weights = [{} for _ in range(len(mesh_data.get("vertices_2d") or []))]
@@ -1859,6 +2027,7 @@ def extract_scene_cli(
         "mesh": mesh_data,
         "bones": bones,
         "source_weights": _weights_to_json(source_weights),
+        "mesh_reduction": mesh_reduction_report,
     }
 
 
@@ -2115,6 +2284,8 @@ def main() -> None:
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             projection_space=args.projection_space,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
         )
     elif args.command == "extract-animations":
         view_dir = None
