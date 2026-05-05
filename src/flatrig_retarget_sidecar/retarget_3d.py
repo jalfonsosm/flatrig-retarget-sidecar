@@ -396,14 +396,22 @@ def bvh_to_flatrig_animation(
                 parent_state = world_cache[parent_index]
                 assert parent_state is not None
                 parent_basis = parent_state["world_basis_2d"]
+                # Use the full parent basis for position (matches setup extraction)
                 local_position_2d = _safe_inverse_2x2(parent_basis) @ (
                     world_head_2d - parent_state["head_2d"]
                 )
-                local_axis = _safe_inverse_2x2(parent_basis) @ projected_axis_2d
+                # For rotation, respect inherit mode: NoScale bones use the rigid
+                # (orthonormalized) parent basis, matching extract_bone_hierarchy.
+                inherit_mode = setup_bone.get("inherit", "Normal") if setup_bone else "Normal"
+                if inherit_mode == "NoScale":
+                    rotation_basis = _orthonormalize_2x2(parent_basis)
+                else:
+                    rotation_basis = parent_basis
+                local_axis = _safe_inverse_2x2(rotation_basis) @ projected_axis_2d
                 local_rotation_deg = math.degrees(math.atan2(local_axis[1], local_axis[0]))
                 local_x = float(local_position_2d[0])
                 local_y = float(local_position_2d[1])
-                world_basis_2d = parent_basis @ _build_basis_2d(local_rotation_deg)
+                world_basis_2d = rotation_basis @ _build_basis_2d(local_rotation_deg)
 
             world_cache[joint_index] = {
                 "head_3d": head_3d,
@@ -726,10 +734,19 @@ def _joint_tail_offset(joint_metadata: dict[str, Any], children: dict[int, list[
 
 
 def _projection_basis(target_metadata: dict[str, Any]) -> np.ndarray:
+    """Return the 2x3 projection basis from view metadata.
+
+    The fallback maps 3D-X to 2D-X and 3D-Z to 2D-Y, matching Blender's Z-up
+    "front" view convention.  The previous fallback of [[1,0,0],[0,1,0]] mapped
+    to the XY (top-down) plane, producing stretched or rotated results when the
+    view metadata was missing.
+    """
+    # Front-view default: right = +X, up = +Z  (Blender Z-up convention)
+    _FRONT_VIEW_FALLBACK = [[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]]
     view_payload = target_metadata.get("view") or {}
-    basis = np.asarray(view_payload.get("basis_2d") or [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+    basis = np.asarray(view_payload.get("basis_2d") or _FRONT_VIEW_FALLBACK, dtype=np.float64)
     if basis.shape != (2, 3):
-        return np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float64)
+        return np.array(_FRONT_VIEW_FALLBACK, dtype=np.float64)
     return basis
 
 
