@@ -1067,14 +1067,14 @@ def _euler_xyz_degrees_to_matrix(values: np.ndarray) -> np.ndarray:
     return rx @ ry @ rz
 
 
-def _build_basis_2d(rotation_deg: float) -> np.ndarray:
+def _build_basis_2d(rotation_deg: float, scale_x: float = 1.0, scale_y: float = 1.0) -> np.ndarray:
     rotation_rad = math.radians(rotation_deg)
     cos_r = math.cos(rotation_rad)
     sin_r = math.sin(rotation_rad)
     return np.array(
         [
-            [cos_r, -sin_r],
-            [sin_r, cos_r],
+            [cos_r * scale_x, -sin_r * scale_y],
+            [sin_r * scale_x, cos_r * scale_y],
         ],
         dtype=np.float64,
     )
