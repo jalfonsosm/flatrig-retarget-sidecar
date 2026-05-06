@@ -205,7 +205,7 @@ def _retarget_one_3d_clip(
         view_dir=view_dir,
         view_up=view_up,
         view_roll=view_roll,
-        source_frame=0,
+        source_frame=source_frame,
         projection_space=projection_space,
         fps=fps,
         frame_count=int(source_metadata.get("frame_count") or 2),
