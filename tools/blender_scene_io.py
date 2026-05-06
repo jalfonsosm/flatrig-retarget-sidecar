@@ -1570,6 +1570,7 @@ def export_3d_rest_bvh_cli(
         armature_obj,
         view_cfg,
         source_frame=source_frame,
+        use_rest_pose=True,
         projection_space=projection_space,
         projection_reference_root=None,
     )

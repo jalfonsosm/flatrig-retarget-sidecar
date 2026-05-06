@@ -205,7 +205,7 @@ def _retarget_one_3d_clip(
         view_dir=view_dir,
         view_up=view_up,
         view_roll=view_roll,
-        source_frame=source_frame,
+        source_frame=0,
         projection_space=projection_space,
         fps=fps,
         frame_count=int(source_metadata.get("frame_count") or 2),
@@ -479,11 +479,14 @@ def bvh_to_flatrig_animation(
     for bone_name, timelines in track_map.items():
         rotate = _compress_timeline_keys(timelines["rotate"], ("angle", "value"), tolerance=0.01)
         translate = _compress_timeline_keys(timelines["translate"], ("x", "y"), tolerance=1e-4)
+        scale = _compress_timeline_keys(timelines.get("scale", []), ("x", "y"), tolerance=1e-4)
         payload: dict[str, Any] = {}
         if rotate:
             payload["rotate"] = rotate
         if translate:
             payload["translate"] = translate
+        if scale:
+            payload["scale"] = scale
         if payload:
             compressed_bones[bone_name] = payload
 
