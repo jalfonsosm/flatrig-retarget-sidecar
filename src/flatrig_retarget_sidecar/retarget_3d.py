@@ -377,9 +377,6 @@ def bvh_to_flatrig_animation(
             original_name = joint_metadata.get("name")
             setup_bone = setup_bones.get(str(original_name)) if original_name else None
             fallback_axis = _setup_bone_world_axis(setup_bone, setup_bones)
-            setup_length = float(setup_bone.get("length", 1.0)) if setup_bone else 1.0
-            local_scale_x = axis_norm / max(1e-4, setup_length)
-            local_scale_y = 1.0
 
             if axis_norm <= NUMERIC_EPSILON:
                 projected_axis_2d = fallback_axis
@@ -388,6 +385,10 @@ def bvh_to_flatrig_animation(
                 projected_axis_2d = np.array((1.0, 0.0), dtype=np.float64)
             else:
                 projected_axis_2d = projected_axis_2d / axis_norm
+
+            setup_length = float(setup_bone.get("length", 1.0)) if setup_bone else 1.0
+            local_scale_x = axis_norm / max(1e-4, setup_length)
+            local_scale_y = 1.0
 
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
