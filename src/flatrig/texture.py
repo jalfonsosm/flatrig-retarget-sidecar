@@ -123,7 +123,7 @@ def _build_unlit_material(original_material):
     material = original_material.copy()
     material.use_nodes = True
     if hasattr(material, "use_backface_culling"):
-        material.use_backface_culling = False
+        material.use_backface_culling = True
     if hasattr(material, "show_transparent_back"):
         material.show_transparent_back = False
     nodes = material.node_tree.nodes
@@ -308,9 +308,9 @@ def render_part_sprite(
     bm.to_mesh(render_mesh)
     bm.free()
 
-    render_mesh.update()
-    render_mesh.calc_normals_split()
-    render_mesh.calc_loop_triangles()
+    # render_mesh.update()
+    # render_mesh.calc_normals_split()
+    # render_mesh.calc_loop_triangles()
 
     render_obj = bpy.data.objects.new(f"{source_obj.name}_sidecar_part", render_mesh)
     render_obj.matrix_world = source_obj.matrix_world.copy()
