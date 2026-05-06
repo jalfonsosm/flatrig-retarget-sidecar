@@ -33,6 +33,7 @@ def _add_projection_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--view-up", dest="view_up", default=None)
     parser.add_argument("--view-roll", dest="view_roll", type=float, default=0.0)
     parser.add_argument("--source-frame", type=int, default=None)
+    parser.add_argument("--use-rest-pose", action="store_true", default=False)
     parser.add_argument("--projection-space", choices=("world", "root"), default="world")
     parser.add_argument("--animation", dest="animation_names", action="append", default=[])
 
@@ -353,6 +354,7 @@ def main() -> None:
             view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             mesh_reduction=args.mesh_reduction,
             mesh_target_vertices=args.mesh_target_vertices,
@@ -411,6 +413,7 @@ def main() -> None:
             view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             resolution=args.resolution,
             bind_frame=args.bind_frame,

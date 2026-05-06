@@ -378,12 +378,63 @@ def project_points_to_uv(points_2d, frame):
     return np.stack((u, v), axis=1)
 
 
+def _set_scene_armatures_rest_pose(scene):
+    """Temporarily force armatures to rest pose for bind/setup extraction."""
+    previous = []
+    for scene_obj in scene.objects:
+        if scene_obj.type != "ARMATURE" or scene_obj.data is None:
+            continue
+        previous.append((scene_obj.data, scene_obj.data.pose_position))
+        scene_obj.data.pose_position = "REST"
+    if previous:
+        bpy.context.view_layer.update()
+    return previous
+
+
+def _restore_scene_armature_pose_positions(previous):
+    for armature_data, pose_position in previous:
+        armature_data.pose_position = pose_position
+    if previous:
+        bpy.context.view_layer.update()
+
+
+def _armature_uniform_scale(armature_obj) -> float:
+    if armature_obj is None:
+        return 1.0
+    scale = armature_obj.matrix_world.to_scale()
+    values = [abs(float(scale.x)), abs(float(scale.y)), abs(float(scale.z))]
+    values = [value for value in values if value > VECTOR_EPSILON]
+    if not values:
+        return 1.0
+    return sum(values) / len(values)
+
+
+def _matrix3_to_json(matrix):
+    return [
+        [float(matrix[row][col]) for col in range(3)]
+        for row in range(3)
+    ]
+
+
+def _matrix3_from_json(values):
+    if values is None:
+        return mathutils.Matrix.Identity(3)
+    return mathutils.Matrix(
+        (
+            (float(values[0][0]), float(values[0][1]), float(values[0][2])),
+            (float(values[1][0]), float(values[1][1]), float(values[1][2])),
+            (float(values[2][0]), float(values[2][1]), float(values[2][2])),
+        )
+    )
+
+
 def extract_2d_mesh(
     mesh_obj,
     view_cfg,
     projection_frame=None,
     source_frame=None,
     projection_inverse=None,
+    use_rest_pose=False,
 ):
     """Extract the bind-pose mesh projected to 2D."""
     scene = bpy.context.scene
@@ -391,114 +442,122 @@ def extract_2d_mesh(
     if source_frame is None:
         source_frame = scene.frame_start
     scene.frame_set(source_frame)
+    rest_pose_state = _set_scene_armatures_rest_pose(scene) if use_rest_pose else []
     depsgraph.update()
 
     eval_obj = mesh_obj.evaluated_get(depsgraph)
-    eval_mesh = eval_obj.to_mesh()
-    world_mat = eval_obj.matrix_world
+    eval_mesh = None
+    try:
+        eval_mesh = eval_obj.to_mesh()
+        world_mat = eval_obj.matrix_world
 
-    # Extract vertices in world space
-    vertices_3d = np.empty((len(eval_mesh.vertices), 3), dtype=np.float64)
-    for index, vert in enumerate(eval_mesh.vertices):
-        world_co = world_mat @ vert.co
-        vertices_3d[index] = (world_co.x, world_co.y, world_co.z)
+        # Extract vertices in world space
+        vertices_3d = np.empty((len(eval_mesh.vertices), 3), dtype=np.float64)
+        for index, vert in enumerate(eval_mesh.vertices):
+            world_co = world_mat @ vert.co
+            vertices_3d[index] = (world_co.x, world_co.y, world_co.z)
 
-    # Project to 2D
-    vertices_2d_list = []
-    for i in range(len(vertices_3d)):
-        pt = vertices_3d[i]
-        projected = _transform_point_to_projection_space(pt, projection_inverse=projection_inverse)
-        basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
-        proj_2d = basis_2d @ projected
-        vertices_2d_list.append([proj_2d[0], proj_2d[1]])
-    vertices_2d = np.array(vertices_2d_list, dtype=np.float64)
+        # Project to 2D
+        vertices_2d_list = []
+        for i in range(len(vertices_3d)):
+            pt = vertices_3d[i]
+            projected = _transform_point_to_projection_space(pt, projection_inverse=projection_inverse)
+            basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
+            proj_2d = basis_2d @ projected
+            vertices_2d_list.append([proj_2d[0], proj_2d[1]])
+        vertices_2d = np.array(vertices_2d_list, dtype=np.float64)
 
-    if projection_frame is None:
-        projection_frame = compute_projection_frame(vertices_2d)
-    fallback_uvs = project_points_to_uv(vertices_2d, projection_frame)
+        if projection_frame is None:
+            projection_frame = compute_projection_frame(vertices_2d)
+        fallback_uvs = project_points_to_uv(vertices_2d, projection_frame)
 
-    # Compute depths
-    depths = np.array(
-        [
-            point_depth(vertices_3d[i], view_cfg, projection_inverse=projection_inverse)
-            for i in range(len(vertices_3d))
-        ],
-        dtype=np.float64,
-    )
+        # Compute depths
+        depths = np.array(
+            [
+                point_depth(vertices_3d[i], view_cfg, projection_inverse=projection_inverse)
+                for i in range(len(vertices_3d))
+            ],
+            dtype=np.float64,
+        )
 
-    bm = bmesh.new()
-    bm.from_mesh(eval_mesh)
-    bmesh.ops.triangulate(bm, faces=bm.faces[:])
-    bm.faces.ensure_lookup_table()
-    uv_layer = bm.loops.layers.uv.active
+        bm = bmesh.new()
+        try:
+            bm.from_mesh(eval_mesh)
+            bmesh.ops.triangulate(bm, faces=bm.faces[:])
+            bm.faces.ensure_lookup_table()
+            uv_layer = bm.loops.layers.uv.active
 
-    output_vertices_2d = []
-    output_vertices_3d = []
-    output_uvs = []
-    output_depths = []
-    source_vertex_indices = []
-    triangles = []
-    triangle_keys = []
-    vertex_remap = {}
+            output_vertices_2d = []
+            output_vertices_3d = []
+            output_uvs = []
+            output_depths = []
+            source_vertex_indices = []
+            triangles = []
+            triangle_keys = []
+            vertex_remap = {}
 
-    for face in bm.faces:
-        if len(face.loops) != 3:
-            continue
-        tri = []
-        for loop in face.loops:
-            source_index = int(loop.vert.index)
-            if source_index < 0 or source_index >= len(vertices_2d):
-                continue
-            if uv_layer is not None:
-                loop_uv = loop[uv_layer].uv
-                source_uv = (float(loop_uv.x), float(loop_uv.y))
-            else:
-                source_uv = (
-                    float(fallback_uvs[source_index][0]),
-                    float(fallback_uvs[source_index][1]),
-                )
-            remap_key = (
-                source_index,
-                round(source_uv[0], 8),
-                round(source_uv[1], 8),
-            )
-            output_index = vertex_remap.get(remap_key)
-            if output_index is None:
-                output_index = len(output_vertices_2d)
-                vertex_remap[remap_key] = output_index
-                output_vertices_2d.append(vertices_2d[source_index].tolist())
-                output_vertices_3d.append(vertices_3d[source_index].tolist())
-                output_uvs.append([source_uv[0], source_uv[1]])
-                output_depths.append(float(depths[source_index]))
-                source_vertex_indices.append(source_index)
-            tri.append(output_index)
-        if len(tri) != 3 or len(set(tri)) != 3:
-            continue
-        triangles.append(tri)
-        triangle_keys.append(tuple(sorted(tri)))
-    bm.free()
-    eval_obj.to_mesh_clear()
+            for face in bm.faces:
+                if len(face.loops) != 3:
+                    continue
+                tri = []
+                for loop in face.loops:
+                    source_index = int(loop.vert.index)
+                    if source_index < 0 or source_index >= len(vertices_2d):
+                        continue
+                    if uv_layer is not None:
+                        loop_uv = loop[uv_layer].uv
+                        source_uv = (float(loop_uv.x), float(loop_uv.y))
+                    else:
+                        source_uv = (
+                            float(fallback_uvs[source_index][0]),
+                            float(fallback_uvs[source_index][1]),
+                        )
+                    remap_key = (
+                        source_index,
+                        round(source_uv[0], 8),
+                        round(source_uv[1], 8),
+                    )
+                    output_index = vertex_remap.get(remap_key)
+                    if output_index is None:
+                        output_index = len(output_vertices_2d)
+                        vertex_remap[remap_key] = output_index
+                        output_vertices_2d.append(vertices_2d[source_index].tolist())
+                        output_vertices_3d.append(vertices_3d[source_index].tolist())
+                        output_uvs.append([source_uv[0], source_uv[1]])
+                        output_depths.append(float(depths[source_index]))
+                        source_vertex_indices.append(source_index)
+                    tri.append(output_index)
+                if len(tri) != 3 or len(set(tri)) != 3:
+                    continue
+                triangles.append(tri)
+                triangle_keys.append(tuple(sorted(tri)))
+        finally:
+            bm.free()
 
-    # Extract vertex groups (weights)
-    vertex_groups = {}
-    group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
+        # Extract vertex groups (weights)
+        vertex_groups = {}
+        group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
 
-    for vert in mesh_obj.data.vertices:
-        for group in vert.groups:
-            group_name = group_names.get(group.group, f"group_{group.group}")
-            vertex_groups.setdefault(group_name, []).append((vert.index, group.weight))
+        for vert in mesh_obj.data.vertices:
+            for group in vert.groups:
+                group_name = group_names.get(group.group, f"group_{group.group}")
+                vertex_groups.setdefault(group_name, []).append((vert.index, group.weight))
 
-    return {
-        "vertices_2d": output_vertices_2d,
-        "vertices_3d": output_vertices_3d,
-        "triangles": triangles,
-        "triangle_keys": triangle_keys,
-        "uvs": output_uvs,
-        "depths": output_depths,
-        "vertex_groups": vertex_groups,
-        "source_vertex_indices": source_vertex_indices,
-        "projection_frame": projection_frame,
-    }
+        return {
+            "vertices_2d": output_vertices_2d,
+            "vertices_3d": output_vertices_3d,
+            "triangles": triangles,
+            "triangle_keys": triangle_keys,
+            "uvs": output_uvs,
+            "depths": output_depths,
+            "vertex_groups": vertex_groups,
+            "source_vertex_indices": source_vertex_indices,
+            "projection_frame": projection_frame,
+        }
+    finally:
+        if eval_mesh is not None:
+            eval_obj.to_mesh_clear()
+        _restore_scene_armature_pose_positions(rest_pose_state)
 
 
 def parse_args() -> argparse.Namespace:
@@ -534,6 +593,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--view-roll", type=float, default=0.0, help="View roll in degrees")
     parser.add_argument(
         "--source-frame", type=int, default=None, help="Source frame for pose evaluation"
+    )
+    parser.add_argument(
+        "--use-rest-pose",
+        action="store_true",
+        default=False,
+        help="Evaluate setup mesh and bones in armature rest pose",
     )
     # Animation extraction parameters
     parser.add_argument(
@@ -1240,6 +1305,9 @@ def _build_3d_bvh_layout(armature_obj):
     """Return Motion2Motion-friendly BVH joints for a Blender armature."""
     bone_order = _topological_sort(armature_obj)
     bone_order_index = {name: index for index, name in enumerate(bone_order)}
+    armature_scale = _armature_uniform_scale(armature_obj)
+    armature_world = armature_obj.matrix_world.copy()
+    armature_linear = armature_world.to_3x3()
     root_bones = [
         bone
         for bone in armature_obj.data.bones
@@ -1292,11 +1360,14 @@ def _build_3d_bvh_layout(armature_obj):
         if parent_index >= 0:
             parent_bvh_name = joints[parent_index]["bvh_name"]
 
+        head_vec = armature_world @ rest_bone.head_local
+        tail_vec = armature_world @ rest_bone.tail_local
         if rest_bone.parent is None:
-            offset_vec = rest_bone.head_local if use_synthetic_root else mathutils.Vector((0.0, 0.0, 0.0))
+            offset_vec = head_vec
         else:
-            offset_vec = rest_bone.head_local - rest_bone.parent.head_local
-        tail_offset_vec = rest_bone.tail_local - rest_bone.head_local
+            parent_head_vec = armature_world @ rest_bone.parent.head_local
+            offset_vec = head_vec - parent_head_vec
+        tail_offset_vec = tail_vec - head_vec
         length = float(tail_offset_vec.length)
 
         joint = {
@@ -1307,8 +1378,8 @@ def _build_3d_bvh_layout(armature_obj):
             "parent_index": int(parent_index),
             "parent_bvh_name": parent_bvh_name,
             "offset": _vector_to_json(offset_vec),
-            "head": _vector_to_json(rest_bone.head_local),
-            "tail": _vector_to_json(rest_bone.tail_local),
+            "head": _vector_to_json(head_vec),
+            "tail": _vector_to_json(tail_vec),
             "tail_offset": _vector_to_json(tail_offset_vec),
             "length": length,
             "synthetic": False,
@@ -1328,6 +1399,8 @@ def _build_3d_bvh_layout(armature_obj):
         "matching_to_bvh": matching_to_bvh,
         "root_bvh_name": joints[0]["bvh_name"] if joints else None,
         "root_matching_name": joints[0]["matching_name"] if joints else None,
+        "coordinate_scale": armature_scale,
+        "coordinate_linear": _matrix3_to_json(armature_linear),
     }
 
 
@@ -1425,6 +1498,7 @@ def _set_scene_frame_float(scene, frame_value):
 
 def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
     scene = bpy.context.scene
+    coordinate_linear = _matrix3_from_json(layout.get("coordinate_linear"))
     positions = []
     rotations = []
     for frame_value in sample_frames:
@@ -1441,8 +1515,12 @@ def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
                 frame_positions.extend((0.0, 0.0, 0.0))
                 frame_rotations.extend((0.0, 0.0, 0.0))
                 continue
-            location = pose_bone.location
-            frame_positions.extend((float(location.x), float(location.y), float(location.z)))
+            location = coordinate_linear @ pose_bone.location
+            frame_positions.extend((
+                float(location.x),
+                float(location.y),
+                float(location.z),
+            ))
             frame_rotations.extend(_pose_bone_basis_euler_degrees(pose_bone))
         positions.append(frame_positions)
         rotations.append(frame_rotations)
@@ -1548,6 +1626,7 @@ def export_3d_rest_bvh_cli(
     view_up=None,
     view_roll: float = 0.0,
     source_frame: int = None,
+    use_rest_pose: bool = True,
     projection_space: str = "world",
     fps: float = 30.0,
     frame_count: int = None,
@@ -1570,6 +1649,7 @@ def export_3d_rest_bvh_cli(
         armature_obj,
         view_cfg,
         source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
         projection_space=projection_space,
         projection_reference_root=None,
     )
@@ -1965,6 +2045,7 @@ def extract_scene_cli(
     view_up=None,
     view_roll: float = 0.0,
     source_frame: int = None,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     mesh_reduction: bool = True,
     mesh_target_vertices: int = 5000,
@@ -2001,12 +2082,14 @@ def extract_scene_cli(
             armature_obj,
             view_cfg,
             source_frame=source_frame,
+            use_rest_pose=use_rest_pose,
             projection_space=projection_space,
             projection_reference_root=None,
         )
     bones_3d = extract_bone_hierarchy_3d(
         armature_obj,
         source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
     )
 
     # Extract mesh
@@ -2014,6 +2097,7 @@ def extract_scene_cli(
         mesh_obj,
         view_cfg,
         source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
     )
     mesh_reduction_report["output_vertex_count"] = len(mesh_data.get("vertices_2d") or [])
     mesh_reduction_report["output_triangle_count"] = len(mesh_data.get("triangles") or [])
@@ -2193,6 +2277,7 @@ def render_sprites_cli(
     view_up=None,
     view_roll: float = 0.0,
     source_frame: int = None,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     parts_json: str = None,
     images_dir: str = None,
@@ -2252,6 +2337,7 @@ def render_sprites_cli(
             get_projection_reference_matrix(
                 armature_obj,
                 projection_space=projection_space,
+                use_rest_pose=use_rest_pose,
                 reference_root_matrix=projection_reference_root,
             )
             if armature_obj
@@ -2271,6 +2357,7 @@ def render_sprites_cli(
                 resolution=resolution,
                 depth_center=float(part.get("mean_depth", 0.0) or 0.0),
                 bind_frame=bind_frame if bind_frame > 0 else source_frame or 0,
+                use_rest_pose=use_rest_pose,
                 projection_matrix=projection_matrix,
             )
             renders.append(
@@ -2322,6 +2409,7 @@ def main() -> None:
             view_up=view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             mesh_reduction=args.mesh_reduction,
             mesh_target_vertices=args.mesh_target_vertices,
@@ -2397,6 +2485,7 @@ def main() -> None:
             view_up=view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=True,
             projection_space=args.projection_space,
             fps=args.fps,
             frame_count=args.frame_count,
@@ -2417,6 +2506,7 @@ def main() -> None:
             view_up=view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             parts_json=args.parts_json,
             images_dir=args.images_dir,

@@ -442,6 +442,7 @@ def extract_scene(
     view_up: str = None,
     view_roll: float = 0.0,
     source_frame: int = None,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     mesh_reduction: bool = True,
     mesh_target_vertices: int = 5000,
@@ -461,6 +462,8 @@ def extract_scene(
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
         extra_args.extend(["--source-frame", str(source_frame)])
+    if use_rest_pose:
+        extra_args.append("--use-rest-pose")
     if mesh_reduction:
         extra_args.extend(["--mesh-target-vertices", str(mesh_target_vertices)])
     else:
@@ -647,6 +650,7 @@ def render_sprites(
     view_up: str = None,
     view_roll: float = 0.0,
     source_frame: int = None,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     resolution: int = 2048,
     bind_frame: int = 0,
@@ -672,6 +676,8 @@ def render_sprites(
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
         extra_args.extend(["--source-frame", str(source_frame)])
+    if use_rest_pose:
+        extra_args.append("--use-rest-pose")
     if bind_frame > 0:
         extra_args.extend(["--bind-frame", str(bind_frame)])
 

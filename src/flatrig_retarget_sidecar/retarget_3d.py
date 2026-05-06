@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -247,6 +248,22 @@ def _retarget_one_3d_clip(
             output_bvh=retargeted_bvh,
             matching_alpha=matching_alpha,
         )
+        source_motion = _bvh_motion_stats(source_bvh)
+        retargeted_motion = _bvh_motion_stats(retargeted_bvh)
+        direct_fallback = None
+        if (
+            source_motion["max_rotation_std"] > 1e-3
+            and retargeted_motion["max_rotation_std"] <= 1e-4
+        ):
+            direct_fallback = direct_mapped_bvh_retarget(
+                source_bvh,
+                target_bvh,
+                source_metadata,
+                target_metadata,
+                mapping_payload,
+                output_bvh=retargeted_bvh,
+            )
+            retargeted_motion = _bvh_motion_stats(retargeted_bvh)
         animation = bvh_to_flatrig_animation(
             retargeted_bvh,
             target_metadata,
@@ -293,10 +310,279 @@ def _retarget_one_3d_clip(
             "mapping_review_required": mapping_review_required,
             "mapping_diagnostics": mapping_diagnostics,
             "bvh_result": dict(bvh_result.diagnostics),
+            "source_motion_stats": source_motion,
+            "retargeted_motion_stats": retargeted_motion,
+            "direct_retarget_fallback": direct_fallback,
             "result_bone_count": len(animation.get("bones") or {}),
         }
     )
     return {"animation": animation, "preview_3d": preview_3d, "diagnostics": diagnostics}
+
+
+def _bvh_motion_stats(bvh_path: str | Path) -> dict[str, float | int]:
+    animation = _load_bvh_animation(bvh_path)
+    rotations = np.asarray(animation.rotations, dtype=np.float64)
+    positions = np.asarray(animation.positions, dtype=np.float64)
+    return {
+        "frame_count": int(rotations.shape[0]) if rotations.ndim >= 1 else 0,
+        "joint_count": int(rotations.shape[1]) if rotations.ndim >= 2 else 0,
+        "max_rotation_std": float(np.max(np.std(rotations, axis=0))) if rotations.size else 0.0,
+        "max_position_std": float(np.max(np.std(positions, axis=0))) if positions.size else 0.0,
+    }
+
+
+def direct_mapped_bvh_retarget(
+    source_bvh: str | Path,
+    target_bvh: str | Path,
+    source_metadata: dict[str, Any],
+    target_metadata: dict[str, Any],
+    mapping_payload: dict[str, Any],
+    *,
+    output_bvh: str | Path,
+) -> dict[str, Any]:
+    """Copy mapped local rotations onto the target hierarchy when M2M returns a static clip.
+
+    Motion2Motion needs a target motion prior. For a newly loaded character we only have a
+    target rest rig, so M2M can synthesize a static rest clip. Mixamo-style rigs still have
+    compatible local joint bases, so this deterministic fallback preserves the source motion
+    while keeping target offsets, bone lengths and naming.
+    """
+    source_animation = _load_bvh_animation(source_bvh)
+    target_animation = _load_bvh_animation(target_bvh)
+
+    source_rotations = np.asarray(source_animation.rotations, dtype=np.float64)
+    source_positions = np.asarray(source_animation.positions, dtype=np.float64)
+    target_offsets = np.asarray(target_animation.offsets, dtype=np.float64)
+    target_parents = [int(parent) for parent in target_animation.parents]
+    target_names = [str(name) for name in target_animation.names]
+    source_names = [str(name) for name in source_animation.names]
+
+    frame_count = int(source_rotations.shape[0])
+    target_joint_count = len(target_names)
+    rotations = np.zeros((frame_count, target_joint_count, 3), dtype=np.float64)
+    positions = np.zeros((frame_count, target_joint_count, 3), dtype=np.float64)
+
+    index_map, mapping_stats = _build_direct_retarget_index_map(
+        source_metadata,
+        target_metadata,
+        mapping_payload,
+        source_names,
+        target_names,
+    )
+    for target_index, source_index in index_map.items():
+        rotations[:, target_index, :] = source_rotations[:, source_index, :]
+
+    target_root_index = _root_index_from_parents(target_parents)
+    source_root_index = index_map.get(target_root_index)
+    if source_root_index is not None and source_positions.size:
+        root_scale = _metadata_height(target_metadata) / max(_metadata_height(source_metadata), 1e-6)
+        positions[:, target_root_index, :] = source_positions[:, source_root_index, :] * root_scale
+
+    _write_mapped_bvh(
+        output_bvh,
+        target_metadata.get("joints") or [],
+        positions,
+        rotations,
+        fps=(1.0 / float(source_animation.frametime)) if float(source_animation.frametime) > 0 else 30.0,
+    )
+    return {
+        "reason": "motion2motion_static_output",
+        "mapped_joint_count": len(index_map),
+        "target_joint_count": target_joint_count,
+        "mapping_stats": mapping_stats,
+    }
+
+
+def _build_direct_retarget_index_map(
+    source_metadata: dict[str, Any],
+    target_metadata: dict[str, Any],
+    mapping_payload: dict[str, Any],
+    source_names: list[str],
+    target_names: list[str],
+) -> tuple[dict[int, int], dict[str, int]]:
+    source_name_to_index = _animation_name_index(source_names)
+    target_name_to_index = _animation_name_index(target_names)
+    source_joint_lookup = _metadata_joint_lookup(source_metadata)
+    target_joint_lookup = _metadata_joint_lookup(target_metadata)
+    index_map: dict[int, int] = {}
+    explicit_count = 0
+
+    for pair in mapping_payload.get("mapping") or []:
+        source_joint = source_joint_lookup.get(str(pair.get("source") or ""))
+        target_joint = target_joint_lookup.get(str(pair.get("target") or ""))
+        if not source_joint or not target_joint:
+            continue
+        source_index = source_name_to_index.get(str(source_joint.get("bvh_name") or ""))
+        target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
+        if source_index is None or target_index is None:
+            continue
+        index_map[target_index] = source_index
+        explicit_count += 1
+
+    source_semantic = _unique_semantic_joint_lookup(source_metadata, source_name_to_index)
+    target_joints = target_metadata.get("joints") or []
+    semantic_count = 0
+    for target_joint in target_joints:
+        target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
+        if target_index is None or target_index in index_map:
+            continue
+        semantic_key = _semantic_joint_key(
+            str(target_joint.get("matching_name") or target_joint.get("name") or target_joint.get("bvh_name") or "")
+        )
+        source_index = source_semantic.get(semantic_key)
+        if source_index is None:
+            continue
+        index_map[target_index] = source_index
+        semantic_count += 1
+
+    return index_map, {"explicit": explicit_count, "semantic": semantic_count}
+
+
+def _animation_name_index(names: list[str]) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for index, name in enumerate(names):
+        text = str(name)
+        result[text] = index
+        result[_strip_motion2motion_suffix(text)] = index
+    return result
+
+
+def _metadata_joint_lookup(metadata: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for raw_joint in metadata.get("joints") or []:
+        joint = dict(raw_joint)
+        for value in (
+            joint.get("matching_name"),
+            joint.get("bvh_name"),
+            _strip_motion2motion_suffix(str(joint.get("bvh_name") or "")),
+            joint.get("name"),
+        ):
+            if value:
+                result[str(value)] = joint
+    return result
+
+
+def _unique_semantic_joint_lookup(
+    metadata: dict[str, Any],
+    name_to_index: dict[str, int],
+) -> dict[tuple[str, ...], int]:
+    values: dict[tuple[str, ...], int | None] = {}
+    for joint in metadata.get("joints") or []:
+        bvh_name = str(joint.get("bvh_name") or "")
+        index = name_to_index.get(bvh_name)
+        if index is None:
+            continue
+        key = _semantic_joint_key(str(joint.get("matching_name") or joint.get("name") or bvh_name))
+        if not key:
+            continue
+        values[key] = index if key not in values else None
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _semantic_joint_key(name: str) -> tuple[str, ...]:
+    base = _strip_motion2motion_suffix(str(name or "").split(":")[-1])
+    base = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", base)
+    base = re.sub(r"([A-Za-z])([0-9])", r"\1_\2", base)
+    base = re.sub(r"([0-9])([A-Za-z])", r"\1_\2", base)
+    tokens = [token.lower() for token in re.split(r"[^A-Za-z0-9]+", base) if token]
+    filtered = []
+    skip_prefix_number = False
+    for token in tokens:
+        if token == "mixamorig" or re.fullmatch(r"mixamorig\d+", token):
+            skip_prefix_number = True
+            continue
+        if skip_prefix_number and token.isdigit():
+            skip_prefix_number = False
+            continue
+        skip_prefix_number = False
+        if token in {"armature", "rig", "root", "joint"}:
+            continue
+        filtered.append(token)
+    return tuple(filtered)
+
+
+def _root_index_from_parents(parents: list[int]) -> int:
+    for index, parent in enumerate(parents):
+        if int(parent) < 0:
+            return index
+    return 0
+
+
+def _metadata_height(metadata: dict[str, Any]) -> float:
+    values: list[float] = []
+    for joint in metadata.get("joints") or []:
+        for key in ("head", "tail"):
+            coords = joint.get(key) or []
+            if len(coords) >= 2:
+                values.append(float(coords[1]))
+    if not values:
+        return 1.0
+    return max(values) - min(values)
+
+
+def _write_mapped_bvh(
+    output_path: str | Path,
+    joints: list[dict[str, Any]],
+    positions: np.ndarray,
+    rotations: np.ndarray,
+    fps: float,
+) -> None:
+    output = Path(output_path).expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    children: dict[int, list[int]] = {}
+    root_index = 0
+    for index, joint in enumerate(joints):
+        parent_index = int(joint.get("parent_index", -1))
+        if parent_index < 0:
+            root_index = index
+            continue
+        children.setdefault(parent_index, []).append(index)
+
+    lines = ["HIERARCHY"]
+    _append_bvh_joint_lines(lines, joints, children, root_index, 0)
+    lines.append("MOTION")
+    lines.append(f"Frames: {int(positions.shape[0])}")
+    lines.append(f"Frame Time: {1.0 / max(float(fps), 1e-6):.8f}")
+    for frame_index in range(int(positions.shape[0])):
+        values: list[str] = []
+        for joint_index in range(len(joints)):
+            values.extend(f"{float(value):.6f}" for value in positions[frame_index, joint_index, :3])
+            values.extend(f"{float(value):.6f}" for value in rotations[frame_index, joint_index, :3])
+        lines.append(" ".join(values))
+    output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _append_bvh_joint_lines(
+    lines: list[str],
+    joints: list[dict[str, Any]],
+    children: dict[int, list[int]],
+    joint_index: int,
+    depth: int,
+) -> None:
+    joint = joints[joint_index]
+    indent = "\t" * depth
+    label = "ROOT" if int(joint.get("parent_index", -1)) < 0 else "JOINT"
+    lines.append(f"{indent}{label} {joint.get('bvh_name')}")
+    lines.append(f"{indent}{{")
+    offset = joint.get("offset") or [0.0, 0.0, 0.0]
+    channel_indent = f"{indent}\t"
+    lines.append(f"{channel_indent}OFFSET {float(offset[0]):.6f} {float(offset[1]):.6f} {float(offset[2]):.6f}")
+    lines.append(
+        f"{channel_indent}CHANNELS 6 Xposition Yposition Zposition Xrotation Yrotation Zrotation"
+    )
+    child_indices = children.get(joint_index) or []
+    if child_indices:
+        for child_index in child_indices:
+            _append_bvh_joint_lines(lines, joints, children, child_index, depth + 1)
+    else:
+        tail_offset = joint.get("tail_offset") or [1.0, 0.0, 0.0]
+        lines.append(f"{channel_indent}End Site")
+        lines.append(f"{channel_indent}{{")
+        lines.append(
+            f"{channel_indent}\tOFFSET {float(tail_offset[0]):.6f} {float(tail_offset[1]):.6f} {float(tail_offset[2]):.6f}"
+        )
+        lines.append(f"{channel_indent}}}")
+    lines.append(f"{indent}}}")
 
 
 def build_generic_skeleton_from_exported_3d_metadata(

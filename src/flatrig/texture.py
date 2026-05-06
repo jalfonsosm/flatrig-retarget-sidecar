@@ -249,6 +249,7 @@ def render_part_sprite(
     resolution=1024,
     depth_center=0.0,
     bind_frame=None,
+    use_rest_pose=False,
     projection_matrix=None,
 ):
     """Render a cropped sprite for one body part.
@@ -260,13 +261,28 @@ def render_part_sprite(
     if bind_frame is not None:
         scene.frame_set(bind_frame)
         bpy.context.view_layer.update()
+    rest_pose_state = []
+    if use_rest_pose:
+        for scene_obj in scene.objects:
+            if scene_obj.type == "ARMATURE" and scene_obj.data is not None:
+                rest_pose_state.append((scene_obj.data, scene_obj.data.pose_position))
+                scene_obj.data.pose_position = "REST"
+        if rest_pose_state:
+            bpy.context.view_layer.update()
     depsgraph = bpy.context.evaluated_depsgraph_get()
-    eval_obj = source_obj.evaluated_get(depsgraph)
-    render_mesh = bpy.data.meshes.new_from_object(
-        eval_obj,
-        preserve_all_data_layers=True,
-        depsgraph=depsgraph,
-    )
+    render_mesh = None
+    try:
+        eval_obj = source_obj.evaluated_get(depsgraph)
+        render_mesh = bpy.data.meshes.new_from_object(
+            eval_obj,
+            preserve_all_data_layers=True,
+            depsgraph=depsgraph,
+        )
+    finally:
+        for armature_data, pose_position in rest_pose_state:
+            armature_data.pose_position = pose_position
+        if rest_pose_state:
+            bpy.context.view_layer.update()
 
     bm = bmesh.new()
     bm.from_mesh(render_mesh)
