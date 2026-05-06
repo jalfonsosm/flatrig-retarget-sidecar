@@ -123,7 +123,7 @@ def _build_unlit_material(original_material):
     material = original_material.copy()
     material.use_nodes = True
     if hasattr(material, "use_backface_culling"):
-        material.use_backface_culling = True
+        material.use_backface_culling = False
     if hasattr(material, "show_transparent_back"):
         material.show_transparent_back = False
     nodes = material.node_tree.nodes
@@ -298,30 +298,7 @@ def render_part_sprite(
     if delete_faces:
         bmesh.ops.delete(bm, geom=delete_faces, context="FACES")
 
-    # TODO: This doesn't work yet!!!
-
     fill_holes = False
-
-    if fill_holes:
-        # Find boundary edges and fill holes
-        boundary_edges = [edge for edge in bm.edges if len(edge.link_faces) == 1]
-        hole_faces = []
-        if boundary_edges:
-            res = bmesh.ops.holes_fill(bm, edges=boundary_edges)
-            if "faces" in res and res["faces"]:
-                hole_faces = res["faces"]
-                # To remove jagged teeth, we want the fill to be convex.
-                # We can take the geometry of the newly created faces and their boundary
-                # and run convex hull just on them to expand the fill outwards across concavities.
-                geom_to_hull = list({v for f in hole_faces for v in f.verts})
-                hull_res = bmesh.ops.convex_hull(bm, input=geom_to_hull, use_existing_faces=True)
-                new_hull_faces = [
-                    f for f in hull_res.get("geom", []) if isinstance(f, bmesh.types.BMFace)
-                ]
-                # Also keep track of any newly added faces to assign the mask material later
-                for f in new_hull_faces:
-                    if f not in hole_faces:
-                        hole_faces.append(f)
 
     if not bm.faces:
         bm.free()
@@ -330,6 +307,10 @@ def render_part_sprite(
 
     bm.to_mesh(render_mesh)
     bm.free()
+
+    render_mesh.update()
+    render_mesh.calc_normals_split()
+    render_mesh.calc_loop_triangles()
 
     render_obj = bpy.data.objects.new(f"{source_obj.name}_sidecar_part", render_mesh)
     render_obj.matrix_world = source_obj.matrix_world.copy()
