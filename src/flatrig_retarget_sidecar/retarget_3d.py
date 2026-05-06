@@ -386,17 +386,13 @@ def bvh_to_flatrig_animation(
             else:
                 projected_axis_2d = projected_axis_2d / axis_norm
 
-            setup_length = float(setup_bone.get("length", 1.0)) if setup_bone else 1.0
-            local_scale_x = axis_norm / max(1e-4, setup_length)
-            local_scale_y = 1.0
-
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
                 local_y = float(world_head_2d[1])
                 local_rotation_deg = math.degrees(
                     math.atan2(projected_axis_2d[1], projected_axis_2d[0])
                 )
-                world_basis_2d = _build_basis_2d(local_rotation_deg, local_scale_x, local_scale_y)
+                world_basis_2d = _build_basis_2d(local_rotation_deg)
             else:
                 parent_state = world_cache[parent_index]
                 assert parent_state is not None
@@ -416,13 +412,13 @@ def bvh_to_flatrig_animation(
                 local_rotation_deg = math.degrees(math.atan2(local_axis[1], local_axis[0]))
                 local_x = float(local_position_2d[0])
                 local_y = float(local_position_2d[1])
-                world_basis_2d = rotation_basis @ _build_basis_2d(local_rotation_deg, local_scale_x, local_scale_y)
+                world_basis_2d = rotation_basis @ _build_basis_2d(local_rotation_deg)
 
             world_cache[joint_index] = {
                 "head_3d": head_3d,
                 "head_2d": world_head_2d,
                 "world_rotation_3d": world_rotation_3d,
-                "world_basis_2d": world_basis_2d,
+                "world_basis_2d": _orthonormalize_2x2(world_basis_2d),
                 "original_name": original_name,
             }
 
@@ -431,8 +427,6 @@ def bvh_to_flatrig_animation(
                     "x": local_x,
                     "y": local_y,
                     "rotation": _normalize_angle(local_rotation_deg),
-                    "scale_x": local_scale_x,
-                    "scale_y": local_scale_y,
                 }
 
         for bone_name, pose in local_cache_2d.items():
@@ -453,20 +447,6 @@ def bvh_to_flatrig_animation(
                     "value": round(rel_rotation, 2),
                 }
             )
-            setup_scale_x = float(setup_bone.get("scaleX", 1.0))
-            setup_scale_y = float(setup_bone.get("scaleY", 1.0))
-            rel_scale_x = float(pose["scale_x"]) / max(1e-4, setup_scale_x)
-            rel_scale_y = float(pose["scale_y"]) / max(1e-4, setup_scale_y)
-            if abs(rel_scale_x - 1.0) > 1e-4 or abs(rel_scale_y - 1.0) > 1e-4:
-                scale_track = timelines.setdefault("scale", [])
-                scale_track.append(
-                    {
-                        "time": time_value,
-                        "x": round(rel_scale_x, 4),
-                        "y": round(rel_scale_y, 4),
-                    }
-                )
-
             if abs(rel_x) > 1e-4 or abs(rel_y) > 1e-4 or setup_bone.get("parent") is None:
                 timelines["translate"].append(
                     {
@@ -480,14 +460,11 @@ def bvh_to_flatrig_animation(
     for bone_name, timelines in track_map.items():
         rotate = _compress_timeline_keys(timelines["rotate"], ("angle", "value"), tolerance=0.01)
         translate = _compress_timeline_keys(timelines["translate"], ("x", "y"), tolerance=1e-4)
-        scale = _compress_timeline_keys(timelines.get("scale", []), ("x", "y"), tolerance=1e-4)
         payload: dict[str, Any] = {}
         if rotate:
             payload["rotate"] = rotate
         if translate:
             payload["translate"] = translate
-        if scale:
-            payload["scale"] = scale
         if payload:
             compressed_bones[bone_name] = payload
 
