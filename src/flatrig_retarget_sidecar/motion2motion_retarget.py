@@ -1064,7 +1064,9 @@ def _euler_xyz_degrees_to_matrix(values: np.ndarray) -> np.ndarray:
         ],
         dtype=np.float64,
     )
-    return rx @ ry @ rz
+    # Blender's Euler(..., "XYZ").to_matrix() uses this composition for column vectors.
+    # The BVH exporter writes Blender XYZ Euler angles, so import must mirror it exactly.
+    return rz @ ry @ rx
 
 
 def _build_basis_2d(rotation_deg: float, scale_x: float = 1.0, scale_y: float = 1.0) -> np.ndarray:

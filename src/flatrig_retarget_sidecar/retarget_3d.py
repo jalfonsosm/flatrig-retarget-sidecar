@@ -378,15 +378,15 @@ def _rotation_between_vectors_3d(source: np.ndarray, target: np.ndarray) -> np.n
 
 def _matrix_to_euler_xyz_degrees(matrix: np.ndarray) -> np.ndarray:
     values = np.asarray(matrix, dtype=np.float64)
-    sy = float(np.clip(values[0, 2], -1.0, 1.0))
+    sy = float(np.clip(-values[2, 0], -1.0, 1.0))
     y = math.asin(sy)
     cy = math.cos(y)
     if abs(cy) > 1e-8:
-        x = math.atan2(-values[1, 2], values[2, 2])
-        z = math.atan2(-values[0, 1], values[0, 0])
+        x = math.atan2(values[2, 1], values[2, 2])
+        z = math.atan2(values[1, 0], values[0, 0])
     else:
-        x = math.atan2(values[2, 1], values[1, 1])
-        z = 0.0
+        x = 0.0
+        z = math.atan2(-values[0, 1], values[1, 1])
     return np.array([math.degrees(x), math.degrees(y), math.degrees(z)], dtype=np.float64)
 
 
@@ -463,6 +463,8 @@ def direct_mapped_bvh_retarget(
     target_parents = [int(parent) for parent in target_animation.parents]
     target_names = [str(name) for name in target_animation.names]
     source_names = [str(name) for name in source_animation.names]
+    source_tail_offsets = _bvh_joint_tail_offsets(source_names, source_metadata)
+    target_tail_offsets = _bvh_joint_tail_offsets(target_names, target_metadata)
 
     frame_count = int(source_animation.rotations.shape[0])
     target_joint_count = len(target_names)
@@ -489,7 +491,18 @@ def direct_mapped_bvh_retarget(
             0 <= target_index < target_joint_count
             and 0 <= source_index < int(source_rotations.shape[1])
         ):
-            rotations[:, target_index, :] = source_rotations[:, source_index, :3]
+            source_axis = source_tail_offsets[source_index]
+            target_axis = target_tail_offsets[target_index]
+            target_to_source = _rotation_between_vectors_3d(target_axis, source_axis)
+            source_to_target = target_to_source.T
+            for frame_index in range(frame_count):
+                source_local_rotation = _euler_xyz_degrees_to_matrix(
+                    source_rotations[frame_index, source_index, :3]
+                )
+                target_local_rotation = source_to_target @ source_local_rotation @ target_to_source
+                rotations[frame_index, target_index, :] = _matrix_to_euler_xyz_degrees(
+                    target_local_rotation
+                )
 
     _write_mapped_bvh(
         output_bvh,
@@ -500,11 +513,26 @@ def direct_mapped_bvh_retarget(
     )
     return {
         "reason": "motion2motion_static_output",
-        "mode": "local_rotation_copy",
+        "mode": "axis_aligned_local_rotation_copy",
         "mapped_joint_count": len(index_map),
         "target_joint_count": target_joint_count,
         "mapping_stats": mapping_stats,
     }
+
+
+def _bvh_joint_tail_offsets(names: list[str], metadata: dict[str, Any]) -> list[np.ndarray]:
+    joint_metadata_by_bvh_name = _joint_metadata_lookup(metadata)
+    children = _metadata_children(metadata)
+    offsets: list[np.ndarray] = []
+    for bvh_name in names:
+        joint_metadata = joint_metadata_by_bvh_name.get(bvh_name) or joint_metadata_by_bvh_name.get(
+            _strip_motion2motion_suffix(bvh_name)
+        )
+        if joint_metadata is not None:
+            offsets.append(_joint_tail_offset(joint_metadata, children))
+        else:
+            offsets.append(np.array((1.0, 0.0, 0.0), dtype=np.float64))
+    return offsets
 
 
 def _build_direct_retarget_index_map(
