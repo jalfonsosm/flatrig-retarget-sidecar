@@ -200,6 +200,10 @@ def main() -> None:
     render_sprites_parser.add_argument("--images-dir", required=True)
     render_sprites_parser.add_argument("--resolution", type=int, default=2048)
     render_sprites_parser.add_argument("--bind-frame", type=int, default=0)
+    render_sprites_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
+    render_sprites_parser.add_argument(
+        "--no-mesh-reduction", dest="mesh_reduction", action="store_false", default=True
+    )
 
     args = parser.parse_args()
 
@@ -417,6 +421,8 @@ def main() -> None:
             projection_space=args.projection_space,
             resolution=args.resolution,
             bind_frame=args.bind_frame,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
         )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:

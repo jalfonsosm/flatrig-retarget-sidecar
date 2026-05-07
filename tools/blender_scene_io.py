@@ -64,19 +64,19 @@ VIEW_PRESETS = {
         "up_axis": (0.0, 1.0, 0.0),
     },
     "three_quarter": {
-        "view_dir": (1.0, 1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_r": {
-        "view_dir": (-1.0, 1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_back": {
         "view_dir": (1.0, -1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
-    "three_quarter_back_r": {
+    "three_quarter_r": {
         "view_dir": (-1.0, -1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back": {
+        "view_dir": (1.0, 1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back_r": {
+        "view_dir": (-1.0, 1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
     "isometric": {
@@ -428,6 +428,12 @@ def _matrix3_from_json(values):
     )
 
 
+def _armature_world_rotation(armature_obj):
+    if armature_obj is None:
+        return mathutils.Matrix.Identity(3)
+    return armature_obj.matrix_world.to_quaternion().to_matrix()
+
+
 def extract_2d_mesh(
     mesh_obj,
     view_cfg,
@@ -500,10 +506,12 @@ def extract_2d_mesh(
                 if len(face.loops) != 3:
                     continue
                 tri = []
+                source_tri = []
                 for loop in face.loops:
                     source_index = int(loop.vert.index)
                     if source_index < 0 or source_index >= len(vertices_2d):
                         continue
+                    source_tri.append(source_index)
                     if uv_layer is not None:
                         loop_uv = loop[uv_layer].uv
                         source_uv = (float(loop_uv.x), float(loop_uv.y))
@@ -530,7 +538,7 @@ def extract_2d_mesh(
                 if len(tri) != 3 or len(set(tri)) != 3:
                     continue
                 triangles.append(tri)
-                triangle_keys.append(tuple(sorted(tri)))
+                triangle_keys.append(tuple(sorted(source_tri)))
         finally:
             bm.free()
 
@@ -666,14 +674,14 @@ def parse_args() -> argparse.Namespace:
         "--mesh-target-vertices",
         type=int,
         default=5000,
-        help="Target vertex count for source mesh reduction during extract-scene",
+        help="Target vertex count for source mesh reduction",
     )
     parser.add_argument(
         "--no-mesh-reduction",
         dest="mesh_reduction",
         action="store_false",
         default=True,
-        help="Disable source mesh reduction during extract-scene",
+        help="Disable source mesh reduction",
     )
     return parser.parse_args(script_args)
 
@@ -1308,6 +1316,7 @@ def _build_3d_bvh_layout(armature_obj):
     armature_scale = _armature_uniform_scale(armature_obj)
     armature_world = armature_obj.matrix_world.copy()
     armature_linear = armature_world.to_3x3()
+    armature_rotation = _armature_world_rotation(armature_obj)
     root_bones = [
         bone
         for bone in armature_obj.data.bones
@@ -1401,6 +1410,7 @@ def _build_3d_bvh_layout(armature_obj):
         "root_matching_name": joints[0]["matching_name"] if joints else None,
         "coordinate_scale": armature_scale,
         "coordinate_linear": _matrix3_to_json(armature_linear),
+        "coordinate_rotation": _matrix3_to_json(armature_rotation),
     }
 
 
@@ -1469,8 +1479,11 @@ def _write_3d_bvh(output_path, joints, positions, rotations, fps):
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _pose_bone_basis_euler_degrees(pose_bone):
-    euler = pose_bone.matrix_basis.to_euler("XYZ")
+def _pose_bone_basis_euler_degrees(pose_bone, coordinate_rotation=None):
+    basis = pose_bone.matrix_basis.to_3x3()
+    if coordinate_rotation is not None:
+        basis = coordinate_rotation @ basis @ coordinate_rotation.inverted()
+    euler = basis.to_euler("XYZ")
     return [math.degrees(float(euler.x)), math.degrees(float(euler.y)), math.degrees(float(euler.z))]
 
 
@@ -1499,6 +1512,7 @@ def _set_scene_frame_float(scene, frame_value):
 def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
     scene = bpy.context.scene
     coordinate_linear = _matrix3_from_json(layout.get("coordinate_linear"))
+    coordinate_rotation = _matrix3_from_json(layout.get("coordinate_rotation"))
     positions = []
     rotations = []
     for frame_value in sample_frames:
@@ -1521,7 +1535,7 @@ def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
                 float(location.y),
                 float(location.z),
             ))
-            frame_rotations.extend(_pose_bone_basis_euler_degrees(pose_bone))
+            frame_rotations.extend(_pose_bone_basis_euler_degrees(pose_bone, coordinate_rotation))
         positions.append(frame_positions)
         rotations.append(frame_rotations)
     return positions, rotations
@@ -1563,6 +1577,21 @@ def _resolve_action_for_export(armature_obj, animation_names):
     if actions:
         return sorted(actions, key=lambda action: str(action.name).lower())[0]
     return None
+
+
+def _select_sprite_render_frame(armature_obj, source_frame=None) -> int:
+    if source_frame is not None and int(source_frame) > 0:
+        return int(source_frame)
+
+    action = _resolve_action_for_export(armature_obj, [])
+    if action is not None:
+        start, end = action.frame_range
+        if float(end) > float(start):
+            return int(round(float(start) + (float(end) - float(start)) * 0.35))
+        return int(round(float(start)))
+
+    scene = bpy.context.scene
+    return int(scene.frame_start or 1)
 
 
 def export_3d_animation_bvh_cli(
@@ -2283,6 +2312,8 @@ def render_sprites_cli(
     images_dir: str = None,
     resolution: int = 2048,
     bind_frame: int = 0,
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
 ) -> dict[str, object]:
     """CLI wrapper for sprite rendering.
 
@@ -2297,6 +2328,12 @@ def render_sprites_cli(
     if mesh_obj is None:
         return {"ok": False, "detail": "No mesh found in scene"}
 
+    mesh_reduction_report = reduce_mesh_object(
+        mesh_obj,
+        target_vertices=mesh_target_vertices,
+        enabled=mesh_reduction,
+    )
+
     if not parts_json or not images_dir:
         return {"ok": False, "detail": "parts-json and images-dir are required"}
 
@@ -2308,6 +2345,17 @@ def render_sprites_cli(
 
     parts = json_module.loads(parts_path.read_text(encoding="utf-8"))
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if bind_frame < 0 and not use_rest_pose:
+        render_frame = _select_sprite_render_frame(armature_obj, source_frame=source_frame)
+    elif bind_frame > 0:
+        render_frame = int(bind_frame)
+    elif source_frame is not None and int(source_frame) > 0:
+        render_frame = int(source_frame)
+    else:
+        render_frame = int(bpy.context.scene.frame_start or 1)
+    bpy.context.scene.frame_set(render_frame)
+    bpy.context.view_layer.update()
 
     # Build view configuration
     view_cfg = get_view_config(
@@ -2356,7 +2404,7 @@ def render_sprites_cli(
                 str(part_output),
                 resolution=resolution,
                 depth_center=float(part.get("mean_depth", 0.0) or 0.0),
-                bind_frame=bind_frame if bind_frame > 0 else source_frame or 0,
+                bind_frame=render_frame,
                 use_rest_pose=use_rest_pose,
                 projection_matrix=projection_matrix,
             )
@@ -2376,6 +2424,9 @@ def render_sprites_cli(
             "ok": True,
             "detail": "rendered",
             "source": source_path,
+            "render_frame": render_frame,
+            "use_rest_pose": bool(use_rest_pose),
+            "mesh_reduction": mesh_reduction_report,
             "renders": renders,
         }
     except ImportError as e:
@@ -2512,6 +2563,8 @@ def main() -> None:
             images_dir=args.images_dir,
             resolution=args.resolution,
             bind_frame=args.bind_frame,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
         )
     else:
         raise AssertionError(f"Unhandled command: {args.command}")

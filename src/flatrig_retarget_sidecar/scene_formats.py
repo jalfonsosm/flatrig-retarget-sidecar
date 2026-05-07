@@ -654,6 +654,8 @@ def render_sprites(
     projection_space: str = "world",
     resolution: int = 2048,
     bind_frame: int = 0,
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
 ) -> SceneCommandResult:
     """Render sprites using projection."""
     extra_args = [
@@ -668,6 +670,10 @@ def render_sprites(
         "--resolution",
         str(resolution),
     ]
+    if mesh_reduction:
+        extra_args.extend(["--mesh-target-vertices", str(mesh_target_vertices)])
+    else:
+        extra_args.append("--no-mesh-reduction")
     if view_dir:
         extra_args.extend(["--view-dir", view_dir])
     if view_up:
@@ -678,7 +684,7 @@ def render_sprites(
         extra_args.extend(["--source-frame", str(source_frame)])
     if use_rest_pose:
         extra_args.append("--use-rest-pose")
-    if bind_frame > 0:
+    if bind_frame != 0:
         extra_args.extend(["--bind-frame", str(bind_frame)])
 
     probe = probe_scene_backend_impl()

@@ -123,9 +123,9 @@ def _build_unlit_material(original_material):
     material = original_material.copy()
     material.use_nodes = True
     if hasattr(material, "use_backface_culling"):
-        material.use_backface_culling = True
+        material.use_backface_culling = False
     if hasattr(material, "show_transparent_back"):
-        material.show_transparent_back = False
+        material.show_transparent_back = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
 
