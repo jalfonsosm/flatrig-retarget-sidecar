@@ -340,6 +340,7 @@ def main() -> None:
             view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             fps=args.fps,
             frame_count=args.frame_count,

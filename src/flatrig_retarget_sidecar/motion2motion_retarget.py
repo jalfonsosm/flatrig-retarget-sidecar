@@ -1332,6 +1332,16 @@ def _score_generic_chain_pair(
 ) -> float:
     if source.is_main != target.is_main:
         return 0.0
+    source_named_side = _named_lateral_side(source.names)
+    target_named_side = _named_lateral_side(target.names)
+    if mirror:
+        target_named_side = _opposite_lateral_side(target_named_side)
+    if (
+        source_named_side in {"left", "right"}
+        and target_named_side in {"left", "right"}
+        and source_named_side != target_named_side
+    ):
+        return 0.0
     target_side = target.side
     if mirror:
         if target_side == "left":
@@ -1677,7 +1687,10 @@ def build_auto_sparse_mapping_payload(
         mirror=True,
         min_score=min_chain_score,
     )
-    use_mirror = mirrored_score > direct_score
+    suppress_mirror_by_named_sides = _has_named_lateral_chains(
+        branch_source
+    ) and _has_named_lateral_chains(branch_target)
+    use_mirror = False if suppress_mirror_by_named_sides else mirrored_score > direct_score
     matched_chain_pairs = mirrored_pairs if use_mirror else direct_pairs
 
     pair_candidates: list[tuple[str, str, float, str]] = [
@@ -1689,14 +1702,16 @@ def build_auto_sparse_mapping_payload(
         and main_source.end_name != source.root_name
         and main_target.end_name != target.root_name
     ):
-        pair_candidates.append(
-            (
-                main_source.end_name,
-                main_target.end_name,
-                _score_generic_chain_pair(main_source, main_target, mirror=use_mirror),
-                "main_chain_leaf",
+        main_score = _score_generic_chain_pair(main_source, main_target, mirror=use_mirror)
+        if main_score >= min_chain_score:
+            pair_candidates.append(
+                (
+                    main_source.end_name,
+                    main_target.end_name,
+                    main_score,
+                    "main_chain_leaf",
+                )
             )
-        )
     for source_chain, target_chain, score in matched_chain_pairs:
         pair_candidates.append(
             (source_chain.start_name, target_chain.start_name, score, "chain_start")
@@ -1726,6 +1741,7 @@ def build_auto_sparse_mapping_payload(
     }
     diagnostics = {
         "mirror_x": use_mirror,
+        "mirror_suppressed_by_named_sides": suppress_mirror_by_named_sides,
         "source_root": source.root_name,
         "target_root": target.root_name,
         "source_chain_count": len(source_chains),
@@ -1749,6 +1765,34 @@ def build_auto_sparse_mapping_payload(
         ],
     }
     return payload, diagnostics
+
+
+def _has_named_lateral_chains(chains: list[GenericSparseChain]) -> bool:
+    named_sides = set()
+    for chain in chains:
+        side = _named_lateral_side(chain.names)
+        if side in {"left", "right"}:
+            named_sides.add(side)
+    return "left" in named_sides and "right" in named_sides
+
+
+def _named_lateral_side(names: list[str]) -> str:
+    sides = [_infer_side_from_name(name) for name in names]
+    left_count = sum(1 for side in sides if side == "left")
+    right_count = sum(1 for side in sides if side == "right")
+    if left_count > right_count:
+        return "left"
+    if right_count > left_count:
+        return "right"
+    return "unknown"
+
+
+def _opposite_lateral_side(side: str) -> str:
+    if side == "left":
+        return "right"
+    if side == "right":
+        return "left"
+    return side
 
 
 def build_generic_skeleton_description(

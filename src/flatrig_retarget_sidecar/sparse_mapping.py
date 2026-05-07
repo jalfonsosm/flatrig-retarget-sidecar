@@ -105,7 +105,10 @@ def suggest_sparse_mapping(
         mirror=True,
         min_score=min_chain_score,
     )
-    use_mirror = mirrored_score > direct_score
+    suppress_mirror_by_named_sides = _has_named_lateral_chains(
+        branch_source
+    ) and _has_named_lateral_chains(branch_target)
+    use_mirror = False if suppress_mirror_by_named_sides else mirrored_score > direct_score
     matched_chain_pairs = mirrored_pairs if use_mirror else direct_pairs
 
     anchor_pairs: list[SparsePair] = [
@@ -123,14 +126,16 @@ def suggest_sparse_mapping(
         and main_source.end_name != source_root.name
         and main_target.end_name != target_root.name
     ):
-        anchor_pairs.append(
-            SparsePair(
-                source=main_source.end_name,
-                target=main_target.end_name,
-                score=_score_chain_pair(main_source, main_target, mirror=use_mirror),
-                reason="main_chain_leaf",
+        main_score = _score_chain_pair(main_source, main_target, mirror=use_mirror)
+        if main_score >= min_chain_score:
+            anchor_pairs.append(
+                SparsePair(
+                    source=main_source.end_name,
+                    target=main_target.end_name,
+                    score=main_score,
+                    reason="main_chain_leaf",
+                )
             )
-        )
 
     for source_chain, target_chain, score in matched_chain_pairs:
         anchor_pairs.append(
@@ -161,6 +166,7 @@ def suggest_sparse_mapping(
         "source_root": source_root.name,
         "target_root": target_root.name,
         "mirror_x": use_mirror,
+        "mirror_suppressed_by_named_sides": suppress_mirror_by_named_sides,
         "source_chain_count": len(source_chains),
         "target_chain_count": len(target_chains),
         "chain_pairs": [
@@ -183,6 +189,34 @@ def suggest_sparse_mapping(
         mapping=mapping,
         diagnostics=diagnostics,
     )
+
+
+def _has_named_lateral_chains(chains: list[SparseChain]) -> bool:
+    named_sides = set()
+    for chain in chains:
+        side = _named_lateral_side(chain.names)
+        if side in {SIDE_LEFT, SIDE_RIGHT}:
+            named_sides.add(side)
+    return SIDE_LEFT in named_sides and SIDE_RIGHT in named_sides
+
+
+def _named_lateral_side(names: list[str]) -> str:
+    sides = [_infer_side_from_name(name) for name in names]
+    left_count = sum(1 for side in sides if side == SIDE_LEFT)
+    right_count = sum(1 for side in sides if side == SIDE_RIGHT)
+    if left_count > right_count:
+        return SIDE_LEFT
+    if right_count > left_count:
+        return SIDE_RIGHT
+    return SIDE_UNKNOWN
+
+
+def _opposite_lateral_side(side: str) -> str:
+    if side == SIDE_LEFT:
+        return SIDE_RIGHT
+    if side == SIDE_RIGHT:
+        return SIDE_LEFT
+    return side
 
 
 def build_motion2motion_mapping_payload(
@@ -443,6 +477,16 @@ def _score_chain_pair(source: SparseChain, target: SparseChain, *, mirror: bool)
     if source.is_main != target.is_main:
         return 0.0
 
+    source_named_side = _named_lateral_side(source.names)
+    target_named_side = _named_lateral_side(target.names)
+    if mirror:
+        target_named_side = _opposite_lateral_side(target_named_side)
+    if (
+        source_named_side in {SIDE_LEFT, SIDE_RIGHT}
+        and target_named_side in {SIDE_LEFT, SIDE_RIGHT}
+        and source_named_side != target_named_side
+    ):
+        return 0.0
     name_score = _token_similarity(source.name_tokens, target.name_tokens)
     length_score = _ratio_score(source.total_length, target.total_length)
     depth_score = 1.0 / (1.0 + abs(source.start_depth - target.start_depth))

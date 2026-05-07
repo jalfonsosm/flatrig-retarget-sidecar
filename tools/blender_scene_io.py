@@ -1309,8 +1309,14 @@ def _view_config_to_json(view_cfg):
     }
 
 
-def _build_3d_bvh_layout(armature_obj):
+def _build_3d_bvh_layout(armature_obj, source_frame=None, use_rest_pose=True):
     """Return Motion2Motion-friendly BVH joints for a Blender armature."""
+    scene = bpy.context.scene
+    if source_frame is not None:
+        scene.frame_set(int(source_frame))
+    rest_pose_state = _set_scene_armatures_rest_pose(scene) if use_rest_pose else []
+    bpy.context.view_layer.update()
+
     bone_order = _topological_sort(armature_obj)
     bone_order_index = {name: index for index, name in enumerate(bone_order)}
     armature_scale = _armature_uniform_scale(armature_obj)
@@ -1333,85 +1339,94 @@ def _build_3d_bvh_layout(armature_obj):
     matching_to_bvh = {}
     name_to_index = {}
 
-    if use_synthetic_root:
-        matching_name = _sanitize_motion2motion_name("sidecar_root", used_names)
-        bvh_name = _motion2motion_export_name(matching_name, 0)
-        joints.append(
-            {
-                "index": 0,
-                "name": None,
+    def bone_world_head_tail(rest_bone):
+        if not use_rest_pose:
+            pose_bone = armature_obj.pose.bones.get(rest_bone.name)
+            if pose_bone is not None:
+                return armature_world @ pose_bone.head, armature_world @ pose_bone.tail
+        return armature_world @ rest_bone.head_local, armature_world @ rest_bone.tail_local
+
+    try:
+        if use_synthetic_root:
+            matching_name = _sanitize_motion2motion_name("sidecar_root", used_names)
+            bvh_name = _motion2motion_export_name(matching_name, 0)
+            joints.append(
+                {
+                    "index": 0,
+                    "name": None,
+                    "matching_name": matching_name,
+                    "bvh_name": bvh_name,
+                    "parent_index": -1,
+                    "parent_bvh_name": None,
+                    "offset": [0.0, 0.0, 0.0],
+                    "head": [0.0, 0.0, 0.0],
+                    "tail": [0.0, 0.0, 0.0],
+                    "tail_offset": [1.0, 0.0, 0.0],
+                    "length": 0.0,
+                    "synthetic": True,
+                }
+            )
+            matching_to_bvh[matching_name] = bvh_name
+            bvh_to_original[bvh_name] = None
+
+        for bone_name in bone_order:
+            rest_bone = armature_obj.data.bones[bone_name]
+            index = len(joints)
+            matching_name = _sanitize_motion2motion_name(rest_bone.name, used_names)
+            bvh_name = _motion2motion_export_name(matching_name, index)
+            parent_index = -1
+            parent_bvh_name = None
+            if rest_bone.parent is not None:
+                parent_index = name_to_index.get(rest_bone.parent.name, -1)
+            elif use_synthetic_root:
+                parent_index = 0
+            if parent_index >= 0:
+                parent_bvh_name = joints[parent_index]["bvh_name"]
+
+            head_vec, tail_vec = bone_world_head_tail(rest_bone)
+            if rest_bone.parent is None:
+                offset_vec = head_vec
+            else:
+                parent_head_vec, _parent_tail_vec = bone_world_head_tail(rest_bone.parent)
+                offset_vec = head_vec - parent_head_vec
+            tail_offset_vec = tail_vec - head_vec
+            length = float(tail_offset_vec.length)
+
+            joint = {
+                "index": index,
+                "name": rest_bone.name,
                 "matching_name": matching_name,
                 "bvh_name": bvh_name,
-                "parent_index": -1,
-                "parent_bvh_name": None,
-                "offset": [0.0, 0.0, 0.0],
-                "head": [0.0, 0.0, 0.0],
-                "tail": [0.0, 0.0, 0.0],
-                "tail_offset": [1.0, 0.0, 0.0],
-                "length": 0.0,
-                "synthetic": True,
+                "parent_index": int(parent_index),
+                "parent_bvh_name": parent_bvh_name,
+                "offset": _vector_to_json(offset_vec),
+                "head": _vector_to_json(head_vec),
+                "tail": _vector_to_json(tail_vec),
+                "tail_offset": _vector_to_json(tail_offset_vec),
+                "length": length,
+                "synthetic": False,
             }
-        )
-        matching_to_bvh[matching_name] = bvh_name
-        bvh_to_original[bvh_name] = None
+            joints.append(joint)
+            name_to_index[rest_bone.name] = index
+            original_to_bvh[rest_bone.name] = bvh_name
+            bvh_to_original[bvh_name] = rest_bone.name
+            original_to_matching[rest_bone.name] = matching_name
+            matching_to_bvh[matching_name] = bvh_name
 
-    for bone_name in bone_order:
-        rest_bone = armature_obj.data.bones[bone_name]
-        index = len(joints)
-        matching_name = _sanitize_motion2motion_name(rest_bone.name, used_names)
-        bvh_name = _motion2motion_export_name(matching_name, index)
-        parent_index = -1
-        parent_bvh_name = None
-        if rest_bone.parent is not None:
-            parent_index = name_to_index.get(rest_bone.parent.name, -1)
-        elif use_synthetic_root:
-            parent_index = 0
-        if parent_index >= 0:
-            parent_bvh_name = joints[parent_index]["bvh_name"]
-
-        head_vec = armature_world @ rest_bone.head_local
-        tail_vec = armature_world @ rest_bone.tail_local
-        if rest_bone.parent is None:
-            offset_vec = head_vec
-        else:
-            parent_head_vec = armature_world @ rest_bone.parent.head_local
-            offset_vec = head_vec - parent_head_vec
-        tail_offset_vec = tail_vec - head_vec
-        length = float(tail_offset_vec.length)
-
-        joint = {
-            "index": index,
-            "name": rest_bone.name,
-            "matching_name": matching_name,
-            "bvh_name": bvh_name,
-            "parent_index": int(parent_index),
-            "parent_bvh_name": parent_bvh_name,
-            "offset": _vector_to_json(offset_vec),
-            "head": _vector_to_json(head_vec),
-            "tail": _vector_to_json(tail_vec),
-            "tail_offset": _vector_to_json(tail_offset_vec),
-            "length": length,
-            "synthetic": False,
+        return {
+            "joints": joints,
+            "original_to_bvh": original_to_bvh,
+            "bvh_to_original": bvh_to_original,
+            "original_to_matching": original_to_matching,
+            "matching_to_bvh": matching_to_bvh,
+            "root_bvh_name": joints[0]["bvh_name"] if joints else None,
+            "root_matching_name": joints[0]["matching_name"] if joints else None,
+            "coordinate_scale": armature_scale,
+            "coordinate_linear": _matrix3_to_json(armature_linear),
+            "coordinate_rotation": _matrix3_to_json(armature_rotation),
         }
-        joints.append(joint)
-        name_to_index[rest_bone.name] = index
-        original_to_bvh[rest_bone.name] = bvh_name
-        bvh_to_original[bvh_name] = rest_bone.name
-        original_to_matching[rest_bone.name] = matching_name
-        matching_to_bvh[matching_name] = bvh_name
-
-    return {
-        "joints": joints,
-        "original_to_bvh": original_to_bvh,
-        "bvh_to_original": bvh_to_original,
-        "original_to_matching": original_to_matching,
-        "matching_to_bvh": matching_to_bvh,
-        "root_bvh_name": joints[0]["bvh_name"] if joints else None,
-        "root_matching_name": joints[0]["matching_name"] if joints else None,
-        "coordinate_scale": armature_scale,
-        "coordinate_linear": _matrix3_to_json(armature_linear),
-        "coordinate_rotation": _matrix3_to_json(armature_rotation),
-    }
+    finally:
+        _restore_scene_armature_pose_positions(rest_pose_state)
 
 
 def _build_joint_children(joints):
@@ -1637,6 +1652,9 @@ def _resolve_action_for_export(armature_obj, animation_names):
 def _select_sprite_render_frame(armature_obj, source_frame=None) -> int:
     if source_frame is not None and int(source_frame) > 0:
         return int(source_frame)
+    if armature_obj is None:
+        scene = bpy.context.scene
+        return int(scene.frame_start or 1)
 
     action = _resolve_action_for_export(armature_obj, [])
     if action is not None:
@@ -1646,6 +1664,23 @@ def _select_sprite_render_frame(armature_obj, source_frame=None) -> int:
         return int(round(float(start)))
 
     scene = bpy.context.scene
+    return int(scene.frame_start or 1)
+
+
+def _resolve_setup_frame(armature_obj, source_frame=None, use_rest_pose=False) -> int:
+    """Resolve the shared setup frame for mesh, bones, target BVH, and sprites.
+
+    source_frame=-1 means "auto": choose a stable in-action pose when possible.
+    Rest-pose extraction still evaluates at a concrete scene frame so evaluated
+    meshes and projection metadata stay deterministic.
+    """
+    scene = bpy.context.scene
+    if source_frame is not None:
+        source_frame = int(source_frame)
+        if source_frame > 0:
+            return source_frame
+        if source_frame < 0 and not use_rest_pose:
+            return _select_sprite_render_frame(armature_obj)
     return int(scene.frame_start or 1)
 
 
@@ -1710,7 +1745,7 @@ def export_3d_rest_bvh_cli(
     view_up=None,
     view_roll: float = 0.0,
     source_frame: int = None,
-    use_rest_pose: bool = True,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     fps: float = 30.0,
     frame_count: int = None,
@@ -1723,6 +1758,11 @@ def export_3d_rest_bvh_cli(
     if fps <= 0.0:
         return {"ok": False, "detail": "fps must be > 0"}
 
+    setup_frame = _resolve_setup_frame(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+    )
     view_cfg = get_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
@@ -1732,12 +1772,16 @@ def export_3d_rest_bvh_cli(
     bones_2d = extract_bone_hierarchy(
         armature_obj,
         view_cfg,
-        source_frame=source_frame,
+        source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
         projection_space=projection_space,
         projection_reference_root=None,
     )
-    layout = _build_3d_bvh_layout(armature_obj)
+    layout = _build_3d_bvh_layout(
+        armature_obj,
+        source_frame=setup_frame,
+        use_rest_pose=use_rest_pose,
+    )
     positions, rotations = _rest_3d_bvh_frames(layout, frame_count=frame_count)
     _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
 
@@ -1754,6 +1798,8 @@ def export_3d_rest_bvh_cli(
         "frame_time": 1.0 / fps,
         "positions_mode": "all",
         "projection_space": projection_space,
+        "setup_frame": setup_frame,
+        "use_rest_pose": bool(use_rest_pose),
         "view": _view_config_to_json(view_cfg),
         "bones_2d": bones_2d,
         **layout,
@@ -2145,6 +2191,11 @@ def extract_scene_cli(
     if mesh_obj is None:
         return {"ok": False, "detail": "No mesh found in scene"}
 
+    setup_frame = _resolve_setup_frame(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+    )
     mesh_reduction_report = reduce_mesh_object(
         mesh_obj,
         target_vertices=mesh_target_vertices,
@@ -2165,14 +2216,14 @@ def extract_scene_cli(
         bones = extract_bone_hierarchy(
             armature_obj,
             view_cfg,
-            source_frame=source_frame,
+            source_frame=setup_frame,
             use_rest_pose=use_rest_pose,
             projection_space=projection_space,
             projection_reference_root=None,
         )
     bones_3d = extract_bone_hierarchy_3d(
         armature_obj,
-        source_frame=source_frame,
+        source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
     )
 
@@ -2180,7 +2231,7 @@ def extract_scene_cli(
     mesh_data = extract_2d_mesh(
         mesh_obj,
         view_cfg,
-        source_frame=source_frame,
+        source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
     )
     mesh_reduction_report["output_vertex_count"] = len(mesh_data.get("vertices_2d") or [])
@@ -2230,6 +2281,8 @@ def extract_scene_cli(
         "ok": True,
         "detail": "extracted",
         "source": source_path,
+        "setup_frame": setup_frame,
+        "use_rest_pose": bool(use_rest_pose),
         "mesh": mesh_data,
         "bones": bones,
         "bones_3d": bones_3d,
@@ -2281,6 +2334,11 @@ def extract_animations_cli(
     if armature_obj is None:
         return {"ok": False, "detail": "No armature found in scene"}
 
+    setup_frame = _resolve_setup_frame(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=False,
+    )
     # Build view configuration
     view_cfg = get_view_config(
         view_name=view_preset,
@@ -2293,7 +2351,7 @@ def extract_animations_cli(
     bones = extract_bone_hierarchy(
         armature_obj,
         view_cfg,
-        source_frame=source_frame,
+        source_frame=setup_frame,
         projection_space=projection_space,
         projection_reference_root=None,
     )
@@ -2348,6 +2406,7 @@ def extract_animations_cli(
         "ok": True,
         "detail": "extracted",
         "source": source_path,
+        "setup_frame": setup_frame,
         "bones": bones,
         "animations": _serialize_animations(animations),
     }
@@ -2401,14 +2460,14 @@ def render_sprites_cli(
     parts = json_module.loads(parts_path.read_text(encoding="utf-8"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if bind_frame < 0 and not use_rest_pose:
-        render_frame = _select_sprite_render_frame(armature_obj, source_frame=source_frame)
-    elif bind_frame > 0:
+    if bind_frame > 0:
         render_frame = int(bind_frame)
-    elif source_frame is not None and int(source_frame) > 0:
-        render_frame = int(source_frame)
     else:
-        render_frame = int(bpy.context.scene.frame_start or 1)
+        render_frame = _resolve_setup_frame(
+            armature_obj,
+            source_frame=(source_frame if bind_frame == 0 else -1),
+            use_rest_pose=use_rest_pose,
+        )
     bpy.context.scene.frame_set(render_frame)
     bpy.context.view_layer.update()
 
@@ -2591,7 +2650,7 @@ def main() -> None:
             view_up=view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
-            use_rest_pose=True,
+            use_rest_pose=args.use_rest_pose,
             projection_space=args.projection_space,
             fps=args.fps,
             frame_count=args.frame_count,

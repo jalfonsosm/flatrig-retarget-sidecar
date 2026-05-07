@@ -608,6 +608,7 @@ def export_3d_rest_bvh(
     view_up: str | None = None,
     view_roll: float = 0.0,
     source_frame: int | None = None,
+    use_rest_pose: bool = False,
     projection_space: str = "world",
     fps: float = 30.0,
     frame_count: int | None = None,
@@ -631,6 +632,8 @@ def export_3d_rest_bvh(
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
         extra_args.extend(["--source-frame", str(source_frame)])
+    if use_rest_pose:
+        extra_args.append("--use-rest-pose")
     if frame_count is not None:
         extra_args.extend(["--frame-count", str(frame_count)])
 
