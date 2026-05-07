@@ -262,6 +262,7 @@ def _retarget_one_3d_clip(
                 target_metadata,
                 mapping_payload,
                 output_bvh=retargeted_bvh,
+                manual_mapping=mapping_mode == "manual",
             )
             retargeted_motion = _bvh_motion_stats(retargeted_bvh)
         animation = bvh_to_flatrig_animation(
@@ -445,6 +446,7 @@ def direct_mapped_bvh_retarget(
     mapping_payload: dict[str, Any],
     *,
     output_bvh: str | Path,
+    manual_mapping: bool = False,
 ) -> dict[str, Any]:
     """Copy mapped local rotations onto the target hierarchy when M2M returns a static clip.
 
@@ -457,7 +459,7 @@ def direct_mapped_bvh_retarget(
     target_animation = _load_bvh_animation(target_bvh)
 
     source_positions = np.asarray(source_animation.positions, dtype=np.float64)
-    target_offsets = np.asarray(target_animation.offsets, dtype=np.float64)
+    source_rotations = np.asarray(source_animation.rotations, dtype=np.float64)
     target_parents = [int(parent) for parent in target_animation.parents]
     target_names = [str(name) for name in target_animation.names]
     source_names = [str(name) for name in source_animation.names]
@@ -473,23 +475,8 @@ def direct_mapped_bvh_retarget(
         mapping_payload,
         source_names,
         target_names,
+        prefer_explicit_pairs=manual_mapping,
     )
-
-    source_heads, source_tails, _source_world_rotations = _bvh_world_joint_samples(
-        source_animation,
-        source_metadata,
-    )
-    target_joint_metadata_by_bvh_name = _joint_metadata_lookup(target_metadata)
-    target_children = _metadata_children(target_metadata)
-    target_tail_offsets = []
-    for bvh_name in target_names:
-        joint_metadata = target_joint_metadata_by_bvh_name.get(bvh_name) or target_joint_metadata_by_bvh_name.get(
-            _strip_motion2motion_suffix(bvh_name)
-        )
-        if joint_metadata is not None:
-            target_tail_offsets.append(_joint_tail_offset(joint_metadata, target_children))
-        else:
-            target_tail_offsets.append(np.array((1.0, 0.0, 0.0), dtype=np.float64))
 
     target_root_index = _root_index_from_parents(target_parents)
     source_root_index = index_map.get(target_root_index)
@@ -497,27 +484,12 @@ def direct_mapped_bvh_retarget(
         root_scale = _metadata_height(target_metadata) / max(_metadata_height(source_metadata), 1e-6)
         positions[:, target_root_index, :] = source_positions[:, source_root_index, :] * root_scale
 
-    for frame_index in range(frame_count):
-        target_world_rotations: list[np.ndarray | None] = [None] * target_joint_count
-        for target_index in range(target_joint_count):
-            parent_index = target_parents[target_index]
-            parent_rotation = (
-                target_world_rotations[parent_index]
-                if 0 <= parent_index < len(target_world_rotations)
-                and target_world_rotations[parent_index] is not None
-                else np.eye(3, dtype=np.float64)
-            )
-            source_index = index_map.get(target_index)
-            target_tail_offset = target_tail_offsets[target_index]
-            if source_index is not None:
-                desired_axis_world = source_tails[frame_index, source_index] - source_heads[frame_index, source_index]
-            else:
-                desired_axis_world = parent_rotation @ target_tail_offset
-            desired_axis_parent = parent_rotation.T @ desired_axis_world
-            local_rotation = _rotation_between_vectors_3d(target_tail_offset, desired_axis_parent)
-            target_world_rotation = parent_rotation @ local_rotation
-            rotations[frame_index, target_index, :] = _matrix_to_euler_xyz_degrees(local_rotation)
-            target_world_rotations[target_index] = target_world_rotation
+    for target_index, source_index in index_map.items():
+        if (
+            0 <= target_index < target_joint_count
+            and 0 <= source_index < int(source_rotations.shape[1])
+        ):
+            rotations[:, target_index, :] = source_rotations[:, source_index, :3]
 
     _write_mapped_bvh(
         output_bvh,
@@ -528,6 +500,7 @@ def direct_mapped_bvh_retarget(
     )
     return {
         "reason": "motion2motion_static_output",
+        "mode": "local_rotation_copy",
         "mapped_joint_count": len(index_map),
         "target_joint_count": target_joint_count,
         "mapping_stats": mapping_stats,
@@ -540,6 +513,8 @@ def _build_direct_retarget_index_map(
     mapping_payload: dict[str, Any],
     source_names: list[str],
     target_names: list[str],
+    *,
+    prefer_explicit_pairs: bool = False,
 ) -> tuple[dict[int, int], dict[str, int]]:
     source_name_to_index = _animation_name_index(source_names)
     target_name_to_index = _animation_name_index(target_names)
@@ -547,36 +522,56 @@ def _build_direct_retarget_index_map(
     target_joint_lookup = _metadata_joint_lookup(target_metadata)
     index_map: dict[int, int] = {}
     explicit_count = 0
-
-    for pair in mapping_payload.get("mapping") or []:
-        source_joint = source_joint_lookup.get(str(pair.get("source") or ""))
-        target_joint = target_joint_lookup.get(str(pair.get("target") or ""))
-        if not source_joint or not target_joint:
-            continue
-        source_index = source_name_to_index.get(str(source_joint.get("bvh_name") or ""))
-        target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
-        if source_index is None or target_index is None:
-            continue
-        index_map[target_index] = source_index
-        explicit_count += 1
+    semantic_count = 0
 
     source_semantic = _unique_semantic_joint_lookup(source_metadata, source_name_to_index)
     target_joints = target_metadata.get("joints") or []
-    semantic_count = 0
-    for target_joint in target_joints:
-        target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
-        if target_index is None or target_index in index_map:
-            continue
-        semantic_key = _semantic_joint_key(
-            str(target_joint.get("matching_name") or target_joint.get("name") or target_joint.get("bvh_name") or "")
-        )
-        source_index = source_semantic.get(semantic_key)
-        if source_index is None:
-            continue
-        index_map[target_index] = source_index
-        semantic_count += 1
 
-    return index_map, {"explicit": explicit_count, "semantic": semantic_count}
+    def add_semantic_pairs(*, overwrite: bool) -> None:
+        nonlocal semantic_count
+        for target_joint in target_joints:
+            target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
+            if target_index is None or (target_index in index_map and not overwrite):
+                continue
+            semantic_key = _semantic_joint_key(
+                str(target_joint.get("matching_name") or target_joint.get("name") or target_joint.get("bvh_name") or "")
+            )
+            source_index = source_semantic.get(semantic_key)
+            if source_index is None:
+                continue
+            if index_map.get(target_index) != source_index:
+                semantic_count += 1
+            index_map[target_index] = source_index
+
+    def add_explicit_pairs(*, overwrite: bool) -> None:
+        nonlocal explicit_count
+        for pair in mapping_payload.get("mapping") or []:
+            source_joint = source_joint_lookup.get(str(pair.get("source") or ""))
+            target_joint = target_joint_lookup.get(str(pair.get("target") or ""))
+            if not source_joint or not target_joint:
+                continue
+            source_index = source_name_to_index.get(str(source_joint.get("bvh_name") or ""))
+            target_index = target_name_to_index.get(str(target_joint.get("bvh_name") or ""))
+            if source_index is None or target_index is None:
+                continue
+            if target_index in index_map and not overwrite:
+                continue
+            if index_map.get(target_index) != source_index:
+                explicit_count += 1
+            index_map[target_index] = source_index
+
+    if prefer_explicit_pairs:
+        add_explicit_pairs(overwrite=True)
+        add_semantic_pairs(overwrite=False)
+    else:
+        add_semantic_pairs(overwrite=True)
+        add_explicit_pairs(overwrite=False)
+
+    return index_map, {
+        "explicit": explicit_count,
+        "semantic": semantic_count,
+        "prefer_explicit_pairs": bool(prefer_explicit_pairs),
+    }
 
 
 def _animation_name_index(names: list[str]) -> dict[str, int]:

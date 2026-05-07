@@ -1449,6 +1449,8 @@ def _infer_side_from_name(name: str) -> str:
 def _name_tokens(name: str) -> list[str]:
     tokens: list[str] = []
     for token in _split_tokens(name):
+        if token == "mixamorig" or re.fullmatch(r"mixamorig\d+", token):
+            continue
         if token in LEFT_TOKENS or token in RIGHT_TOKENS or token in STOP_TOKENS:
             continue
         if token.isdigit():
@@ -1666,7 +1668,7 @@ def build_auto_sparse_mapping_payload(
     *,
     root_joint: str,
     max_pairs: int = 12,
-    min_chain_score: float = 0.38,
+    min_chain_score: float = 0.45,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     source_chains = _collect_generic_sparse_chains(source)
     target_chains = _collect_generic_sparse_chains(target)

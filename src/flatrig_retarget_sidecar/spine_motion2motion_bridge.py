@@ -162,7 +162,7 @@ def build_exported_motion2motion_mapping(
     target: SpinePackage,
     *,
     max_pairs: int = 12,
-    min_chain_score: float = 0.38,
+    min_chain_score: float = 0.45,
     mapping_file: str | Path | None = None,
 ) -> dict[str, Any]:
     source_joints, _, _ = build_bvh_joint_layout(source)

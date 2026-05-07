@@ -1779,8 +1779,8 @@ def export_3d_rest_bvh_cli(
     )
     layout = _build_3d_bvh_layout(
         armature_obj,
-        source_frame=setup_frame,
-        use_rest_pose=use_rest_pose,
+        source_frame=None,
+        use_rest_pose=True,
     )
     positions, rotations = _rest_3d_bvh_frames(layout, frame_count=frame_count)
     _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
@@ -1800,6 +1800,7 @@ def export_3d_rest_bvh_cli(
         "projection_space": projection_space,
         "setup_frame": setup_frame,
         "use_rest_pose": bool(use_rest_pose),
+        "retarget_use_rest_pose": True,
         "view": _view_config_to_json(view_cfg),
         "bones_2d": bones_2d,
         **layout,

@@ -80,7 +80,7 @@ def suggest_sparse_mapping(
     target: SpinePackage,
     *,
     max_pairs: int = 12,
-    min_chain_score: float = 0.38,
+    min_chain_score: float = 0.45,
 ) -> SparseMappingSuggestion:
     source_root = _select_root(source)
     target_root = _select_root(target)
@@ -224,7 +224,7 @@ def build_motion2motion_mapping_payload(
     target: SpinePackage,
     *,
     max_pairs: int = 12,
-    min_chain_score: float = 0.38,
+    min_chain_score: float = 0.45,
 ) -> dict[str, Any]:
     suggestion = suggest_sparse_mapping(
         source,
@@ -597,6 +597,8 @@ def _infer_side_from_name(name: str) -> str:
 def _name_tokens(name: str) -> list[str]:
     tokens = []
     for token in _split_tokens(name):
+        if token == "mixamorig" or re.fullmatch(r"mixamorig\d+", token):
+            continue
         if token in LEFT_TOKENS or token in RIGHT_TOKENS or token in STOP_TOKENS:
             continue
         if token.isdigit():
