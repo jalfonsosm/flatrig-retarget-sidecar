@@ -64,19 +64,19 @@ VIEW_PRESETS = {
         "up_axis": (0.0, 1.0, 0.0),
     },
     "three_quarter": {
-        "view_dir": (1.0, -1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_r": {
-        "view_dir": (-1.0, -1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_back": {
         "view_dir": (1.0, 1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
-    "three_quarter_back_r": {
+    "three_quarter_r": {
         "view_dir": (-1.0, 1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back": {
+        "view_dir": (1.0, -1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back_r": {
+        "view_dir": (-1.0, -1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
     "isometric": {
@@ -1479,12 +1479,38 @@ def _write_3d_bvh(output_path, joints, positions, rotations, fps):
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _pose_bone_basis_euler_degrees(pose_bone, coordinate_rotation=None):
-    basis = pose_bone.matrix_basis.to_3x3()
-    if coordinate_rotation is not None:
-        basis = coordinate_rotation @ basis @ coordinate_rotation.inverted()
-    euler = basis.to_euler("XYZ")
+def _matrix_xyz_euler_degrees(matrix):
+    euler = matrix.to_euler("XYZ")
     return [math.degrees(float(euler.x)), math.degrees(float(euler.y)), math.degrees(float(euler.z))]
+
+
+def _vector_from_json(values, fallback=(0.0, 0.0, 0.0)):
+    values = values or fallback
+    return mathutils.Vector((float(values[0]), float(values[1]), float(values[2])))
+
+
+def _rotation_between_vectors(source, target):
+    source_vec = mathutils.Vector(source)
+    target_vec = mathutils.Vector(target)
+    if source_vec.length <= VECTOR_EPSILON or target_vec.length <= VECTOR_EPSILON:
+        return mathutils.Matrix.Identity(3)
+    source_vec.normalize()
+    target_vec.normalize()
+    dot = max(-1.0, min(1.0, float(source_vec.dot(target_vec))))
+    if dot > 1.0 - 1e-8:
+        return mathutils.Matrix.Identity(3)
+    if dot < -1.0 + 1e-8:
+        axis = source_vec.cross(mathutils.Vector((1.0, 0.0, 0.0)))
+        if axis.length <= VECTOR_EPSILON:
+            axis = source_vec.cross(mathutils.Vector((0.0, 1.0, 0.0)))
+        axis.normalize()
+        return mathutils.Matrix.Rotation(math.pi, 3, axis)
+    return source_vec.rotation_difference(target_vec).to_matrix()
+
+
+def _pose_bone_world_head_tail(armature_obj, pose_bone):
+    armature_world = armature_obj.matrix_world
+    return armature_world @ pose_bone.head, armature_world @ pose_bone.tail
 
 
 def _sample_action_frames(action, scene, fps, frame_start=None, frame_end=None):
@@ -1511,31 +1537,60 @@ def _set_scene_frame_float(scene, frame_value):
 
 def _collect_3d_bvh_frames(armature_obj, layout, sample_frames, fps):
     scene = bpy.context.scene
-    coordinate_linear = _matrix3_from_json(layout.get("coordinate_linear"))
-    coordinate_rotation = _matrix3_from_json(layout.get("coordinate_rotation"))
     positions = []
     rotations = []
+    joints = list(layout["joints"])
     for frame_value in sample_frames:
         _set_scene_frame_float(scene, frame_value)
         frame_positions = []
         frame_rotations = []
-        for joint in layout["joints"]:
+        world_cache = [None] * len(joints)
+        for joint in joints:
+            joint_index = int(joint.get("index", len(frame_positions) // 3))
+            parent_index = int(joint.get("parent_index", -1))
             if joint.get("synthetic"):
+                world_cache[joint_index] = {
+                    "head": _vector_from_json(joint.get("head")),
+                    "rotation": mathutils.Matrix.Identity(3),
+                }
                 frame_positions.extend((0.0, 0.0, 0.0))
                 frame_rotations.extend((0.0, 0.0, 0.0))
                 continue
             pose_bone = armature_obj.pose.bones.get(joint["name"])
             if pose_bone is None:
+                world_cache[joint_index] = None
                 frame_positions.extend((0.0, 0.0, 0.0))
                 frame_rotations.extend((0.0, 0.0, 0.0))
                 continue
-            location = coordinate_linear @ pose_bone.location
+
+            rest_offset = _vector_from_json(joint.get("offset"))
+            tail_offset = _vector_from_json(joint.get("tail_offset"), fallback=(1.0, 0.0, 0.0))
+            head_world, tail_world = _pose_bone_world_head_tail(armature_obj, pose_bone)
+            posed_tail_axis_world = tail_world - head_world
+
+            parent_state = world_cache[parent_index] if 0 <= parent_index < len(world_cache) else None
+            if parent_state is not None:
+                parent_rotation = parent_state["rotation"]
+                parent_rotation_inv = parent_rotation.inverted()
+                local_position = parent_rotation_inv @ (head_world - parent_state["head"]) - rest_offset
+                desired_axis_parent = parent_rotation_inv @ posed_tail_axis_world
+                local_rotation = _rotation_between_vectors(tail_offset, desired_axis_parent)
+                world_rotation = parent_rotation @ local_rotation
+            else:
+                local_position = head_world - rest_offset
+                local_rotation = _rotation_between_vectors(tail_offset, posed_tail_axis_world)
+                world_rotation = local_rotation
+
+            world_cache[joint_index] = {
+                "head": head_world,
+                "rotation": world_rotation,
+            }
             frame_positions.extend((
-                float(location.x),
-                float(location.y),
-                float(location.z),
+                float(local_position.x),
+                float(local_position.y),
+                float(local_position.z),
             ))
-            frame_rotations.extend(_pose_bone_basis_euler_degrees(pose_bone, coordinate_rotation))
+            frame_rotations.extend(_matrix_xyz_euler_degrees(local_rotation))
         positions.append(frame_positions)
         rotations.append(frame_rotations)
     return positions, rotations

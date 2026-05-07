@@ -331,6 +331,112 @@ def _bvh_motion_stats(bvh_path: str | Path) -> dict[str, float | int]:
     }
 
 
+def _normalize_vector_3d(vector: np.ndarray, fallback: np.ndarray | None = None) -> np.ndarray:
+    values = np.asarray(vector, dtype=np.float64)
+    norm = float(np.linalg.norm(values))
+    if norm > NUMERIC_EPSILON:
+        return values / norm
+    if fallback is not None:
+        return _normalize_vector_3d(np.asarray(fallback, dtype=np.float64))
+    return np.array((1.0, 0.0, 0.0), dtype=np.float64)
+
+
+def _rotation_between_vectors_3d(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    source_axis = _normalize_vector_3d(source)
+    target_axis = _normalize_vector_3d(target, fallback=source_axis)
+    dot = float(np.clip(np.dot(source_axis, target_axis), -1.0, 1.0))
+    if dot > 1.0 - 1e-8:
+        return np.eye(3, dtype=np.float64)
+    if dot < -1.0 + 1e-8:
+        axis = np.cross(source_axis, np.array((1.0, 0.0, 0.0), dtype=np.float64))
+        if float(np.linalg.norm(axis)) <= NUMERIC_EPSILON:
+            axis = np.cross(source_axis, np.array((0.0, 1.0, 0.0), dtype=np.float64))
+        axis = _normalize_vector_3d(axis)
+        x, y, z = axis
+        return np.array(
+            [
+                [2.0 * x * x - 1.0, 2.0 * x * y, 2.0 * x * z],
+                [2.0 * y * x, 2.0 * y * y - 1.0, 2.0 * y * z],
+                [2.0 * z * x, 2.0 * z * y, 2.0 * z * z - 1.0],
+            ],
+            dtype=np.float64,
+        )
+
+    cross = np.cross(source_axis, target_axis)
+    skew = np.array(
+        [
+            [0.0, -cross[2], cross[1]],
+            [cross[2], 0.0, -cross[0]],
+            [-cross[1], cross[0], 0.0],
+        ],
+        dtype=np.float64,
+    )
+    sin_sq = max(float(np.dot(cross, cross)), NUMERIC_EPSILON)
+    return np.eye(3, dtype=np.float64) + skew + skew @ skew * ((1.0 - dot) / sin_sq)
+
+
+def _matrix_to_euler_xyz_degrees(matrix: np.ndarray) -> np.ndarray:
+    values = np.asarray(matrix, dtype=np.float64)
+    sy = float(np.clip(values[0, 2], -1.0, 1.0))
+    y = math.asin(sy)
+    cy = math.cos(y)
+    if abs(cy) > 1e-8:
+        x = math.atan2(-values[1, 2], values[2, 2])
+        z = math.atan2(-values[0, 1], values[0, 0])
+    else:
+        x = math.atan2(values[2, 1], values[1, 1])
+        z = 0.0
+    return np.array([math.degrees(x), math.degrees(y), math.degrees(z)], dtype=np.float64)
+
+
+def _bvh_world_joint_samples(animation, metadata: dict[str, Any]):
+    names = [str(name) for name in animation.names]
+    parents = [int(parent_index) for parent_index in animation.parents]
+    offsets = np.asarray(animation.offsets, dtype=np.float64)
+    positions = np.asarray(animation.positions, dtype=np.float64)
+    rotations = np.asarray(animation.rotations, dtype=np.float64)
+    frame_count = int(rotations.shape[0])
+    joint_count = len(names)
+    joint_metadata_by_bvh_name = _joint_metadata_lookup(metadata)
+    children = _metadata_children(metadata)
+
+    heads = np.zeros((frame_count, joint_count, 3), dtype=np.float64)
+    tails = np.zeros((frame_count, joint_count, 3), dtype=np.float64)
+    world_rotations = np.zeros((frame_count, joint_count, 3, 3), dtype=np.float64)
+
+    for frame_index in range(frame_count):
+        frame_world_rotations: list[np.ndarray | None] = [None] * joint_count
+        for joint_index, bvh_name in enumerate(names):
+            local_position = positions[frame_index, joint_index]
+            local_offset = offsets[joint_index]
+            local_rotation = _euler_xyz_degrees_to_matrix(rotations[frame_index, joint_index])
+            parent_index = parents[joint_index]
+            if parent_index < 0:
+                head_3d = local_offset + local_position
+                world_rotation = local_rotation
+            else:
+                parent_rotation = frame_world_rotations[parent_index]
+                if parent_rotation is None:
+                    parent_rotation = np.eye(3, dtype=np.float64)
+                head_3d = heads[frame_index, parent_index] + parent_rotation @ (local_offset + local_position)
+                world_rotation = parent_rotation @ local_rotation
+
+            joint_metadata = joint_metadata_by_bvh_name.get(bvh_name) or joint_metadata_by_bvh_name.get(
+                _strip_motion2motion_suffix(bvh_name)
+            )
+            if joint_metadata is not None:
+                tail_offset = _joint_tail_offset(joint_metadata, children)
+            else:
+                tail_offset = np.array((1.0, 0.0, 0.0), dtype=np.float64)
+
+            heads[frame_index, joint_index] = head_3d
+            tails[frame_index, joint_index] = head_3d + world_rotation @ tail_offset
+            world_rotations[frame_index, joint_index] = world_rotation
+            frame_world_rotations[joint_index] = world_rotation
+
+    return heads, tails, world_rotations
+
+
 def direct_mapped_bvh_retarget(
     source_bvh: str | Path,
     target_bvh: str | Path,
@@ -350,14 +456,13 @@ def direct_mapped_bvh_retarget(
     source_animation = _load_bvh_animation(source_bvh)
     target_animation = _load_bvh_animation(target_bvh)
 
-    source_rotations = np.asarray(source_animation.rotations, dtype=np.float64)
     source_positions = np.asarray(source_animation.positions, dtype=np.float64)
     target_offsets = np.asarray(target_animation.offsets, dtype=np.float64)
     target_parents = [int(parent) for parent in target_animation.parents]
     target_names = [str(name) for name in target_animation.names]
     source_names = [str(name) for name in source_animation.names]
 
-    frame_count = int(source_rotations.shape[0])
+    frame_count = int(source_animation.rotations.shape[0])
     target_joint_count = len(target_names)
     rotations = np.zeros((frame_count, target_joint_count, 3), dtype=np.float64)
     positions = np.zeros((frame_count, target_joint_count, 3), dtype=np.float64)
@@ -369,14 +474,50 @@ def direct_mapped_bvh_retarget(
         source_names,
         target_names,
     )
-    for target_index, source_index in index_map.items():
-        rotations[:, target_index, :] = source_rotations[:, source_index, :]
+
+    source_heads, source_tails, _source_world_rotations = _bvh_world_joint_samples(
+        source_animation,
+        source_metadata,
+    )
+    target_joint_metadata_by_bvh_name = _joint_metadata_lookup(target_metadata)
+    target_children = _metadata_children(target_metadata)
+    target_tail_offsets = []
+    for bvh_name in target_names:
+        joint_metadata = target_joint_metadata_by_bvh_name.get(bvh_name) or target_joint_metadata_by_bvh_name.get(
+            _strip_motion2motion_suffix(bvh_name)
+        )
+        if joint_metadata is not None:
+            target_tail_offsets.append(_joint_tail_offset(joint_metadata, target_children))
+        else:
+            target_tail_offsets.append(np.array((1.0, 0.0, 0.0), dtype=np.float64))
 
     target_root_index = _root_index_from_parents(target_parents)
     source_root_index = index_map.get(target_root_index)
     if source_root_index is not None and source_positions.size:
         root_scale = _metadata_height(target_metadata) / max(_metadata_height(source_metadata), 1e-6)
         positions[:, target_root_index, :] = source_positions[:, source_root_index, :] * root_scale
+
+    for frame_index in range(frame_count):
+        target_world_rotations: list[np.ndarray | None] = [None] * target_joint_count
+        for target_index in range(target_joint_count):
+            parent_index = target_parents[target_index]
+            parent_rotation = (
+                target_world_rotations[parent_index]
+                if 0 <= parent_index < len(target_world_rotations)
+                and target_world_rotations[parent_index] is not None
+                else np.eye(3, dtype=np.float64)
+            )
+            source_index = index_map.get(target_index)
+            target_tail_offset = target_tail_offsets[target_index]
+            if source_index is not None:
+                desired_axis_world = source_tails[frame_index, source_index] - source_heads[frame_index, source_index]
+            else:
+                desired_axis_world = parent_rotation @ target_tail_offset
+            desired_axis_parent = parent_rotation.T @ desired_axis_world
+            local_rotation = _rotation_between_vectors_3d(target_tail_offset, desired_axis_parent)
+            target_world_rotation = parent_rotation @ local_rotation
+            rotations[frame_index, target_index, :] = _matrix_to_euler_xyz_degrees(local_rotation)
+            target_world_rotations[target_index] = target_world_rotation
 
     _write_mapped_bvh(
         output_bvh,

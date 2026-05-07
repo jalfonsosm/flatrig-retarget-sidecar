@@ -55,19 +55,19 @@ VIEW_PRESETS = {
         "up_axis": (0.0, 1.0, 0.0),
     },
     "three_quarter": {
-        "view_dir": (1.0, -1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_r": {
-        "view_dir": (-1.0, -1.0, 0.0),
-        "up_hint": (0.0, 0.0, 1.0),
-    },
-    "three_quarter_back": {
         "view_dir": (1.0, 1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
-    "three_quarter_back_r": {
+    "three_quarter_r": {
         "view_dir": (-1.0, 1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back": {
+        "view_dir": (1.0, -1.0, 0.0),
+        "up_hint": (0.0, 0.0, 1.0),
+    },
+    "three_quarter_back_r": {
+        "view_dir": (-1.0, -1.0, 0.0),
         "up_hint": (0.0, 0.0, 1.0),
     },
     "isometric": {
