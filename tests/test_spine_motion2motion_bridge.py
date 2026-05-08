@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from flatrig_retarget_sidecar.motion2motion_retarget import (
+    _direct_spine_mapping_transfer,
+    retarget_spine_animation,
+)
 from flatrig_retarget_sidecar.spine_import import build_spine_package
 from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
     build_exported_motion2motion_mapping,
@@ -80,3 +84,144 @@ def test_static_spine_animation_exports_enough_sample_frames_for_m2m() -> None:
     assert len(samples) == 31
     assert samples[0] == 0.0
     assert samples[-1] == 1.0
+
+
+def test_direct_spine_transfer_uses_world_delta_not_raw_local_copy() -> None:
+    source = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "torso", "parent": "root"},
+                {"name": "front-upper-arm", "parent": "torso"},
+            ],
+            "animations": {
+                "walk": {
+                    "bones": {
+                        "torso": {
+                            "rotate": [
+                                {"time": 0.0, "angle": 0.0},
+                                {"time": 1.0, "angle": 30.0},
+                            ]
+                        },
+                        "front-upper-arm": {
+                            "rotate": [
+                                {"time": 0.0, "angle": 0.0},
+                                {"time": 1.0, "angle": 10.0},
+                            ]
+                        },
+                    }
+                }
+            },
+        },
+        source_label="source.json",
+    )
+    target = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "mixamorig:RightShoulder", "parent": "root"},
+                {"name": "mixamorig:RightArm", "parent": "mixamorig:RightShoulder"},
+            ],
+            "animations": {"walk": {"bones": {}}},
+        },
+        source_label="target.json",
+    )
+    mapping = {
+        "root_joint": "root",
+        "mapping": [
+            {"source": "front_upper_arm", "target": "mixamorig_RightArm"},
+        ],
+    }
+
+    clip, diagnostics = _direct_spine_mapping_transfer(
+        source,
+        target,
+        "walk",
+        mapping,
+        reason="test",
+    )
+
+    arm_keys = clip["bones"]["mixamorig:RightArm"]["rotate"]
+    assert arm_keys[-1]["angle"] == 40.0
+    assert diagnostics["transfer_mode"] == "target_space_world_delta"
+
+
+def test_spine_retarget_uses_target_rest_pose_without_target_animations() -> None:
+    source = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "front-upper-arm", "parent": "root"},
+            ],
+            "animations": {
+                "walk": {
+                    "bones": {
+                        "front-upper-arm": {
+                            "rotate": [
+                                {"time": 0.0, "angle": 0.0},
+                                {"time": 1.0, "angle": 20.0},
+                            ]
+                        },
+                    }
+                }
+            },
+        },
+        source_label="source.json",
+    )
+    target = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "mixamorig:RightArm", "parent": "root"},
+            ],
+            "animations": {},
+        },
+        source_label="target.json",
+    )
+
+    result = retarget_spine_animation(source, target, "walk")
+
+    assert result.diagnostics["backend_label"] == "RestPoseSpine2D"
+    assert result.diagnostics["target_exemplar_mode"] == "rest_pose"
+    assert result.animation["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 20.0
+
+
+def test_spine_retarget_accepts_static_pose_animation() -> None:
+    source = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "front-upper-arm", "parent": "root"},
+            ],
+            "animations": {
+                "aim": {
+                    "bones": {
+                        "front-upper-arm": {
+                            "rotate": [
+                                {"time": 0.0, "angle": 35.0},
+                                {"time": 1.0, "angle": 35.0},
+                            ]
+                        },
+                    }
+                }
+            },
+        },
+        source_label="source.json",
+    )
+    target = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "mixamorig:RightArm", "parent": "root"},
+            ],
+            "animations": {},
+        },
+        source_label="target.json",
+    )
+
+    result = retarget_spine_animation(source, target, "aim")
+
+    assert result.diagnostics["backend_label"] == "RestPoseSpine2D"
+    assert result.diagnostics["target_guide"]["result_has_motion"] is False
+    assert result.diagnostics["target_guide"]["result_has_pose_or_motion"] is True
+    assert result.animation["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 35.0
