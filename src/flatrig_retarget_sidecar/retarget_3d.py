@@ -488,19 +488,45 @@ def direct_mapped_bvh_retarget(
         root_scale = _metadata_height(target_metadata) / max(_metadata_height(source_metadata), 1e-6)
         positions[:, target_root_index, :] = source_positions[:, source_root_index, :] * root_scale
 
+    use_setup_delta = (target_metadata.get("setup_pose") or {}).get("mode") == "neutral_down"
+    delta_aligned_joint_count = 0
+    direct_mapping_pairs: list[dict[str, str]] = []
     for target_index, source_index in index_map.items():
         if (
             0 <= target_index < target_joint_count
             and 0 <= source_index < int(source_rotations.shape[1])
         ):
+            direct_mapping_pairs.append(
+                {
+                    "source": _strip_motion2motion_suffix(source_names[source_index]),
+                    "target": _strip_motion2motion_suffix(target_names[target_index]),
+                    "reason": "direct_semantic",
+                }
+            )
             source_axis = source_tail_offsets[source_index]
             target_axis = target_tail_offsets[target_index]
             target_to_source = _rotation_between_vectors_3d(target_axis, source_axis)
             source_to_target = target_to_source.T
+            axis_angle = _axis_angle_degrees(source_axis, target_axis)
+            use_source_delta = bool(
+                use_setup_delta
+                and target_index != target_root_index
+                and source_rotations.shape[0] > 0
+                and axis_angle >= 45.0
+            )
+            source_base_rotation = (
+                _euler_xyz_degrees_to_matrix(source_rotations[0, source_index, :3])
+                if use_source_delta
+                else np.eye(3, dtype=np.float64)
+            )
+            if use_source_delta:
+                delta_aligned_joint_count += 1
             for frame_index in range(frame_count):
                 source_local_rotation = _euler_xyz_degrees_to_matrix(
                     source_rotations[frame_index, source_index, :3]
                 )
+                if use_source_delta:
+                    source_local_rotation = source_base_rotation.T @ source_local_rotation
                 target_local_rotation = source_to_target @ source_local_rotation @ target_to_source
                 rotations[frame_index, target_index, :] = _matrix_to_euler_xyz_degrees(
                     target_local_rotation
@@ -517,9 +543,19 @@ def direct_mapped_bvh_retarget(
         "reason": "motion2motion_static_output",
         "mode": "axis_aligned_local_rotation_copy",
         "mapped_joint_count": len(index_map),
+        "delta_aligned_joint_count": delta_aligned_joint_count,
+        "setup_delta_mode": "neutral_down" if use_setup_delta else "absolute",
+        "mapping_pairs": sorted(direct_mapping_pairs, key=lambda pair: (pair["target"], pair["source"])),
         "target_joint_count": target_joint_count,
         "mapping_stats": mapping_stats,
     }
+
+
+def _axis_angle_degrees(source: np.ndarray, target: np.ndarray) -> float:
+    source_axis = _normalize_vector_3d(source)
+    target_axis = _normalize_vector_3d(target, fallback=source_axis)
+    dot = float(np.clip(np.dot(source_axis, target_axis), -1.0, 1.0))
+    return float(math.degrees(math.acos(dot)))
 
 
 def _bvh_joint_tail_offsets(names: list[str], metadata: dict[str, Any]) -> list[np.ndarray]:
