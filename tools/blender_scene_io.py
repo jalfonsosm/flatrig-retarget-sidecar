@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+# ruff: noqa: I001
+
 import argparse
 import json
 import math
@@ -11,9 +13,10 @@ from pathlib import Path
 from typing import Any
 
 try:
-    import bmesh
+    # bpy must be imported before bmesh/mathutils in the managed bpy runtime.
     import bpy
     import mathutils
+    import bmesh
 except ImportError:
     bpy = None
     mathutils = None
