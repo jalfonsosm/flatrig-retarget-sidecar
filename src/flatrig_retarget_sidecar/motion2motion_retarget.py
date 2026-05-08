@@ -494,6 +494,7 @@ def retarget_spine_animation(
             target_bvh_path,
             metadata_path=target_meta_path,
             positions_mode="all",
+            sample_duration=source_duration,
         )
         mapping_path.write_text(json.dumps(mapping_payload, indent=2) + "\n", encoding="utf-8")
 
@@ -648,6 +649,7 @@ def retarget_bvh_to_spine_animation(
             target_bvh_path,
             metadata_path=target_meta_path,
             positions_mode="all",
+            sample_duration=source_duration,
         )
         target_skeleton = build_generic_skeleton_from_exported_spine_bvh(target_metadata)
         if mapping_file:

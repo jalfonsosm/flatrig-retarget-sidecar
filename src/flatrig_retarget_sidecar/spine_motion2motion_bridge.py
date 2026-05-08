@@ -77,6 +77,7 @@ def export_spine_animation_to_bvh(
     fps: float = 30.0,
     positions_mode: str = "all",
     metadata_path: str | Path | None = None,
+    sample_duration: float | None = None,
 ) -> ExportedSpineBvh:
     if fps <= 0:
         raise ValueError("fps must be > 0")
@@ -90,7 +91,12 @@ def export_spine_animation_to_bvh(
         )
 
     animation = package.animations[animation_name]
-    duration = compute_animation_duration(animation)
+    animation_duration = compute_animation_duration(animation)
+    duration = (
+        max(float(sample_duration), 1.0 / fps)
+        if sample_duration is not None
+        else animation_duration
+    )
     sample_times = build_sample_times(duration, fps)
     exported_joints, original_to_bvh, bvh_to_original = build_bvh_joint_layout(package)
     joint_index_by_spine_name = {
@@ -100,7 +106,12 @@ def export_spine_animation_to_bvh(
     positions: list[list[float]] = []
     rotations: list[list[float]] = []
     for time_value in sample_times:
-        local_pose_map = evaluate_local_pose_map(package, animation_name, time_value)
+        sample_time = remap_sample_time(
+            time_value,
+            export_duration=duration,
+            animation_duration=animation_duration,
+        )
+        local_pose_map = evaluate_local_pose_map(package, animation_name, sample_time)
         frame_positions: list[float] = []
         frame_rotations: list[float] = []
         for joint in exported_joints:
@@ -498,6 +509,22 @@ def build_sample_times(duration: float, fps: float) -> list[float]:
     if abs(times[-1] - duration) > 1e-6:
         times.append(duration)
     return times
+
+
+def remap_sample_time(
+    time_value: float,
+    *,
+    export_duration: float,
+    animation_duration: float,
+) -> float:
+    if animation_duration <= EPSILON:
+        return 0.0
+    if export_duration <= EPSILON:
+        return min(max(0.0, time_value), animation_duration)
+    if abs(export_duration - animation_duration) <= 1e-6:
+        return min(max(0.0, time_value), animation_duration)
+    alpha = min(1.0, max(0.0, time_value / export_duration))
+    return alpha * animation_duration
 
 
 def evaluate_local_pose_map(

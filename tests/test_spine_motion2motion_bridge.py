@@ -9,6 +9,7 @@ from flatrig_retarget_sidecar.spine_import import build_spine_package
 from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
     build_exported_motion2motion_mapping,
     build_sample_times,
+    export_spine_animation_to_bvh,
 )
 
 
@@ -85,6 +86,40 @@ def test_static_spine_animation_exports_enough_sample_frames_for_m2m() -> None:
     assert len(samples) == 31
     assert samples[0] == 0.0
     assert samples[-1] == 1.0
+
+
+def test_target_bvh_export_can_be_resampled_to_source_duration(tmp_path) -> None:
+    package = build_spine_package(
+        {
+            "bones": [
+                {"name": "root"},
+                {"name": "arm", "parent": "root", "length": 10},
+            ],
+            "animations": {
+                "short_walk": {
+                    "bones": {
+                        "arm": {
+                            "rotate": [
+                                {"time": 0.0, "angle": 0.0},
+                                {"time": 0.5, "angle": 30.0},
+                            ]
+                        }
+                    }
+                }
+            },
+        },
+        source_label="target.json",
+    )
+
+    metadata = export_spine_animation_to_bvh(
+        package,
+        "short_walk",
+        tmp_path / "target.bvh",
+        sample_duration=1.0,
+    )
+
+    assert metadata.duration == 1.0
+    assert metadata.frame_count == 31
 
 
 def test_resolve_target_exemplar_prefers_matching_animation_over_arbitrary_idle() -> None:
