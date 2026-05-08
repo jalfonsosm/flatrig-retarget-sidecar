@@ -161,7 +161,7 @@ def build_exported_motion2motion_mapping(
     source: SpinePackage,
     target: SpinePackage,
     *,
-    max_pairs: int = 12,
+    max_pairs: int = 20,
     min_chain_score: float = 0.45,
     mapping_file: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -198,20 +198,39 @@ def build_exported_motion2motion_mapping(
 
     source_export_root = source_joints[0].matching_name
     target_export_root = target_joints[0].matching_name
-    rewritten_mapping.append({"source": source_export_root, "target": target_export_root})
-    used_source.add(source_export_root)
-    used_target.add(target_export_root)
 
-    for pair in payload["mapping"]:
-        source_name = source_original_to_matching.get(pair["source"])
-        target_name = target_original_to_matching.get(pair["target"])
+    def add_pair(source_name: str | None, target_name: str | None) -> None:
         if not source_name or not target_name:
-            continue
+            return
         if source_name in used_source or target_name in used_target:
-            continue
+            return
         rewritten_mapping.append({"source": source_name, "target": target_name})
         used_source.add(source_name)
         used_target.add(target_name)
+
+    add_pair(source_export_root, target_export_root)
+
+    semantic_pairs = _suggest_semantic_biped_mapping(source, target)
+    for source_name, target_name in semantic_pairs:
+        if len(rewritten_mapping) >= max_pairs:
+            break
+        add_pair(
+            source_original_to_matching.get(source_name),
+            target_original_to_matching.get(target_name),
+        )
+
+    semantic_mode = len(semantic_pairs) >= 4
+    for pair in payload["mapping"]:
+        if len(rewritten_mapping) >= max_pairs:
+            break
+        if semantic_mode and (
+            _semantic_biped_role(pair["source"]) is None
+            or _semantic_biped_role(pair["target"]) is None
+        ):
+            continue
+        source_name = source_original_to_matching.get(pair["source"])
+        target_name = target_original_to_matching.get(pair["target"])
+        add_pair(source_name, target_name)
 
     return {
         "source_name": payload["source_name"],
@@ -227,8 +246,139 @@ def build_exported_motion2motion_mapping(
             "target_original_root": _select_primary_root(target).name,
             "source_bvh_joint_count": len(source_joints),
             "target_bvh_joint_count": len(target_joints),
+            "semantic_pair_count": len(semantic_pairs),
         },
     }
+
+
+def _suggest_semantic_biped_mapping(
+    source: SpinePackage,
+    target: SpinePackage,
+) -> list[tuple[str, str]]:
+    """Prefer obvious biped bone pairs before falling back to sparse geometry.
+
+    The sparse matcher is useful for unknown 2D rigs, but generated FlatRig
+    targets commonly expose Mixamo-style names. In that case, semantic anchors
+    avoid unstable matches such as head -> HeadTop_End or foot -> Toe_End.
+    """
+
+    source_by_role = _semantic_role_lookup(source)
+    target_by_role = _semantic_role_lookup(target)
+    role_pairs = [
+        ("hips", "hips"),
+        ("chest", "chest"),
+        ("torso", "chest"),
+        ("torso", "torso"),
+        ("neck", "neck"),
+        ("head", "head"),
+        ("front_upper_arm", "right_upper_arm"),
+        ("front_forearm", "right_forearm"),
+        ("front_hand", "right_hand"),
+        ("rear_upper_arm", "left_upper_arm"),
+        ("rear_forearm", "left_forearm"),
+        ("rear_hand", "left_hand"),
+        ("front_thigh", "right_thigh"),
+        ("front_shin", "right_shin"),
+        ("front_foot", "right_foot"),
+        ("rear_thigh", "left_thigh"),
+        ("rear_shin", "left_shin"),
+        ("rear_foot", "left_foot"),
+        ("left_upper_arm", "left_upper_arm"),
+        ("left_forearm", "left_forearm"),
+        ("left_hand", "left_hand"),
+        ("right_upper_arm", "right_upper_arm"),
+        ("right_forearm", "right_forearm"),
+        ("right_hand", "right_hand"),
+        ("left_thigh", "left_thigh"),
+        ("left_shin", "left_shin"),
+        ("left_foot", "left_foot"),
+        ("right_thigh", "right_thigh"),
+        ("right_shin", "right_shin"),
+        ("right_foot", "right_foot"),
+    ]
+
+    pairs: list[tuple[str, str]] = []
+    used_source: set[str] = set()
+    used_target: set[str] = set()
+    for source_role, target_role in role_pairs:
+        source_name = source_by_role.get(source_role)
+        target_name = target_by_role.get(target_role)
+        if not source_name or not target_name:
+            continue
+        if source_name in used_source or target_name in used_target:
+            continue
+        pairs.append((source_name, target_name))
+        used_source.add(source_name)
+        used_target.add(target_name)
+    return pairs
+
+
+def _semantic_role_lookup(package: SpinePackage) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for bone in package.bones:
+        role = _semantic_biped_role(bone.name)
+        if role:
+            lookup.setdefault(role, bone.name)
+    return lookup
+
+
+def _semantic_biped_role(name: str) -> str | None:
+    key = _semantic_name_key(name)
+    if not key:
+        return None
+
+    if key == "root":
+        return "root"
+    if key in {"hip", "hips", "pelvis"}:
+        return "hips"
+    if key in {"torso", "chest", "spine2", "spine3", "upperbody"}:
+        return "chest"
+    if key in {"spine", "spine1"}:
+        return "torso"
+    if key == "neck":
+        return "neck"
+    if key == "head":
+        return "head"
+    if "headtop" in key or key.endswith("end"):
+        return None
+
+    side = _semantic_side(key)
+    if side is None:
+        return None
+
+    if "shoulder" in key:
+        return f"{side}_shoulder"
+    if "forearm" in key or "lowerarm" in key or "bracer" in key:
+        return f"{side}_forearm"
+    if "upperarm" in key or key.endswith("arm"):
+        return f"{side}_upper_arm"
+    if "hand" in key or "fist" in key:
+        return f"{side}_hand"
+    if "upleg" in key or "upperleg" in key or "thigh" in key:
+        return f"{side}_thigh"
+    if "shin" in key or ("leg" in key and "upleg" not in key and "upperleg" not in key):
+        return f"{side}_shin"
+    if "foot" in key:
+        return f"{side}_foot"
+    return None
+
+
+def _semantic_side(key: str) -> str | None:
+    if key.startswith("front"):
+        return "front"
+    if key.startswith("rear") or key.startswith("back"):
+        return "rear"
+    if key.startswith("left"):
+        return "left"
+    if key.startswith("right"):
+        return "right"
+    return None
+
+
+def _semantic_name_key(name: str) -> str:
+    leaf = str(name).split(":")[-1]
+    leaf = re.sub(r"^mixamorig\d*[_-]?", "", leaf, flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", "", leaf.lower())
 
 
 def _strip_motion2motion_suffix(name: str) -> str:
@@ -342,7 +492,7 @@ def compute_animation_duration(animation_payload: dict[str, Any]) -> float:
 
 def build_sample_times(duration: float, fps: float) -> list[float]:
     if duration <= EPSILON:
-        return [0.0]
+        duration = 1.0
     frame_count = max(2, int(math.ceil(duration * fps)) + 1)
     times = [min(duration, index / fps) for index in range(frame_count)]
     if abs(times[-1] - duration) > 1e-6:

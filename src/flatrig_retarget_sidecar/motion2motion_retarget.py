@@ -482,15 +482,19 @@ def retarget_spine_animation(
             target_package,
             mapping_file=mapping_file,
         )
-        if synthesized_target_rest and mapping_file:
+        semantic_pair_count = int(
+            (mapping_payload.get("metadata") or {}).get("semantic_pair_count") or 0
+        )
+        use_target_guide = bool(mapping_file) or semantic_pair_count >= 4 or synthesized_target_rest
+        if use_target_guide:
             target_guide_clip, target_guide_diagnostics = _direct_spine_mapping_transfer(
                 source,
                 target_package,
                 animation_name,
-                mapping_file,
-                reason="manual_mapping_target_guide",
+                mapping_payload,
+                reason="mapping_target_guide",
             )
-            if _spine_clip_has_motion(target_guide_clip):
+            if target_guide_clip.get("bones"):
                 resolved_target_animation_name = "__sidecar_mapping_guide__"
                 target_payload = copy.deepcopy(target_package.payload)
                 target_animations = dict(target_payload.get("animations") or {})
@@ -501,11 +505,6 @@ def retarget_spine_animation(
                     source_label=target_package.source_label,
                 )
                 synthesized_target_rest = False
-                mapping_payload = build_exported_motion2motion_mapping(
-                    source,
-                    target_package,
-                    mapping_file=mapping_file,
-                )
 
         target_metadata = export_spine_animation_to_bvh(
             target_package,
@@ -563,11 +562,16 @@ def _direct_spine_mapping_transfer(
     source: SpinePackage,
     target: SpinePackage,
     animation_name: str,
-    mapping_file: str | Path,
+    mapping_source: str | Path | dict[str, Any],
     *,
     reason: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    raw_payload = json.loads(Path(mapping_file).expanduser().read_text(encoding="utf-8"))
+    if isinstance(mapping_source, dict):
+        raw_payload = mapping_source
+        mapping_label = "<generated>"
+    else:
+        raw_payload = json.loads(Path(mapping_source).expanduser().read_text(encoding="utf-8"))
+        mapping_label = str(Path(mapping_source).expanduser())
     raw_pairs = raw_payload.get("mapping")
     if not isinstance(raw_pairs, list):
         raw_pairs = raw_payload.get("pairs")
@@ -637,7 +641,7 @@ def _direct_spine_mapping_transfer(
     diagnostics = {
         "mode": "direct_spine_mapping",
         "reason": reason,
-        "mapping_file": str(Path(mapping_file).expanduser()),
+        "mapping_file": mapping_label,
         "mapping_pair_count": len(pairs),
         "transferred_bone_count": len(transferred_bones),
         "skipped_source_bones": skipped_source_bones,
@@ -648,7 +652,7 @@ def _direct_spine_mapping_transfer(
 
 def _copy_spine_transfer_timelines(source_bone_timelines: dict[str, Any]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
-    for timeline_name in ("rotate", "translate", "shear"):
+    for timeline_name in ("rotate",):
         frames = source_bone_timelines.get(timeline_name)
         if isinstance(frames, list) and frames:
             copied[timeline_name] = copy.deepcopy(frames)
@@ -658,7 +662,14 @@ def _copy_spine_transfer_timelines(source_bone_timelines: dict[str, Any]) -> dic
 def _spine_bone_name_lookup(package: SpinePackage) -> dict[str, str]:
     lookup: dict[str, str] = {}
     for name in package.bones_by_name:
-        for key in {name, name.lower(), _spine_bone_lookup_key(name)}:
+        sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")
+        for key in {
+            name,
+            name.lower(),
+            sanitized,
+            sanitized.lower(),
+            _spine_bone_lookup_key(name),
+        }:
             if key:
                 lookup.setdefault(key, name)
     return lookup
