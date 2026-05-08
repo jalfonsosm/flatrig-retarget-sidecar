@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from flatrig_retarget_sidecar.motion2motion_retarget import (
-    _direct_spine_mapping_transfer,
+    _force_spine_clip_loop_closure,
     _resolve_target_package_with_exemplar,
+    _source_animation_loop_closed,
 )
 from flatrig_retarget_sidecar.spine_import import build_spine_package
 from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
@@ -86,67 +87,7 @@ def test_static_spine_animation_exports_enough_sample_frames_for_m2m() -> None:
     assert samples[-1] == 1.0
 
 
-def test_direct_spine_transfer_uses_world_delta_not_raw_local_copy() -> None:
-    source = build_spine_package(
-        {
-            "bones": [
-                {"name": "root"},
-                {"name": "torso", "parent": "root"},
-                {"name": "front-upper-arm", "parent": "torso"},
-            ],
-            "animations": {
-                "walk": {
-                    "bones": {
-                        "torso": {
-                            "rotate": [
-                                {"time": 0.0, "angle": 0.0},
-                                {"time": 1.0, "angle": 30.0},
-                            ]
-                        },
-                        "front-upper-arm": {
-                            "rotate": [
-                                {"time": 0.0, "angle": 0.0},
-                                {"time": 1.0, "angle": 10.0},
-                            ]
-                        },
-                    }
-                }
-            },
-        },
-        source_label="source.json",
-    )
-    target = build_spine_package(
-        {
-            "bones": [
-                {"name": "root"},
-                {"name": "mixamorig:RightShoulder", "parent": "root"},
-                {"name": "mixamorig:RightArm", "parent": "mixamorig:RightShoulder"},
-            ],
-            "animations": {"walk": {"bones": {}}},
-        },
-        source_label="target.json",
-    )
-    mapping = {
-        "root_joint": "root",
-        "mapping": [
-            {"source": "front_upper_arm", "target": "mixamorig_RightArm"},
-        ],
-    }
-
-    clip, diagnostics = _direct_spine_mapping_transfer(
-        source,
-        target,
-        "walk",
-        mapping,
-        reason="test",
-    )
-
-    arm_keys = clip["bones"]["mixamorig:RightArm"]["rotate"]
-    assert arm_keys[-1]["angle"] == 40.0
-    assert diagnostics["transfer_mode"] == "target_space_world_delta"
-
-
-def test_resolve_target_exemplar_prefers_idle_over_matching_animation() -> None:
+def test_resolve_target_exemplar_prefers_matching_animation_over_arbitrary_idle() -> None:
     target = build_spine_package(
         {
             "bones": [
@@ -171,9 +112,9 @@ def test_resolve_target_exemplar_prefers_idle_over_matching_animation() -> None:
     )
 
     assert resolved is target
-    assert animation_name == "idle"
+    assert animation_name == "walk"
     assert synthesized is False
-    assert mode == "idle"
+    assert mode == "matched"
 
 
 def test_resolve_target_exemplar_synthesizes_static_rest_when_target_has_no_animation() -> None:
@@ -200,22 +141,27 @@ def test_resolve_target_exemplar_synthesizes_static_rest_when_target_has_no_anim
     assert synthesized is True
     assert mode == "synthetic"
     assert animation_name in resolved.animations
+    root_rotate = resolved.animations[animation_name]["bones"]["root"]["rotate"]
+    assert len(root_rotate) == 31
+    assert root_rotate[0]["time"] == 0.0
+    assert root_rotate[-1]["time"] == 1.0
 
 
-def test_direct_spine_transfer_accepts_static_pose_animation() -> None:
+def test_loop_closed_source_closes_retarget_clip() -> None:
     source = build_spine_package(
         {
             "bones": [
                 {"name": "root"},
-                {"name": "front-upper-arm", "parent": "root"},
+                {"name": "front-upper-arm", "parent": "root", "rotation": 5.0},
             ],
             "animations": {
-                "aim": {
+                "walk": {
                     "bones": {
                         "front-upper-arm": {
                             "rotate": [
-                                {"time": 0.0, "angle": 35.0},
-                                {"time": 1.0, "angle": 35.0},
+                                {"time": 0.0, "angle": 10.0},
+                                {"time": 0.5, "angle": -20.0},
+                                {"time": 1.0, "angle": 10.0},
                             ]
                         },
                     }
@@ -224,31 +170,21 @@ def test_direct_spine_transfer_accepts_static_pose_animation() -> None:
         },
         source_label="source.json",
     )
-    target = build_spine_package(
-        {
-            "bones": [
-                {"name": "root"},
-                {"name": "mixamorig:RightArm", "parent": "root"},
-            ],
-            "animations": {},
-        },
-        source_label="target.json",
-    )
-
-    mapping = {
-        "root_joint": "root",
-        "mapping": [
-            {"source": "front_upper_arm", "target": "mixamorig_RightArm"},
-        ],
+    clip = {
+        "bones": {
+            "mixamorig:RightArm": {
+                "rotate": [
+                    {"time": 0.0, "angle": 25.0, "value": 25.0},
+                    {"time": 0.5, "angle": -15.0, "value": -15.0},
+                    {"time": 1.0, "angle": 20.0, "value": 20.0},
+                ]
+            }
+        }
     }
-    clip, diagnostics = _direct_spine_mapping_transfer(
-        source,
-        target,
-        "aim",
-        mapping,
-        reason="test",
-    )
 
-    assert diagnostics["result_has_motion"] is False
-    assert diagnostics["result_has_pose_or_motion"] is True
-    assert clip["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 35.0
+    assert _source_animation_loop_closed(source, "walk", 1.0)
+    _force_spine_clip_loop_closure(clip, 1.0)
+
+    arm_keys = clip["bones"]["mixamorig:RightArm"]["rotate"]
+    assert arm_keys[-1]["time"] == 1.0
+    assert arm_keys[-1]["angle"] == arm_keys[0]["angle"]

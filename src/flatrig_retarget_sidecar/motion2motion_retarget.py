@@ -29,7 +29,6 @@ from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
     ExportedSpineBvh,
     build_exported_motion2motion_mapping,
     build_sample_times,
-    compute_animation_duration,
     evaluate_local_pose_map,
     export_spine_animation_to_bvh,
 )
@@ -47,7 +46,6 @@ M2M_DEFAULT_CONFIG = "configs/default.yaml"
 ENV_M2M_DEVICE = "FLATRIG_M2M_DEVICE"
 ENV_M2M_ALLOW_MPS = "FLATRIG_M2M_ALLOW_MPS"
 ENV_M2M_MATCHING_ALPHA = "FLATRIG_M2M_MATCHING_ALPHA"
-M2M_FALLBACK_TARGET_ANIMATIONS = ("idle", "walk", "run", "animation")
 NUMERIC_EPSILON = 1e-8
 M2M_SUFFIX_RE = re.compile(r"__[^\\s]{3}$")
 TOKEN_SPLIT_RE = re.compile(r"(?<!^)(?=[A-Z])|[^A-Za-z0-9]+")
@@ -470,6 +468,7 @@ def retarget_spine_animation(
         preferred_animation_name=target_animation_name,
         source_duration=source_duration,
     )
+    source_loop_closed = _source_animation_loop_closed(source, animation_name, source_duration)
 
     with tempfile.TemporaryDirectory(
         prefix="m2m_spine_", dir=str(ROOT_DIR / "workflow")
@@ -481,7 +480,6 @@ def retarget_spine_animation(
         target_meta_path = temp_dir / "target.meta.json"
         mapping_path = temp_dir / "mapping.json"
         retargeted_bvh_path = temp_dir / "retargeted.bvh"
-        target_guide_diagnostics: dict[str, Any] | None = None
 
         source_metadata = export_spine_animation_to_bvh(
             source,
@@ -490,28 +488,6 @@ def retarget_spine_animation(
             metadata_path=source_meta_path,
             positions_mode="all",
         )
-        use_target_guide = target_exemplar_mode in {"synthetic"}
-        if use_target_guide:
-            target_guide_clip, target_guide_diagnostics = _direct_spine_mapping_transfer(
-                source,
-                target_package,
-                animation_name,
-                mapping_payload,
-                reason="mapping_target_guide",
-            )
-            if target_guide_clip.get("bones"):
-                resolved_target_animation_name = "__sidecar_mapping_guide__"
-                target_payload = copy.deepcopy(target_package.payload)
-                target_animations = dict(target_payload.get("animations") or {})
-                target_animations[resolved_target_animation_name] = target_guide_clip
-                target_payload["animations"] = target_animations
-                target_package = build_spine_package(
-                    target_payload,
-                    source_label=target_package.source_label,
-                )
-                synthesized_target_rest = False
-                target_exemplar_mode = "mapping_guide"
-
         target_metadata = export_spine_animation_to_bvh(
             target_package,
             resolved_target_animation_name,
@@ -533,10 +509,14 @@ def retarget_spine_animation(
             target_package,
             target_metadata,
         )
+        if source_loop_closed:
+            _force_spine_clip_loop_closure(clip, source_duration)
 
         diagnostics = {
             "backend_label": M2M_LABEL,
             "source_animation_name": animation_name,
+            "source_duration": source_duration,
+            "source_loop_closed": source_loop_closed,
             "target_exemplar_animation_name": resolved_target_animation_name,
             "target_exemplar_synthesized": synthesized_target_rest,
             "target_exemplar_mode": target_exemplar_mode,
@@ -557,215 +537,11 @@ def retarget_spine_animation(
             "bvh_result": dict(bvh_result.diagnostics),
             "result_bone_count": len(clip.get("bones") or {}),
         }
-        if target_guide_diagnostics is not None:
-            diagnostics["target_guide"] = target_guide_diagnostics
         return Motion2MotionSpineRetargetResult(
             animation_name=animation_name,
             animation=clip,
             diagnostics=diagnostics,
         )
-
-
-def _direct_spine_mapping_transfer(
-    source: SpinePackage,
-    target: SpinePackage,
-    animation_name: str,
-    mapping_source: str | Path | dict[str, Any],
-    *,
-    reason: str,
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if isinstance(mapping_source, dict):
-        raw_payload = mapping_source
-        mapping_label = "<generated>"
-    else:
-        raw_payload = json.loads(Path(mapping_source).expanduser().read_text(encoding="utf-8"))
-        mapping_label = str(Path(mapping_source).expanduser())
-    raw_pairs = raw_payload.get("mapping")
-    if not isinstance(raw_pairs, list):
-        raw_pairs = raw_payload.get("pairs")
-    if not isinstance(raw_pairs, list):
-        raw_pairs = []
-
-    source_animation = source.animations.get(animation_name)
-    source_timelines = (
-        (source_animation or {}).get("bones")
-        if isinstance(source_animation, dict)
-        else None
-    )
-    if not isinstance(source_timelines, dict):
-        return {}, {
-            "mode": "direct_spine_mapping",
-            "reason": "source_animation_has_no_bone_timelines",
-            "mapping_file": mapping_label,
-        }
-
-    source_lookup = _spine_bone_name_lookup(source)
-    target_lookup = _spine_bone_name_lookup(target)
-    pairs: list[tuple[str, str]] = []
-    used_source: set[str] = set()
-    used_target: set[str] = set()
-
-    def add_pair(raw_source: Any, raw_target: Any) -> None:
-        source_name = source_lookup.get(str(raw_source)) if raw_source is not None else None
-        target_name = target_lookup.get(str(raw_target)) if raw_target is not None else None
-        if not source_name or not target_name:
-            return
-        if source_name in used_source or target_name in used_target:
-            return
-        pairs.append((source_name, target_name))
-        used_source.add(source_name)
-        used_target.add(target_name)
-
-    if source.bones and target.bones:
-        requested_root = raw_payload.get("root_joint") or raw_payload.get("target_root")
-        add_pair(source.bones[0].name, requested_root or target.bones[0].name)
-
-    for raw_pair in raw_pairs:
-        if not isinstance(raw_pair, dict):
-            continue
-        add_pair(
-            raw_pair.get("source")
-            or raw_pair.get("source_joint")
-            or raw_pair.get("from")
-            or raw_pair.get("source_bone"),
-            raw_pair.get("target")
-            or raw_pair.get("target_joint")
-            or raw_pair.get("to")
-            or raw_pair.get("target_bone"),
-        )
-
-    clip, skipped_source_bones = _build_target_space_spine_transfer_clip(
-        source,
-        target,
-        animation_name,
-        pairs,
-    )
-    transferred_bones = dict(clip.get("bones") or {})
-
-    diagnostics = {
-        "mode": "direct_spine_mapping",
-        "reason": reason,
-        "transfer_mode": "target_space_world_delta",
-        "mapping_file": mapping_label,
-        "mapping_pair_count": len(pairs),
-        "transferred_bone_count": len(transferred_bones),
-        "skipped_source_bones": skipped_source_bones,
-        "result_has_motion": _spine_clip_has_motion(clip),
-        "result_has_pose_or_motion": _spine_clip_has_pose_or_motion(clip),
-    }
-    return clip, diagnostics
-
-
-def _build_target_space_spine_transfer_clip(
-    source: SpinePackage,
-    target: SpinePackage,
-    animation_name: str,
-    pairs: list[tuple[str, str]],
-    *,
-    fps: float = 30.0,
-) -> tuple[dict[str, Any], list[str]]:
-    source_animation = source.animations.get(animation_name)
-    if not isinstance(source_animation, dict):
-        return {}, []
-
-    target_to_source = {target_name: source_name for source_name, target_name in pairs}
-    duration = max(1.0 / fps, compute_animation_duration(source_animation))
-    sample_times = build_sample_times(duration, fps)
-    previous_rotation_values: dict[str, float] = {}
-    skipped_source_bones: set[str] = set()
-    track_map: dict[str, list[dict[str, float]]] = {
-        target_name: [] for _source_name, target_name in pairs
-    }
-
-    for time_value in sample_times:
-        source_local_pose = evaluate_local_pose_map(source, animation_name, time_value)
-        source_world_rotation = _spine_world_rotation_from_local_pose(source, source_local_pose)
-        target_world_rotation: dict[str, float] = {}
-
-        for target_bone in target.bones:
-            parent_world_rotation = (
-                target_world_rotation.get(target_bone.parent, 0.0)
-                if target_bone.parent
-                else 0.0
-            )
-            local_rotation = float(target_bone.rotation)
-            source_name = target_to_source.get(target_bone.name)
-
-            if source_name:
-                source_bone = source.bones_by_name.get(source_name)
-                source_pose_world = source_world_rotation.get(source_name)
-                if source_bone is None or source_pose_world is None:
-                    skipped_source_bones.add(source_name)
-                else:
-                    source_delta_world = _normalize_angle(
-                        float(source_pose_world) - float(source_bone.world_rotation)
-                    )
-                    desired_target_world = _normalize_angle(
-                        float(target_bone.world_rotation) + source_delta_world
-                    )
-                    local_rotation = _normalize_angle(
-                        desired_target_world - parent_world_rotation
-                    )
-                    rel_rotation = _unwrap_angle_near(
-                        _normalize_angle(local_rotation - float(target_bone.rotation)),
-                        previous_rotation_values.get(target_bone.name),
-                    )
-                    previous_rotation_values[target_bone.name] = rel_rotation
-                    track_map.setdefault(target_bone.name, []).append(
-                        {
-                            "time": round(float(time_value), 4),
-                            "angle": round(rel_rotation, 2),
-                            "value": round(rel_rotation, 2),
-                        }
-                    )
-
-            target_world_rotation[target_bone.name] = _normalize_angle(
-                parent_world_rotation + local_rotation
-            )
-
-    transferred_bones: dict[str, Any] = {}
-    for target_name, rotate_keys in track_map.items():
-        rotate = _compress_timeline_keys(rotate_keys, ("angle", "value"), tolerance=0.01)
-        if rotate:
-            transferred_bones[target_name] = {"rotate": rotate}
-    return {"bones": transferred_bones} if transferred_bones else {}, sorted(skipped_source_bones)
-
-
-def _spine_world_rotation_from_local_pose(
-    package: SpinePackage,
-    local_pose: dict[str, dict[str, float]],
-) -> dict[str, float]:
-    world_rotation: dict[str, float] = {}
-    for bone in package.bones:
-        pose = local_pose.get(bone.name) or {}
-        local_rotation = float(pose.get("rotation", bone.rotation))
-        parent_rotation = (
-            world_rotation.get(bone.parent, 0.0)
-            if bone.parent
-            else 0.0
-        )
-        world_rotation[bone.name] = _normalize_angle(parent_rotation + local_rotation)
-    return world_rotation
-
-
-def _spine_bone_name_lookup(package: SpinePackage) -> dict[str, str]:
-    lookup: dict[str, str] = {}
-    for name in package.bones_by_name:
-        sanitized = re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_")
-        for key in {
-            name,
-            name.lower(),
-            sanitized,
-            sanitized.lower(),
-            _spine_bone_lookup_key(name),
-        }:
-            if key:
-                lookup.setdefault(key, name)
-    return lookup
-
-
-def _spine_bone_lookup_key(name: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(name).split(":")[-1].lower())
 
 
 def _spine_clip_has_motion(clip: dict[str, Any], tolerance: float = 1e-5) -> bool:
@@ -1089,41 +865,33 @@ def _resolve_target_package_with_exemplar(
     if preferred_animation_name and preferred_animation_name in target.animations:
         return target, preferred_animation_name, False, "preferred"
 
-    available_names = list(target.animations.keys())
-    for idle_name in available_names:
-        if _animation_name_tokens(idle_name) == {"idle"}:
-            return target, idle_name, False, "idle"
-    for idle_name in available_names:
-        if "idle" in _animation_name_tokens(idle_name):
-            return target, idle_name, False, "idle"
-
-    for candidate in M2M_FALLBACK_TARGET_ANIMATIONS:
-        if candidate in target.animations:
-            return target, candidate, False, "fallback"
-    matched_name = _select_matching_target_animation(source_animation_name, available_names)
+    matched_name = _select_matching_target_animation(
+        source_animation_name,
+        list(target.animations.keys()),
+    )
     if matched_name:
         return target, matched_name, False, "matched"
-    if available_names:
-        return target, available_names[0], False, "fallback"
 
     target_root = _select_target_root_name(target)
     synthetic_name = "__sidecar_rest__"
+    duration = round(max(source_duration, 1.0 / 30.0), 4)
+    sample_times = build_sample_times(duration, 30.0)
     cloned_payload = copy.deepcopy(target.payload)
     cloned_payload.setdefault("animations", {})
     cloned_payload["animations"][synthetic_name] = {
         "bones": {
             target_root: {
                 "translate": [
-                    {"time": 0.0, "x": 0.0, "y": 0.0},
-                    {"time": round(max(source_duration, 1.0 / 30.0), 4), "x": 0.0, "y": 0.0},
+                    {"time": round(float(time_value), 4), "x": 0.0, "y": 0.0}
+                    for time_value in sample_times
                 ],
                 "rotate": [
-                    {"time": 0.0, "angle": 0.0, "value": 0.0},
                     {
-                        "time": round(max(source_duration, 1.0 / 30.0), 4),
+                        "time": round(float(time_value), 4),
                         "angle": 0.0,
                         "value": 0.0,
-                    },
+                    }
+                    for time_value in sample_times
                 ],
             }
         }
@@ -1180,7 +948,77 @@ def _select_target_root_name(target: SpinePackage) -> str:
 
 def _infer_source_animation_duration(source: SpinePackage, animation_name: str) -> float:
     animation = source.animations.get(animation_name) or {}
-    return max(1.0 / 30.0, _scan_animation_duration(animation))
+    duration = _scan_animation_duration(animation)
+    if duration <= NUMERIC_EPSILON:
+        return 1.0
+    return max(1.0 / 30.0, duration)
+
+
+def _source_animation_loop_closed(
+    source: SpinePackage,
+    animation_name: str,
+    duration: float,
+    *,
+    tolerance: float = 0.5,
+) -> bool:
+    animation = source.animations.get(animation_name)
+    if not isinstance(animation, dict) or duration <= NUMERIC_EPSILON:
+        return False
+    if not _animation_has_timed_keys(animation):
+        return False
+
+    start_pose = evaluate_local_pose_map(source, animation_name, 0.0)
+    end_pose = evaluate_local_pose_map(source, animation_name, duration)
+    for bone in source.bones:
+        start = start_pose.get(bone.name) or {}
+        end = end_pose.get(bone.name) or {}
+        if abs(_normalize_angle(float(end.get("rotation", 0.0)) - float(start.get("rotation", 0.0)))) > tolerance:
+            return False
+        for pose_field in ("x", "y"):
+            if (
+                abs(float(end.get(pose_field, 0.0)) - float(start.get(pose_field, 0.0)))
+                > tolerance
+            ):
+                return False
+    return True
+
+
+def _animation_has_timed_keys(animation_payload: dict[str, Any]) -> bool:
+    stack = [animation_payload]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, dict):
+            time_value = current.get("time")
+            if isinstance(time_value, (int, float)) and float(time_value) > NUMERIC_EPSILON:
+                return True
+            stack.extend(current.values())
+        elif isinstance(current, list):
+            stack.extend(current)
+    return False
+
+
+def _force_spine_clip_loop_closure(clip: dict[str, Any], duration: float) -> None:
+    if duration <= NUMERIC_EPSILON:
+        return
+    end_time = round(float(duration), 4)
+    for timelines in (clip.get("bones") or {}).values():
+        if not isinstance(timelines, dict):
+            continue
+        for timeline_name, keys in list(timelines.items()):
+            if not isinstance(keys, list) or not keys:
+                continue
+            start_key = {
+                key: copy.deepcopy(value)
+                for key, value in (keys[0] or {}).items()
+                if key not in {"time", "curve", "c", "c2", "c3", "c4"}
+            }
+            if not start_key:
+                continue
+            end_key = {"time": end_time, **start_key}
+            if abs(float((keys[-1] or {}).get("time", 0.0)) - end_time) <= 1e-4:
+                keys[-1] = end_key
+            else:
+                keys.append(end_key)
 
 
 def _scan_animation_duration(animation_payload: dict[str, Any]) -> float:
