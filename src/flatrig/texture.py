@@ -299,6 +299,7 @@ def render_part_sprite(
         bmesh.ops.delete(bm, geom=delete_faces, context="FACES")
 
     fill_holes = False
+    hole_faces = []
 
     if not bm.faces:
         bm.free()

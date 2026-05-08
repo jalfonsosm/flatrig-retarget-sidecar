@@ -458,43 +458,6 @@ def retarget_spine_animation(
         target,
         mapping_file=mapping_file,
     )
-    direct_clip, direct_diagnostics = _direct_spine_mapping_transfer(
-        source,
-        target,
-        animation_name,
-        mapping_payload,
-        reason="rest_pose_mapping",
-    )
-    if direct_clip.get("bones") and _spine_clip_has_pose_or_motion(direct_clip):
-        sample_times = build_sample_times(source_duration, 30.0)
-        diagnostics = {
-            "backend_label": "RestPoseSpine2D",
-            "motion2motion_bypassed": True,
-            "source_animation_name": animation_name,
-            "target_exemplar_animation_name": None,
-            "target_exemplar_synthesized": False,
-            "target_exemplar_mode": "rest_pose",
-            "source_source_label": source.source_label,
-            "target_source_label": target.source_label,
-            "source_non_root_translate_bones": [],
-            "source_ignored_scale_bones": [],
-            "target_non_root_translate_bones": [],
-            "target_ignored_scale_bones": [],
-            "source_frame_count": len(sample_times),
-            "target_frame_count": 1,
-            "mapping_pair_count": len(mapping_payload.get("mapping") or []),
-            "mapping_pairs": list(mapping_payload.get("mapping") or []),
-            "mapping_root_joint": mapping_payload.get("root_joint"),
-            "mapping_mode": "manual" if mapping_file else "auto",
-            "mapping_file": str(Path(mapping_file).expanduser()) if mapping_file else None,
-            "result_bone_count": len(direct_clip.get("bones") or {}),
-            "target_guide": direct_diagnostics,
-        }
-        return Motion2MotionSpineRetargetResult(
-            animation_name=animation_name,
-            animation=direct_clip,
-            diagnostics=diagnostics,
-        )
 
     (
         target_package,
@@ -527,7 +490,7 @@ def retarget_spine_animation(
             metadata_path=source_meta_path,
             positions_mode="all",
         )
-        use_target_guide = target_exemplar_mode in {"fallback", "synthetic"}
+        use_target_guide = target_exemplar_mode in {"synthetic"}
         if use_target_guide:
             target_guide_clip, target_guide_diagnostics = _direct_spine_mapping_transfer(
                 source,
@@ -547,6 +510,7 @@ def retarget_spine_animation(
                     source_label=target_package.source_label,
                 )
                 synthesized_target_rest = False
+                target_exemplar_mode = "mapping_guide"
 
         target_metadata = export_spine_animation_to_bvh(
             target_package,
@@ -1126,13 +1090,19 @@ def _resolve_target_package_with_exemplar(
         return target, preferred_animation_name, False, "preferred"
 
     available_names = list(target.animations.keys())
-    matched_name = _select_matching_target_animation(source_animation_name, available_names)
-    if matched_name:
-        return target, matched_name, False, "matched"
+    for idle_name in available_names:
+        if _animation_name_tokens(idle_name) == {"idle"}:
+            return target, idle_name, False, "idle"
+    for idle_name in available_names:
+        if "idle" in _animation_name_tokens(idle_name):
+            return target, idle_name, False, "idle"
 
     for candidate in M2M_FALLBACK_TARGET_ANIMATIONS:
         if candidate in target.animations:
             return target, candidate, False, "fallback"
+    matched_name = _select_matching_target_animation(source_animation_name, available_names)
+    if matched_name:
+        return target, matched_name, False, "matched"
     if available_names:
         return target, available_names[0], False, "fallback"
 

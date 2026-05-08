@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from flatrig_retarget_sidecar.motion2motion_retarget import (
     _direct_spine_mapping_transfer,
-    retarget_spine_animation,
+    _resolve_target_package_with_exemplar,
 )
 from flatrig_retarget_sidecar.spine_import import build_spine_package
 from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
@@ -146,28 +146,37 @@ def test_direct_spine_transfer_uses_world_delta_not_raw_local_copy() -> None:
     assert diagnostics["transfer_mode"] == "target_space_world_delta"
 
 
-def test_spine_retarget_uses_target_rest_pose_without_target_animations() -> None:
-    source = build_spine_package(
+def test_resolve_target_exemplar_prefers_idle_over_matching_animation() -> None:
+    target = build_spine_package(
         {
             "bones": [
                 {"name": "root"},
-                {"name": "front-upper-arm", "parent": "root"},
+                {"name": "mixamorig:RightArm", "parent": "root"},
             ],
             "animations": {
+                "idle": {"bones": {"mixamorig:RightArm": {"rotate": [{"time": 0, "angle": 0}]}}},
                 "walk": {
-                    "bones": {
-                        "front-upper-arm": {
-                            "rotate": [
-                                {"time": 0.0, "angle": 0.0},
-                                {"time": 1.0, "angle": 20.0},
-                            ]
-                        },
-                    }
-                }
+                    "bones": {"mixamorig:RightArm": {"rotate": [{"time": 0, "angle": 10}]}}
+                },
             },
         },
-        source_label="source.json",
+        source_label="target.json",
     )
+
+    resolved, animation_name, synthesized, mode = _resolve_target_package_with_exemplar(
+        target,
+        source_animation_name="walk",
+        preferred_animation_name=None,
+        source_duration=1.0,
+    )
+
+    assert resolved is target
+    assert animation_name == "idle"
+    assert synthesized is False
+    assert mode == "idle"
+
+
+def test_resolve_target_exemplar_synthesizes_static_rest_when_target_has_no_animation() -> None:
     target = build_spine_package(
         {
             "bones": [
@@ -179,14 +188,21 @@ def test_spine_retarget_uses_target_rest_pose_without_target_animations() -> Non
         source_label="target.json",
     )
 
-    result = retarget_spine_animation(source, target, "walk")
+    resolved, animation_name, synthesized, mode = _resolve_target_package_with_exemplar(
+        target,
+        source_animation_name="walk",
+        preferred_animation_name=None,
+        source_duration=1.0,
+    )
 
-    assert result.diagnostics["backend_label"] == "RestPoseSpine2D"
-    assert result.diagnostics["target_exemplar_mode"] == "rest_pose"
-    assert result.animation["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 20.0
+    assert resolved is not target
+    assert animation_name == "__sidecar_rest__"
+    assert synthesized is True
+    assert mode == "synthetic"
+    assert animation_name in resolved.animations
 
 
-def test_spine_retarget_accepts_static_pose_animation() -> None:
+def test_direct_spine_transfer_accepts_static_pose_animation() -> None:
     source = build_spine_package(
         {
             "bones": [
@@ -219,9 +235,20 @@ def test_spine_retarget_accepts_static_pose_animation() -> None:
         source_label="target.json",
     )
 
-    result = retarget_spine_animation(source, target, "aim")
+    mapping = {
+        "root_joint": "root",
+        "mapping": [
+            {"source": "front_upper_arm", "target": "mixamorig_RightArm"},
+        ],
+    }
+    clip, diagnostics = _direct_spine_mapping_transfer(
+        source,
+        target,
+        "aim",
+        mapping,
+        reason="test",
+    )
 
-    assert result.diagnostics["backend_label"] == "RestPoseSpine2D"
-    assert result.diagnostics["target_guide"]["result_has_motion"] is False
-    assert result.diagnostics["target_guide"]["result_has_pose_or_motion"] is True
-    assert result.animation["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 35.0
+    assert diagnostics["result_has_motion"] is False
+    assert diagnostics["result_has_pose_or_motion"] is True
+    assert clip["bones"]["mixamorig:RightArm"]["rotate"][-1]["angle"] == 35.0

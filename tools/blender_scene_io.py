@@ -11,9 +11,9 @@ from pathlib import Path
 from typing import Any
 
 try:
+    import bmesh
     import bpy
     import mathutils
-    import bmesh
 except ImportError:
     bpy = None
     mathutils = None
@@ -396,6 +396,111 @@ def _restore_scene_armature_pose_positions(previous):
         armature_data.pose_position = pose_position
     if previous:
         bpy.context.view_layer.update()
+
+
+def _neutral_setup_role(name: str) -> str | None:
+    key = re.sub(r"[^a-z0-9]+", "", str(name).split(":")[-1].lower())
+    if not key:
+        return None
+    if "shoulder" in key or "clavicle" in key:
+        return None
+    if "left" not in key and "right" not in key:
+        return None
+    if "hand" in key or "wrist" in key:
+        return "hand"
+    if "forearm" in key or "lowerarm" in key:
+        return "forearm"
+    if "upperarm" in key or "uparm" in key or key.endswith("arm"):
+        return "upper_arm"
+    return None
+
+
+def _clear_armature_animation_for_setup(armature_obj):
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if animation_data is None:
+        return
+    animation_data.action = None
+    for track in getattr(animation_data, "nla_tracks", []) or []:
+        track.mute = True
+
+
+def _reset_armature_pose(armature_obj):
+    if armature_obj is None or getattr(armature_obj, "pose", None) is None:
+        return
+    if armature_obj.data is not None:
+        armature_obj.data.pose_position = "POSE"
+    for pose_bone in armature_obj.pose.bones:
+        pose_bone.location = (0.0, 0.0, 0.0)
+        pose_bone.scale = (1.0, 1.0, 1.0)
+        if pose_bone.rotation_mode == "QUATERNION":
+            pose_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        elif pose_bone.rotation_mode == "AXIS_ANGLE":
+            pose_bone.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+        else:
+            pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+    bpy.context.view_layer.update()
+
+
+def _rotate_pose_bone_world_direction(armature_obj, pose_bone, desired_direction_world) -> bool:
+    head_world, tail_world = _pose_bone_world_head_tail(armature_obj, pose_bone)
+    current_direction = tail_world - head_world
+    if float(current_direction.length) <= VECTOR_EPSILON:
+        return False
+    desired_direction = mathutils.Vector(desired_direction_world)
+    if float(desired_direction.length) <= VECTOR_EPSILON:
+        return False
+    delta = current_direction.normalized().rotation_difference(desired_direction.normalized())
+    pivot_to_origin = mathutils.Matrix.Translation(-head_world)
+    pivot_back = mathutils.Matrix.Translation(head_world)
+    rotate_world = delta.to_matrix().to_4x4()
+    current_world_matrix = armature_obj.matrix_world @ pose_bone.matrix
+    new_world_matrix = pivot_back @ rotate_world @ pivot_to_origin @ current_world_matrix
+    pose_bone.matrix = armature_obj.matrix_world.inverted() @ new_world_matrix
+    bpy.context.view_layer.update()
+    return True
+
+
+def _apply_neutral_down_setup_pose(armature_obj) -> dict[str, object]:
+    """Pose compatible humanoid arms downward for stable sprite/setup extraction."""
+    if armature_obj is None or getattr(armature_obj, "pose", None) is None:
+        return {"mode": "none", "posed_bone_count": 0}
+
+    _clear_armature_animation_for_setup(armature_obj)
+    _reset_armature_pose(armature_obj)
+
+    ordered_roles = {"upper_arm": 0, "forearm": 1, "hand": 2}
+    candidates = []
+    for pose_bone in armature_obj.pose.bones:
+        role = _neutral_setup_role(pose_bone.name)
+        if role:
+            candidates.append((ordered_roles.get(role, 99), pose_bone.name, pose_bone))
+    candidates.sort(key=lambda item: (item[0], item[1]))
+
+    posed_count = 0
+    for _order, _name, pose_bone in candidates:
+        try:
+            if _rotate_pose_bone_world_direction(armature_obj, pose_bone, (0.0, 0.0, -1.0)):
+                posed_count += 1
+        except Exception:
+            continue
+
+    return {
+        "mode": "neutral_down",
+        "posed_bone_count": posed_count,
+        "posed_roles": sorted({role for role in (_neutral_setup_role(pb.name) for pb in armature_obj.pose.bones) if role}),
+    }
+
+
+def _should_use_neutral_setup_pose(source_frame=None, use_rest_pose=False) -> bool:
+    if use_rest_pose:
+        return False
+    return source_frame is not None and int(source_frame) < 0
+
+
+def _apply_auto_setup_pose(armature_obj, source_frame=None, use_rest_pose=False) -> dict[str, object]:
+    if _should_use_neutral_setup_pose(source_frame, use_rest_pose):
+        return _apply_neutral_down_setup_pose(armature_obj)
+    return {"mode": "rest_pose" if use_rest_pose else "frame", "posed_bone_count": 0}
 
 
 def _armature_uniform_scale(armature_obj) -> float:
@@ -1667,7 +1772,12 @@ def _select_sprite_render_frame(armature_obj, source_frame=None) -> int:
     return int(scene.frame_start or 1)
 
 
-def _resolve_setup_frame(armature_obj, source_frame=None, use_rest_pose=False) -> int:
+def _resolve_setup_frame(
+    armature_obj,
+    source_frame=None,
+    use_rest_pose=False,
+    neutral_auto_pose=False,
+) -> int:
     """Resolve the shared setup frame for mesh, bones, target BVH, and sprites.
 
     source_frame=-1 means "auto": choose a stable in-action pose when possible.
@@ -1679,6 +1789,8 @@ def _resolve_setup_frame(armature_obj, source_frame=None, use_rest_pose=False) -
         source_frame = int(source_frame)
         if source_frame > 0:
             return source_frame
+        if source_frame < 0 and neutral_auto_pose:
+            return int(scene.frame_start or 1)
         if source_frame < 0 and not use_rest_pose:
             return _select_sprite_render_frame(armature_obj)
     return int(scene.frame_start or 1)
@@ -1762,6 +1874,13 @@ def export_3d_rest_bvh_cli(
         armature_obj,
         source_frame=source_frame,
         use_rest_pose=use_rest_pose,
+        neutral_auto_pose=True,
+    )
+    bpy.context.scene.frame_set(setup_frame)
+    setup_pose = _apply_auto_setup_pose(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
     )
     view_cfg = get_view_config(
         view_name=view_preset,
@@ -1779,8 +1898,8 @@ def export_3d_rest_bvh_cli(
     )
     layout = _build_3d_bvh_layout(
         armature_obj,
-        source_frame=None,
-        use_rest_pose=True,
+        source_frame=setup_frame,
+        use_rest_pose=use_rest_pose,
     )
     positions, rotations = _rest_3d_bvh_frames(layout, frame_count=frame_count)
     _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
@@ -1799,8 +1918,9 @@ def export_3d_rest_bvh_cli(
         "positions_mode": "all",
         "projection_space": projection_space,
         "setup_frame": setup_frame,
+        "setup_pose": setup_pose,
         "use_rest_pose": bool(use_rest_pose),
-        "retarget_use_rest_pose": True,
+        "retarget_use_rest_pose": bool(use_rest_pose),
         "view": _view_config_to_json(view_cfg),
         "bones_2d": bones_2d,
         **layout,
@@ -2196,6 +2316,13 @@ def extract_scene_cli(
         armature_obj,
         source_frame=source_frame,
         use_rest_pose=use_rest_pose,
+        neutral_auto_pose=True,
+    )
+    bpy.context.scene.frame_set(setup_frame)
+    setup_pose = _apply_auto_setup_pose(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
     )
     mesh_reduction_report = reduce_mesh_object(
         mesh_obj,
@@ -2283,6 +2410,7 @@ def extract_scene_cli(
         "detail": "extracted",
         "source": source_path,
         "setup_frame": setup_frame,
+        "setup_pose": setup_pose,
         "use_rest_pose": bool(use_rest_pose),
         "mesh": mesh_data,
         "bones": bones,
@@ -2463,13 +2591,22 @@ def render_sprites_cli(
 
     if bind_frame > 0:
         render_frame = int(bind_frame)
+        setup_pose = {"mode": "frame", "posed_bone_count": 0}
     else:
         render_frame = _resolve_setup_frame(
             armature_obj,
             source_frame=(source_frame if bind_frame == 0 else -1),
             use_rest_pose=use_rest_pose,
+            neutral_auto_pose=True,
         )
+        setup_pose = None
     bpy.context.scene.frame_set(render_frame)
+    if setup_pose is None:
+        setup_pose = _apply_auto_setup_pose(
+            armature_obj,
+            source_frame=(source_frame if bind_frame == 0 else -1),
+            use_rest_pose=use_rest_pose,
+        )
     bpy.context.view_layer.update()
 
     # Build view configuration
@@ -2540,6 +2677,7 @@ def render_sprites_cli(
             "detail": "rendered",
             "source": source_path,
             "render_frame": render_frame,
+            "setup_pose": setup_pose,
             "use_rest_pose": bool(use_rest_pose),
             "mesh_reduction": mesh_reduction_report,
             "renders": renders,

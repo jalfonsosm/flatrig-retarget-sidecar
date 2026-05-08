@@ -317,6 +317,8 @@ def _retarget_one_3d_clip(
             "result_bone_count": len(animation.get("bones") or {}),
         }
     )
+    if preview_3d is not None:
+        preview_3d["diagnostics"] = dict(diagnostics)
     return {"animation": animation, "preview_3d": preview_3d, "diagnostics": diagnostics}
 
 
