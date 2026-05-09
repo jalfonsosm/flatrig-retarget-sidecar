@@ -1990,10 +1990,18 @@ def export_3d_rest_bvh_cli(
         projection_space=projection_space,
         projection_reference_root=None,
     )
+    # The "rest" BVH that Motion2Motion uses as the target reference must be
+    # built from the actual 3D rest pose of the rig, NOT from the bind frame
+    # the user picked for sprite rendering. The source BVH (input animation)
+    # is also built in rest pose (default of `_build_3d_bvh_layout`) and M2M
+    # assumes both rigs share that convention. Building the target layout from
+    # the bind frame (e.g. frame 1 of a Walk action) made M2M interpret every
+    # rotation against a posed reference, producing visibly broken retargets
+    # whenever the bind frame wasn't the rest pose. Fixed 2026-05-09.
     layout = _build_3d_bvh_layout(
         armature_obj,
-        source_frame=setup_frame,
-        use_rest_pose=use_rest_pose,
+        source_frame=None,
+        use_rest_pose=True,
     )
     positions, rotations = _rest_3d_bvh_frames(layout, frame_count=frame_count)
     _write_3d_bvh(bvh_output, layout["joints"], positions, rotations, fps)
