@@ -1053,11 +1053,16 @@ def bvh_to_preview_3d_animation(
             original_name = joint_metadata.get("name")
             if original_name is None:
                 continue
+            # Emit the full world rotation matrix per bone per frame so the
+            # native draw-order resolver can do real linear blend skinning of
+            # each sprite's vertices, instead of approximating with a single
+            # depth scalar per bone. 9 floats per bone per frame.
             frame_bones.append(
                 {
                     "name": str(original_name),
                     "head": _vector3_to_list(head_3d),
                     "tail": _vector3_to_list(tail_3d),
+                    "rotation": _matrix3_to_list(world_rotation_3d),
                 }
             )
 
@@ -1080,6 +1085,14 @@ def bvh_to_preview_3d_animation(
 def _vector3_to_list(vector) -> list[float]:
     arr = np.asarray(vector, dtype=np.float64).reshape(3)
     return [round(float(arr[0]), 6), round(float(arr[1]), 6), round(float(arr[2]), 6)]
+
+
+def _matrix3_to_list(matrix) -> list[list[float]]:
+    arr = np.asarray(matrix, dtype=np.float64).reshape(3, 3)
+    return [
+        [round(float(arr[r, c]), 6) for c in range(3)]
+        for r in range(3)
+    ]
 
 
 def _inspect_source_action_names(source_path: Path, temp_dir: Path) -> list[str]:
