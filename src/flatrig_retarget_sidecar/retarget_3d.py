@@ -28,6 +28,10 @@ from flatrig_retarget_sidecar.motion2motion_retarget import (
     build_generic_skeleton_description,
     retarget_bvh_pair,
 )
+from flatrig_retarget_sidecar.rig_identity import (
+    can_use_mixamo_direct_bypass,
+    detect_rig_family,
+)
 from flatrig_retarget_sidecar.scene_formats import (
     export_3d_animation_bvh,
     export_3d_rest_bvh,
@@ -240,21 +244,18 @@ def _retarget_one_3d_clip(
     mapping_review_required = bool(force_mapping_review or mapping_quality < quality_threshold)
     mapping_path.write_text(json.dumps(mapping_payload, indent=2) + "\n", encoding="utf-8")
 
+    source_rig_family = detect_rig_family(source_metadata)
+    target_rig_family = detect_rig_family(target_metadata)
+    mixamo_bypass = can_use_mixamo_direct_bypass(source_metadata, target_metadata)
+
     try:
-        bvh_result = retarget_bvh_pair(
-            source_bvh,
-            target_bvh,
-            mapping_path,
-            output_bvh=retargeted_bvh,
-            matching_alpha=matching_alpha,
-        )
-        source_motion = _bvh_motion_stats(source_bvh)
-        retargeted_motion = _bvh_motion_stats(retargeted_bvh)
-        direct_fallback = None
-        if (
-            source_motion["max_rotation_std"] > 1e-3
-            and retargeted_motion["max_rotation_std"] <= 1e-4
-        ):
+        bvh_result: Any = None
+        direct_fallback: dict[str, Any] | None = None
+        if mixamo_bypass:
+            # Both rigs are Mixamo: skip Motion2Motion entirely. Mixamo joint
+            # axes line up by construction, so the deterministic local-rotation
+            # copy in direct_mapped_bvh_retarget produces a faithful retarget
+            # without needing target motion priors or sparse matching.
             direct_fallback = direct_mapped_bvh_retarget(
                 source_bvh,
                 target_bvh,
@@ -264,7 +265,33 @@ def _retarget_one_3d_clip(
                 output_bvh=retargeted_bvh,
                 manual_mapping=mapping_mode == "manual",
             )
+            direct_fallback["bypass_reason"] = "mixamo_direct"
+            source_motion = _bvh_motion_stats(source_bvh)
             retargeted_motion = _bvh_motion_stats(retargeted_bvh)
+        else:
+            bvh_result = retarget_bvh_pair(
+                source_bvh,
+                target_bvh,
+                mapping_path,
+                output_bvh=retargeted_bvh,
+                matching_alpha=matching_alpha,
+            )
+            source_motion = _bvh_motion_stats(source_bvh)
+            retargeted_motion = _bvh_motion_stats(retargeted_bvh)
+            if (
+                source_motion["max_rotation_std"] > 1e-3
+                and retargeted_motion["max_rotation_std"] <= 1e-4
+            ):
+                direct_fallback = direct_mapped_bvh_retarget(
+                    source_bvh,
+                    target_bvh,
+                    source_metadata,
+                    target_metadata,
+                    mapping_payload,
+                    output_bvh=retargeted_bvh,
+                    manual_mapping=mapping_mode == "manual",
+                )
+                retargeted_motion = _bvh_motion_stats(retargeted_bvh)
         animation = bvh_to_flatrig_animation(
             retargeted_bvh,
             target_metadata,
@@ -307,14 +334,17 @@ def _retarget_one_3d_clip(
             "target_joint_count": len(target_metadata.get("joints") or []),
             "mapping_pair_count": len(mapping_payload.get("mapping") or []),
             "mapping_root_joint": mapping_payload.get("root_joint"),
-            "mapping_quality_score": mapping_quality,
-            "mapping_review_required": mapping_review_required,
+            "mapping_quality_score": 1.0 if mixamo_bypass else mapping_quality,
+            "mapping_review_required": False if mixamo_bypass else mapping_review_required,
             "mapping_diagnostics": mapping_diagnostics,
-            "bvh_result": dict(bvh_result.diagnostics),
+            "bvh_result": dict(bvh_result.diagnostics) if bvh_result is not None else None,
             "source_motion_stats": source_motion,
             "retargeted_motion_stats": retargeted_motion,
             "direct_retarget_fallback": direct_fallback,
             "result_bone_count": len(animation.get("bones") or {}),
+            "rig_family_source": source_rig_family,
+            "rig_family_target": target_rig_family,
+            "bypass_reason": "mixamo_direct" if mixamo_bypass else None,
         }
     )
     if preview_3d is not None:

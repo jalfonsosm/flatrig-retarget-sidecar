@@ -409,13 +409,40 @@ def _neutral_setup_role(name: str) -> str | None:
         return None
     if "left" not in key and "right" not in key:
         return None
+    # Hands and arms — the original A-pose support.
     if "hand" in key or "wrist" in key:
         return "hand"
     if "forearm" in key or "lowerarm" in key:
         return "forearm"
     if "upperarm" in key or "uparm" in key or key.endswith("arm"):
         return "upper_arm"
+    # Legs and feet — newly covered so the A-pose silhouette also straightens
+    # legs/feet (otherwise legs spread or bend when the source rig was authored
+    # with a non-T setup pose, e.g. squat-style rigs).
+    if "toe" in key:
+        return "toe"
+    if "foot" in key or "ankle" in key:
+        return "foot"
+    if "shin" in key or "calf" in key or "lowerleg" in key or "loleg" in key:
+        return "lower_leg"
+    if "thigh" in key or "upleg" in key or "upperleg" in key or key.endswith("leg"):
+        return "upper_leg"
     return None
+
+
+# Direction (in armature world space) we rotate each limb segment to. Arms point
+# straight down (A-pose silhouette), legs point straight down (vertical stance),
+# and feet point straight forward so toes don't curl. Each entry is a unit-ish
+# vector applied via _rotate_pose_bone_world_direction.
+_NEUTRAL_ROLE_DIRECTIONS: dict[str, tuple[float, float, float]] = {
+    "upper_arm": (0.0, 0.0, -1.0),
+    "forearm":   (0.0, 0.0, -1.0),
+    "hand":      (0.0, 0.0, -1.0),
+    "upper_leg": (0.0, 0.0, -1.0),
+    "lower_leg": (0.0, 0.0, -1.0),
+    "foot":      (0.0, 1.0,  0.0),
+    "toe":       (0.0, 1.0,  0.0),
+}
 
 
 def _clear_armature_animation_for_setup(armature_obj):
@@ -464,44 +491,89 @@ def _rotate_pose_bone_world_direction(armature_obj, pose_bone, desired_direction
 
 
 def _apply_neutral_down_setup_pose(armature_obj) -> dict[str, object]:
-    """Pose compatible humanoid arms downward for stable sprite/setup extraction."""
+    """Pose compatible humanoid limbs into a neutral A-pose silhouette.
+
+    Arms hang down, legs are vertical, feet/toes point forward. Used as the
+    sprite/setup pose for source models that don't bring an animation, replacing
+    the bare T/rest pose that produced thin-arm side renders.
+    """
     if armature_obj is None or getattr(armature_obj, "pose", None) is None:
         return {"mode": "none", "posed_bone_count": 0}
 
     _clear_armature_animation_for_setup(armature_obj)
     _reset_armature_pose(armature_obj)
 
-    ordered_roles = {"upper_arm": 0, "forearm": 1, "hand": 2}
+    # Order matters: rotate root segments before their children so the child
+    # rotation is computed against the already-posed parent.
+    role_order = {
+        "upper_arm": 0,
+        "forearm":   1,
+        "hand":      2,
+        "upper_leg": 3,
+        "lower_leg": 4,
+        "foot":      5,
+        "toe":       6,
+    }
+
     candidates = []
     for pose_bone in armature_obj.pose.bones:
         role = _neutral_setup_role(pose_bone.name)
-        if role:
-            candidates.append((ordered_roles.get(role, 99), pose_bone.name, pose_bone))
+        if role and role in _NEUTRAL_ROLE_DIRECTIONS:
+            candidates.append((role_order.get(role, 99), pose_bone.name, role, pose_bone))
     candidates.sort(key=lambda item: (item[0], item[1]))
 
     posed_count = 0
-    for _order, _name, pose_bone in candidates:
+    posed_roles: set[str] = set()
+    for _order, _name, role, pose_bone in candidates:
+        direction = _NEUTRAL_ROLE_DIRECTIONS[role]
         try:
-            if _rotate_pose_bone_world_direction(armature_obj, pose_bone, (0.0, 0.0, -1.0)):
+            if _rotate_pose_bone_world_direction(armature_obj, pose_bone, direction):
                 posed_count += 1
+                posed_roles.add(role)
         except Exception:
             continue
 
     return {
         "mode": "neutral_down",
         "posed_bone_count": posed_count,
-        "posed_roles": sorted({role for role in (_neutral_setup_role(pb.name) for pb in armature_obj.pose.bones) if role}),
+        "posed_roles": sorted(posed_roles),
     }
 
 
-def _should_use_neutral_setup_pose(source_frame=None, use_rest_pose=False) -> bool:
+def _armature_has_pose_action(armature_obj) -> bool:
+    """True if the armature has at least one usable action with pose keyframes."""
+    if armature_obj is None:
+        return False
+    animation_data = getattr(armature_obj, "animation_data", None)
+    if animation_data is not None and animation_data.action is not None:
+        return True
+    try:
+        candidates = [act for act in bpy.data.actions if is_pose_action(act)]
+    except Exception:
+        return False
+    return bool(candidates)
+
+
+def _should_use_neutral_setup_pose(source_frame=None, use_rest_pose=False, armature_obj=None) -> bool:
+    """Decide whether to apply a synthetic A-pose for sprite/setup extraction.
+
+    Trigger conditions:
+      - explicit auto request (source_frame < 0), OR
+      - the armature carries no usable pose action (the previously C++-side
+        heuristic gated this on the Mixamo-default 1..250 frame range, which
+        broke for any other rig and produced thin-arm side renders).
+    use_rest_pose=True still wins — callers that explicitly want the bare rest
+    pose (e.g. debug paths) keep that contract.
+    """
     if use_rest_pose:
         return False
-    return source_frame is not None and int(source_frame) < 0
+    if source_frame is not None and int(source_frame) < 0:
+        return True
+    return not _armature_has_pose_action(armature_obj)
 
 
 def _apply_auto_setup_pose(armature_obj, source_frame=None, use_rest_pose=False) -> dict[str, object]:
-    if _should_use_neutral_setup_pose(source_frame, use_rest_pose):
+    if _should_use_neutral_setup_pose(source_frame, use_rest_pose, armature_obj):
         return _apply_neutral_down_setup_pose(armature_obj)
     return {"mode": "rest_pose" if use_rest_pose else "frame", "posed_bone_count": 0}
 

@@ -513,6 +513,12 @@ def retarget_spine_animation(
         if source_loop_closed:
             _force_spine_clip_loop_closure(clip, source_duration)
 
+        # Surface rig family detection in diagnostics (informational only — the
+        # 2D Spine path doesn't auto-bypass M2M because Spine bone naming is too
+        # ambiguous for safe Mixamo detection; the 3D path in retarget_3d.py is
+        # where the Mixamo fast-path actually fires).
+        from flatrig_retarget_sidecar.rig_identity import detect_rig_family
+
         diagnostics = {
             "backend_label": M2M_LABEL,
             "source_animation_name": animation_name,
@@ -537,6 +543,9 @@ def retarget_spine_animation(
             "output_bvh": bvh_result.output_bvh,
             "bvh_result": dict(bvh_result.diagnostics),
             "result_bone_count": len(clip.get("bones") or {}),
+            "rig_family_source": detect_rig_family(list(source.bones or [])),
+            "rig_family_target": detect_rig_family(list(target.bones or [])),
+            "bypass_reason": None,
         }
         return Motion2MotionSpineRetargetResult(
             animation_name=animation_name,

@@ -13,6 +13,11 @@ from flatrig_retarget_sidecar.motion2motion_retarget import (
     retarget_bvh_to_spine_animation,
     retarget_spine_animation,
 )
+from flatrig_retarget_sidecar.gmr_retarget import (
+    retarget_3d_animations_to_model_gmr,
+    retarget_bvh_to_spine_animation_gmr,
+    retarget_spine_animation_gmr,
+)
 from flatrig_retarget_sidecar.retarget_3d import retarget_3d_animations_to_model
 from flatrig_retarget_sidecar.scene_formats import (
     convert_3d_source,
@@ -44,6 +49,8 @@ def main() -> None:
 
     subparsers.add_parser("probe", help="probe the public sidecar backend")
 
+    backend_choices = ("auto", "m2m", "mixamo", "gmr")
+
     spine_parser = subparsers.add_parser(
         "retarget-spine",
         help="retarget one Spine animation into a target Spine skeleton",
@@ -55,6 +62,7 @@ def main() -> None:
     spine_parser.add_argument("--output", required=True)
     spine_parser.add_argument("--matching-alpha", type=float, default=None)
     spine_parser.add_argument("--mapping-file", default=None)
+    spine_parser.add_argument("--backend", choices=backend_choices, default="auto")
 
     bvh_to_spine_parser = subparsers.add_parser(
         "retarget-bvh-to-spine",
@@ -67,6 +75,7 @@ def main() -> None:
     bvh_to_spine_parser.add_argument("--output", required=True)
     bvh_to_spine_parser.add_argument("--matching-alpha", type=float, default=None)
     bvh_to_spine_parser.add_argument("--mapping-file", default=None)
+    bvh_to_spine_parser.add_argument("--backend", choices=backend_choices, default="auto")
 
     retarget_3d_parser = subparsers.add_parser(
         "retarget-3d-animation-to-model",
@@ -84,6 +93,7 @@ def main() -> None:
     retarget_3d_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
     retarget_3d_parser.add_argument("--force-mapping-review", action="store_true", default=False)
     retarget_3d_parser.add_argument("--include-preview-3d", action="store_true", default=False)
+    retarget_3d_parser.add_argument("--backend", choices=backend_choices, default="auto")
 
     spine_to_json_parser = subparsers.add_parser(
         "spine-to-json",
@@ -217,6 +227,10 @@ def main() -> None:
         return
 
     if args.command == "retarget-spine":
+        if args.backend == "gmr":
+            payload = retarget_spine_animation_gmr()
+            print(json.dumps(payload, indent=2))
+            raise SystemExit(1)
         source = load_spine_package(args.source)
         target = load_spine_package(args.target)
         result = retarget_spine_animation(
@@ -237,6 +251,10 @@ def main() -> None:
         return
 
     if args.command == "retarget-bvh-to-spine":
+        if args.backend == "gmr":
+            payload = retarget_bvh_to_spine_animation_gmr()
+            print(json.dumps(payload, indent=2))
+            raise SystemExit(1)
         target = load_spine_package(args.target)
         result = retarget_bvh_to_spine_animation(
             args.source_bvh,
@@ -256,6 +274,14 @@ def main() -> None:
         return
 
     if args.command == "retarget-3d-animation-to-model":
+        if args.backend == "gmr":
+            payload = retarget_3d_animations_to_model_gmr(
+                args.source,
+                args.target_model,
+                output=args.output,
+            )
+            print(json.dumps(payload, indent=2))
+            raise SystemExit(1)
         result = retarget_3d_animations_to_model(
             args.source,
             args.target_model,
