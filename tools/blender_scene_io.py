@@ -564,41 +564,21 @@ def _apply_neutral_down_setup_pose(armature_obj) -> dict[str, object]:
     }
 
 
-def _armature_has_pose_action(armature_obj) -> bool:
-    """True if the armature has at least one usable action with pose keyframes."""
-    if armature_obj is None:
-        return False
-    animation_data = getattr(armature_obj, "animation_data", None)
-    if animation_data is not None and animation_data.action is not None:
-        return True
-    try:
-        candidates = [act for act in bpy.data.actions if is_pose_action(act)]
-    except Exception:
-        return False
-    return bool(candidates)
-
-
-def _should_use_neutral_setup_pose(source_frame=None, use_rest_pose=False, armature_obj=None) -> bool:
-    """Decide whether to apply a synthetic A-pose for sprite/setup extraction.
-
-    Trigger conditions:
-      - explicit auto request (source_frame < 0), OR
-      - the armature carries no usable pose action (the previously C++-side
-        heuristic gated this on the Mixamo-default 1..250 frame range, which
-        broke for any other rig and produced thin-arm side renders).
-    use_rest_pose=True still wins — callers that explicitly want the bare rest
-    pose (e.g. debug paths) keep that contract.
+def _should_use_neutral_setup_pose(source_frame=None, use_rest_pose=False) -> bool:
+    """Disabled. The synthetic A-pose path was removed on 2026-05-09 — the
+    bind pose now comes exclusively from the input model's first animation
+    frame (or the optimization clip's first frame when the model has none).
+    Kept as a no-op stub so existing callers don't change shape; will be
+    deleted once `_apply_neutral_down_setup_pose` is unreachable from any
+    code path.
     """
-    if use_rest_pose:
-        return False
-    if source_frame is not None and int(source_frame) < 0:
-        return True
-    return not _armature_has_pose_action(armature_obj)
+    return False
 
 
 def _apply_auto_setup_pose(armature_obj, source_frame=None, use_rest_pose=False) -> dict[str, object]:
-    if _should_use_neutral_setup_pose(source_frame, use_rest_pose, armature_obj):
-        return _apply_neutral_down_setup_pose(armature_obj)
+    # The A-pose path is intentionally inactive. We rely on the scene already
+    # being at the chosen render frame (via _select_sprite_render_frame /
+    # _resolve_setup_frame) and don't override pose bones here.
     return {"mode": "rest_pose" if use_rest_pose else "frame", "posed_bone_count": 0}
 
 
@@ -1854,20 +1834,35 @@ def _resolve_action_for_export(armature_obj, animation_names):
 
 
 def _select_sprite_render_frame(armature_obj, source_frame=None) -> int:
+    """Pick the frame used as bind pose for sprite/setup extraction.
+
+    Policy (decided 2026-05-09):
+      * Explicit positive source_frame wins.
+      * Otherwise, return the **first frame** of the input model's action — not
+        a percentage of the duration. The first frame is what the user can
+        guarantee looks good (the previous 35%-of-duration heuristic landed on
+        unpredictable poses and was the original "thin arms" bug).
+      * If no action exists, fall back to scene.frame_start. The intended
+        long-term fallback is the first frame of a curated single-clip
+        optimization animation; that wiring is pending — see
+        TODO(single-clip-optimization) below.
+    """
     if source_frame is not None and int(source_frame) > 0:
         return int(source_frame)
+
+    scene = bpy.context.scene
     if armature_obj is None:
-        scene = bpy.context.scene
         return int(scene.frame_start or 1)
 
     action = _resolve_action_for_export(armature_obj, [])
     if action is not None:
-        start, end = action.frame_range
-        if float(end) > float(start):
-            return int(round(float(start) + (float(end) - float(start)) * 0.35))
+        start, _end = action.frame_range
         return int(round(float(start)))
 
-    scene = bpy.context.scene
+    # TODO(single-clip-optimization): when the curated single optimization clip
+    # is wired through, load its first frame here instead of falling back to
+    # scene.frame_start. This is the path taken when the input model brings no
+    # animation of its own.
     return int(scene.frame_start or 1)
 
 
