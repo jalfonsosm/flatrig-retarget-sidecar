@@ -409,20 +409,19 @@ def _neutral_setup_role(name: str) -> str | None:
         return None
     if "left" not in key and "right" not in key:
         return None
-    # Hands and arms — the original A-pose support.
+    # Arms and hands — straighten in an A-pose-like silhouette so the segmenter
+    # can carve clean part outlines and z-order can resolve front/back arms.
     if "hand" in key or "wrist" in key:
         return "hand"
     if "forearm" in key or "lowerarm" in key:
         return "forearm"
     if "upperarm" in key or "uparm" in key or key.endswith("arm"):
         return "upper_arm"
-    # Legs and feet — newly covered so the A-pose silhouette also straightens
-    # legs/feet (otherwise legs spread or bend when the source rig was authored
-    # with a non-T setup pose, e.g. squat-style rigs).
-    if "toe" in key:
-        return "toe"
-    if "foot" in key or "ankle" in key:
-        return "foot"
+    # Legs straightened too — but NOT feet/toes. Rotating the foot tip in world
+    # space breaks rigs where "forward" isn't a fixed axis (Mixamo, some FBXs
+    # arrive Y-up, others Z-up after Blender's import conversion). Leaving feet
+    # and toes alone preserves whatever orientation the rig author chose, which
+    # is almost always the right one for a static bind pose.
     if "shin" in key or "calf" in key or "lowerleg" in key or "loleg" in key:
         return "lower_leg"
     if "thigh" in key or "upleg" in key or "upperleg" in key or key.endswith("leg"):
@@ -430,19 +429,42 @@ def _neutral_setup_role(name: str) -> str | None:
     return None
 
 
-# Direction (in armature world space) we rotate each limb segment to. Arms point
-# straight down (A-pose silhouette), legs point straight down (vertical stance),
-# and feet point straight forward so toes don't curl. Each entry is a unit-ish
-# vector applied via _rotate_pose_bone_world_direction.
-_NEUTRAL_ROLE_DIRECTIONS: dict[str, tuple[float, float, float]] = {
-    "upper_arm": (0.0, 0.0, -1.0),
-    "forearm":   (0.0, 0.0, -1.0),
-    "hand":      (0.0, 0.0, -1.0),
-    "upper_leg": (0.0, 0.0, -1.0),
-    "lower_leg": (0.0, 0.0, -1.0),
-    "foot":      (0.0, 1.0,  0.0),
-    "toe":       (0.0, 1.0,  0.0),
-}
+def _neutral_setup_side(name: str) -> str | None:
+    key = re.sub(r"[^a-z0-9]+", "", str(name).split(":")[-1].lower())
+    if "left" in key:
+        return "left"
+    if "right" in key:
+        return "right"
+    return None
+
+
+# A-pose direction tables. We use armature world coordinates with the standard
+# Blender post-import convention: +X = right, +Y = forward, +Z = up. Brazos
+# salen hacia abajo y ~30° hacia afuera (silueta A clásica) en lugar de pegados
+# al cuerpo (que era el bug previo: arms hugged the hips). Las piernas se dejan
+# verticales — no se separan — para no quedar en split.
+#
+# sin30 ≈ 0.5, cos30 ≈ 0.866. Vector down-and-outward, normalized.
+_ARM_OUTWARD_LEFT = (-0.5, 0.0, -0.866)
+_ARM_OUTWARD_RIGHT = (0.5, 0.0, -0.866)
+
+
+def _neutral_setup_direction(role: str, side: str | None) -> tuple[float, float, float] | None:
+    """World-space direction the bone tip should point to in the A-pose.
+
+    Returns None when the role/side combo should not be touched (e.g. feet,
+    toes, or a sided role on an unsided bone), in which case the caller skips
+    the rotation entirely.
+    """
+    if role in ("upper_arm", "forearm", "hand"):
+        if side == "left":
+            return _ARM_OUTWARD_LEFT
+        if side == "right":
+            return _ARM_OUTWARD_RIGHT
+        return None
+    if role in ("upper_leg", "lower_leg"):
+        return (0.0, 0.0, -1.0)
+    return None
 
 
 def _clear_armature_animation_for_setup(armature_obj):
@@ -511,21 +533,23 @@ def _apply_neutral_down_setup_pose(armature_obj) -> dict[str, object]:
         "hand":      2,
         "upper_leg": 3,
         "lower_leg": 4,
-        "foot":      5,
-        "toe":       6,
     }
 
     candidates = []
     for pose_bone in armature_obj.pose.bones:
         role = _neutral_setup_role(pose_bone.name)
-        if role and role in _NEUTRAL_ROLE_DIRECTIONS:
-            candidates.append((role_order.get(role, 99), pose_bone.name, role, pose_bone))
+        if role is None:
+            continue
+        side = _neutral_setup_side(pose_bone.name)
+        direction = _neutral_setup_direction(role, side)
+        if direction is None:
+            continue
+        candidates.append((role_order.get(role, 99), pose_bone.name, role, direction, pose_bone))
     candidates.sort(key=lambda item: (item[0], item[1]))
 
     posed_count = 0
     posed_roles: set[str] = set()
-    for _order, _name, role, pose_bone in candidates:
-        direction = _NEUTRAL_ROLE_DIRECTIONS[role]
+    for _order, _name, role, direction, pose_bone in candidates:
         try:
             if _rotate_pose_bone_world_direction(armature_obj, pose_bone, direction):
                 posed_count += 1
