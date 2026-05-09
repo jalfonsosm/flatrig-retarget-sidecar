@@ -1073,12 +1073,32 @@ def bvh_to_preview_3d_animation(
             }
         )
 
+    # Forward the rig's bind pose (head + world rotation per bone, captured in
+    # the user-chosen bind frame) so the native pairwise draw-order resolver
+    # can use the real bind matrix when LBS-skinning sprite vertices, instead
+    # of approximating it from head/tail (which loses the bone roll axis).
+    bind_pose = []
+    for bone in target_metadata.get("bind_pose_3d") or []:
+        if not isinstance(bone, dict):
+            continue
+        name = bone.get("name")
+        head = bone.get("head")
+        rotation = bone.get("world_rotation")
+        if name is None or head is None or rotation is None:
+            continue
+        bind_pose.append({
+            "name": str(name),
+            "head": head,
+            "rotation": rotation,
+        })
+
     return {
         "name": animation_name,
         "duration": round(max(0.0, (frame_count - 1) * frametime), 4),
         "fps": round((1.0 / frametime) if frametime > 0 else 30.0, 4),
         "frame_count": frame_count,
         "frames": frames,
+        "bind_pose": bind_pose,
     }
 
 

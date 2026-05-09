@@ -1990,6 +1990,15 @@ def export_3d_rest_bvh_cli(
         projection_space=projection_space,
         projection_reference_root=None,
     )
+    # Capture the 3D bind pose (head + world rotation per bone) at the same
+    # frame the sprite vertices were extracted from. Native LBS skinning needs
+    # this as the M_bind matrix; deriving it from head/tail alone loses the
+    # bone roll and causes z-fighting on off-axis vertices.
+    bind_pose_3d = extract_bone_hierarchy_3d(
+        armature_obj,
+        source_frame=setup_frame,
+        use_rest_pose=use_rest_pose,
+    )
     # The "rest" BVH that Motion2Motion uses as the target reference must be
     # built from the actual 3D rest pose of the rig, NOT from the bind frame
     # the user picked for sprite rendering. The source BVH (input animation)
@@ -2025,6 +2034,7 @@ def export_3d_rest_bvh_cli(
         "retarget_use_rest_pose": bool(use_rest_pose),
         "view": _view_config_to_json(view_cfg),
         "bones_2d": bones_2d,
+        "bind_pose_3d": bind_pose_3d,
         **layout,
     }
 
@@ -2326,7 +2336,14 @@ def _weights_to_json(weights):
 
 
 def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
-    """Extract 3D bone heads/tails in world space for preview/debug rendering."""
+    """Extract 3D bone heads/tails + world rotations for skinning/preview.
+
+    The `world_rotation` field is a 3x3 row-major matrix giving the bone's
+    world-space orientation in the evaluated pose. Native callers use this as
+    the bind matrix when doing linear blend skinning of sprite vertices —
+    deriving the bind rotation from head/tail alone loses the bone roll, which
+    causes z-fighting on parts whose vertices are off the bone axis.
+    """
     if armature is None:
         return []
 
@@ -2336,16 +2353,25 @@ def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
     scene.frame_set(source_frame)
     bpy.context.view_layer.update()
 
+    armature_world = armature.matrix_world
     bones = []
     for idx, bone_name in enumerate(_topological_sort(armature)):
         rest_bone = armature.data.bones[bone_name]
         pose_bone = armature.pose.bones.get(bone_name)
         if use_rest_pose or pose_bone is None:
-            head_world = armature.matrix_world @ rest_bone.head_local
-            tail_world = armature.matrix_world @ rest_bone.tail_local
+            head_world = armature_world @ rest_bone.head_local
+            tail_world = armature_world @ rest_bone.tail_local
+            # In rest pose the bone matrix is its rest local matrix (in armature
+            # space), so apply armature world to get world rotation.
+            bone_local_matrix = rest_bone.matrix_local
+            world_matrix_3x3 = (armature_world @ bone_local_matrix).to_3x3()
         else:
-            head_world = armature.matrix_world @ pose_bone.head
-            tail_world = armature.matrix_world @ pose_bone.tail
+            head_world = armature_world @ pose_bone.head
+            tail_world = armature_world @ pose_bone.tail
+            # pose_bone.matrix is the bone's transform in armature space for
+            # the current evaluated pose; armature.matrix_world brings it to
+            # world coordinates.
+            world_matrix_3x3 = (armature_world @ pose_bone.matrix).to_3x3()
         bones.append(
             {
                 "name": bone_name,
@@ -2354,6 +2380,7 @@ def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
                 "head": _vector_to_json(head_world),
                 "tail": _vector_to_json(tail_world),
                 "length": float((tail_world - head_world).length),
+                "world_rotation": _matrix3_to_json(world_matrix_3x3),
             }
         )
     return bones
