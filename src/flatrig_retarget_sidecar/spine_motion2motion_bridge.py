@@ -548,10 +548,7 @@ def evaluate_local_pose_map(
         if timelines:
             # Rotation timelines MUST interpolate along the shortest angular
             # path: linear interpolation between e.g. +175° and -175° crosses
-            # 0° (a 350° detour for a 10° real motion), producing a violent
-            # one-frame pose flip after the source is sampled, exported to
-            # BVH and round-tripped through M2M. `angular=True` switches the
-            # interpolator to delta-mod-360.
+            # 0° (a 350° detour for a 10° real motion).
             rotate = sample_timeline(
                 timelines.get("rotate"), ("value", "angle"), time_value, angular=True
             )
@@ -581,6 +578,103 @@ def _shortest_angular_delta(from_value: float, to_value: float) -> float:
     return delta
 
 
+# Number of pre-sample points for cubic Bézier evaluation. Spine's reference
+# runtimes use the same value (10 segments / 11 sample points). Higher
+# numbers improve accuracy at the cost of CPU; this is a per-segment cost
+# that's negligible compared to a Motion2Motion run.
+_BEZIER_SEGMENTS = 10
+
+
+def _cubic_bezier_eval(
+    alpha: float,
+    time_a: float,
+    value_a: float,
+    cx1: float,
+    cy1: float,
+    cx2: float,
+    cy2: float,
+    time_b: float,
+    value_b: float,
+) -> float:
+    """Sample a Spine cubic Bézier curve at fractional position `alpha`.
+
+    Spine stores Bézier control points in ABSOLUTE (time, value) coordinates,
+    so the curve is the cubic Bézier through (time_a, value_a),
+    (cx1, cy1), (cx2, cy2), (time_b, value_b). To convert "I want time t
+    to map to value v" to "what value at parameter u" we need to solve x(u)=t
+    for u. We avoid Newton's method by pre-sampling x(u),y(u) at 11 evenly
+    spaced u values and interpolating linearly between adjacent samples — the
+    same approach Spine's official runtimes use.
+    """
+    target_time = time_a + (time_b - time_a) * alpha
+    if target_time <= time_a:
+        return value_a
+    if target_time >= time_b:
+        return value_b
+
+    # Pre-sample. cubic_bezier(u) = (1-u)^3 * P0 + 3(1-u)^2 u * P1
+    #                              + 3(1-u) u^2 * P2 + u^3 * P3
+    last_time = time_a
+    last_value = value_a
+    for step in range(1, _BEZIER_SEGMENTS + 1):
+        u = step / _BEZIER_SEGMENTS
+        omu = 1.0 - u
+        bx = (
+            omu * omu * omu * time_a
+            + 3.0 * omu * omu * u * cx1
+            + 3.0 * omu * u * u * cx2
+            + u * u * u * time_b
+        )
+        by = (
+            omu * omu * omu * value_a
+            + 3.0 * omu * omu * u * cy1
+            + 3.0 * omu * u * u * cy2
+            + u * u * u * value_b
+        )
+        if bx >= target_time:
+            span = bx - last_time
+            if span <= EPSILON:
+                return by
+            inner_alpha = (target_time - last_time) / span
+            return last_value + (by - last_value) * inner_alpha
+        last_time = bx
+        last_value = by
+    return value_b
+
+
+def _resolve_curve(curve: Any, field_index: int) -> tuple[float, float, float, float] | str | None:
+    """Decode a Spine `curve` entry for the field at `field_index`.
+
+    Returns ('linear' | 'stepped') for special tokens, a 4-tuple of Bézier
+    control points (cx1, cy1, cx2, cy2) for cubic interpolation, or None if
+    the entry doesn't apply (no curve / unknown shape / out of range).
+    """
+    if curve is None:
+        return "linear"
+    if isinstance(curve, str):
+        token = curve.strip().lower()
+        if token in {"linear", "stepped"}:
+            return token
+        return "linear"
+    if isinstance(curve, list):
+        # Spine packs 4 floats per field: [cx1, cy1, cx2, cy2] for the first
+        # field, then the next 4 for the second, etc. Some files pack them
+        # all per field interleaved; the canonical packing is the per-field
+        # block we use here.
+        offset = field_index * 4
+        if len(curve) >= offset + 4:
+            try:
+                return (
+                    float(curve[offset]),
+                    float(curve[offset + 1]),
+                    float(curve[offset + 2]),
+                    float(curve[offset + 3]),
+                )
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 def sample_timeline(
     keys: Any,
     fields: tuple[str, ...],
@@ -603,15 +697,38 @@ def sample_timeline(
         current_time = float(current.get("time", 0.0))
         span = next_time - current_time
         alpha = (time_value - current_time) / span if span > EPSILON else 0.0
+        curve_info = current.get("curve")
         result: dict[str, float] = {}
-        for field in fields:
+        for field_index, field in enumerate(fields):
             current_value = _resolve_key_value(current, field)
             next_value = _resolve_key_value(next_key, field)
+            # For angular interpolation, target uses the shortest delta so
+            # that bezier (and linear) interpolation can't take a 360° detour.
             if angular:
                 delta = _shortest_angular_delta(current_value, next_value)
-                result[field] = current_value + delta * alpha
+                effective_next = current_value + delta
             else:
-                result[field] = current_value + (next_value - current_value) * alpha
+                effective_next = next_value
+
+            curve = _resolve_curve(curve_info, field_index)
+            if curve == "stepped":
+                result[field] = current_value
+            elif isinstance(curve, tuple):
+                cx1, cy1, cx2, cy2 = curve
+                # When using angular shortest-path the bezier control y values
+                # were authored against the wrap-aware target; remapping them
+                # the same way keeps the curve continuous.
+                if angular:
+                    cy1 = current_value + _shortest_angular_delta(current_value, cy1)
+                    cy2 = current_value + _shortest_angular_delta(current_value, cy2)
+                result[field] = _cubic_bezier_eval(
+                    alpha,
+                    current_time, current_value,
+                    cx1, cy1, cx2, cy2,
+                    next_time, effective_next,
+                )
+            else:  # linear (default)
+                result[field] = current_value + (effective_next - current_value) * alpha
         return result
 
     last = keys[-1] or {}

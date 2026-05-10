@@ -9,7 +9,9 @@ from flatrig_retarget_sidecar.spine_import import build_spine_package
 from flatrig_retarget_sidecar.spine_motion2motion_bridge import (
     build_exported_motion2motion_mapping,
     build_sample_times,
+    evaluate_local_pose_map,
     export_spine_animation_to_bvh,
+    sample_timeline,
 )
 
 
@@ -228,6 +230,65 @@ def test_loop_closed_source_closes_retarget_clip() -> None:
     # when one isn't already present at end_time.
     assert arm_keys[-1]["time"] == 1.0
     assert arm_keys[-1]["angle"] == 20.0  # original retargeted value, not overwritten
+
+
+def test_sample_timeline_uses_bezier_curve_when_present() -> None:
+    """Spine animations interpolate between keyframes with cubic Bézier
+    curves, not linear segments. The previous version of `sample_timeline`
+    silently ignored the `curve` field and lerped, causing the source samples
+    fed to Motion2Motion to drift several degrees from what Spine actually
+    renders — visible as 'pose jumps' on the retargeted output. This test
+    pins down the bezier path: a curve with control points that hold value
+    near the start should keep the midpoint close to the start, NOT the
+    linear midpoint.
+    """
+    keys = [
+        {
+            "time": 0.0,
+            "value": 0.0,
+            "angle": 0.0,
+            # Control points keep the value near 0 for most of the segment,
+            # then snap to 100 right before the end. This is the typical
+            # 'ease-out' shape Spine artists use for held poses.
+            "curve": [0.45, 0.0, 0.49, 0.0],
+        },
+        {"time": 1.0, "value": 100.0, "angle": 100.0},
+    ]
+    midpoint = sample_timeline(keys, ("value",), 0.5)
+    assert midpoint is not None
+    # Linear interpolation would give ~50. The bezier with control points
+    # holding low must produce a value SUBSTANTIALLY smaller than 50.
+    # (We measured ~15 with the held-low ease-out curve; allow some slack.)
+    assert midpoint["value"] < 25.0, (
+        f"Bezier midpoint should be small (curve holds near 0); got {midpoint['value']}"
+    )
+
+    # Stepped interpolation should hold the start value until the next key.
+    stepped_keys = [
+        {"time": 0.0, "x": 10.0, "y": 20.0, "curve": "stepped"},
+        {"time": 1.0, "x": 50.0, "y": 90.0},
+    ]
+    sample = sample_timeline(stepped_keys, ("x", "y"), 0.7)
+    assert sample == {"x": 10.0, "y": 20.0}
+
+
+def test_sample_timeline_angular_uses_shortest_path_with_bezier() -> None:
+    """Wrap-around case combined with bezier interpolation: 175° -> -175°
+    should walk the +10° short path, even when the curve has control points
+    that would otherwise generate a 350° detour.
+    """
+    keys = [
+        {"time": 0.0, "value": 175.0, "curve": [0.25, 175.0, 0.75, -175.0]},
+        {"time": 1.0, "value": -175.0},
+    ]
+    midpoint = sample_timeline(keys, ("value",), 0.5, angular=True)
+    assert midpoint is not None
+    # Short angular path: 175 + 10*0.5 = 180. Acceptable range [178, 182]
+    # (bezier may shift slightly due to control points but stays near +180,
+    # not near 0 like the linear-ignoring-wrap path would give).
+    assert 170.0 < midpoint["value"] < 190.0 or midpoint["value"] < -170.0, (
+        f"Angular bezier midpoint should be near ±180°, got {midpoint['value']}"
+    )
 
 
 def test_loop_closure_appends_when_last_key_is_short() -> None:
