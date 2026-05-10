@@ -93,7 +93,7 @@ def main() -> None:
     retarget_3d_parser.add_argument(
         "--scale-blend",
         type=float,
-        default=1.0,
+        default=0.0,
         help="Per-bone stretch blend [0,1]. 0 = no scale (rigid bones, may "
              "disconnect at extremes), 1 = full scale (joints stay attached "
              "but extreme deforms can occur).",

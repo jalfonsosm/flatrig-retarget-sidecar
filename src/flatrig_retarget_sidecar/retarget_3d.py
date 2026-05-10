@@ -66,7 +66,7 @@ def retarget_3d_animations_to_model(
     frame_start: int | None = None,
     frame_end: int | None = None,
     include_preview_3d: bool = False,
-    scale_blend: float = 1.0,
+    scale_blend: float = 0.0,
 ) -> dict[str, Any]:
     """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON.
 
@@ -179,7 +179,7 @@ def _retarget_one_3d_clip(
     frame_start: int | None,
     frame_end: int | None,
     include_preview_3d: bool,
-    scale_blend: float = 1.0,
+    scale_blend: float = 0.0,
 ) -> dict[str, Any]:
     safe_clip_name = _safe_file_stem(clip_name)
     source_bvh = temp_dir / f"source_{safe_clip_name}.bvh"
@@ -843,7 +843,7 @@ def bvh_to_flatrig_animation(
     target_metadata: dict[str, Any],
     *,
     animation_name: str,
-    scale_blend: float = 1.0,
+    scale_blend: float = 0.0,
 ) -> dict[str, Any]:
     """Convert a retargeted BVH into one Spine animation.
 
