@@ -890,53 +890,90 @@ def bvh_to_flatrig_animation(
             tail_3d = head_3d + world_rotation_3d @ tail_offset
             world_head_2d = projection_basis @ head_3d
             world_tail_2d = projection_basis @ tail_3d
-            projected_axis_2d = np.asarray(world_tail_2d - world_head_2d, dtype=np.float64)
-            axis_norm = float(np.linalg.norm(projected_axis_2d))
+            # Keep BOTH the raw segment (with magnitude = current bone length in
+            # 2D) and the unit axis. The original Python pipeline uses the raw
+            # segment divided by the bone's setup_length to derive `scale_x`,
+            # which is what makes children stay attached to their parent's tail
+            # when the parent stretches/contracts in a frame. Dropping the
+            # magnitude (as the previous version did) produced disconnected
+            # joints because the parent's sprite kept its setup length while
+            # the child was placed at the real (longer/shorter) tail position.
+            segment_2d = np.asarray(world_tail_2d - world_head_2d, dtype=np.float64)
+            current_length = float(np.linalg.norm(segment_2d))
             original_name = joint_metadata.get("name")
             setup_bone = setup_bones.get(str(original_name)) if original_name else None
             fallback_axis = _setup_bone_world_axis(setup_bone, setup_bones)
 
-            if axis_norm <= NUMERIC_EPSILON:
-                projected_axis_2d = fallback_axis
-                axis_norm = float(np.linalg.norm(projected_axis_2d))
-            if axis_norm <= NUMERIC_EPSILON:
-                projected_axis_2d = np.array((1.0, 0.0), dtype=np.float64)
-            else:
-                projected_axis_2d = projected_axis_2d / axis_norm
+            if current_length <= NUMERIC_EPSILON:
+                segment_2d = fallback_axis
+                current_length = float(np.linalg.norm(segment_2d))
+            if current_length <= NUMERIC_EPSILON:
+                segment_2d = np.array((1.0, 0.0), dtype=np.float64)
+                current_length = 1.0
+            unit_axis = segment_2d / current_length
+
+            setup_length = float(setup_bone.get("length", 0.0)) if setup_bone else 0.0
+            length_ratio = (
+                current_length / setup_length
+                if setup_length > NUMERIC_EPSILON
+                else 1.0
+            )
 
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
                 local_y = float(world_head_2d[1])
-                local_rotation_deg = math.degrees(
-                    math.atan2(projected_axis_2d[1], projected_axis_2d[0])
-                )
-                world_basis_2d = _build_basis_2d(local_rotation_deg)
+                local_rotation_deg = math.degrees(math.atan2(unit_axis[1], unit_axis[0]))
+                local_scale_x = length_ratio
+                world_basis_2d = _build_basis_2d(local_rotation_deg, local_scale_x)
             else:
                 parent_state = world_cache[parent_index]
                 assert parent_state is not None
+                # Parent's `world_basis_2d` carries the parent's scale (not
+                # orthonormalized) so children inherit the parent stretch
+                # automatically — matching `_compose_world_matrix` in the
+                # original Python implementation.
                 parent_basis = parent_state["world_basis_2d"]
-                # Use the full parent basis for position (matches setup extraction)
                 local_position_2d = _safe_inverse_2x2(parent_basis) @ (
                     world_head_2d - parent_state["head_2d"]
                 )
-                # For rotation, respect inherit mode: NoScale bones use the rigid
-                # (orthonormalized) parent basis, matching extract_bone_hierarchy.
                 inherit_mode = setup_bone.get("inherit", "Normal") if setup_bone else "Normal"
                 if inherit_mode == "NoScale":
                     rotation_basis = _orthonormalize_2x2(parent_basis)
                 else:
                     rotation_basis = parent_basis
-                local_axis = _safe_inverse_2x2(rotation_basis) @ projected_axis_2d
-                local_rotation_deg = math.degrees(math.atan2(local_axis[1], local_axis[0]))
+                # world_x_axis preserves the (current_length / setup_length)
+                # magnitude. Pulling it into local space via inv(rotation_basis)
+                # then yields a vector whose magnitude is the local scale_x:
+                # local_scale_x cancels parent_scale, so total world scale =
+                # parent_scale × local_scale_x = current_length / setup_length.
+                world_x_axis = (
+                    segment_2d / setup_length
+                    if setup_length > NUMERIC_EPSILON
+                    else unit_axis
+                )
+                local_x_axis = _safe_inverse_2x2(rotation_basis) @ world_x_axis
+                local_scale_x = float(np.linalg.norm(local_x_axis))
+                if local_scale_x <= NUMERIC_EPSILON:
+                    local_scale_x = 1.0
+                    unit_local = np.array((1.0, 0.0), dtype=np.float64)
+                else:
+                    unit_local = local_x_axis / local_scale_x
+                local_rotation_deg = math.degrees(math.atan2(unit_local[1], unit_local[0]))
                 local_x = float(local_position_2d[0])
                 local_y = float(local_position_2d[1])
-                world_basis_2d = rotation_basis @ _build_basis_2d(local_rotation_deg)
+                world_basis_2d = rotation_basis @ _build_basis_2d(
+                    local_rotation_deg, local_scale_x
+                )
 
             world_cache[joint_index] = {
                 "head_3d": head_3d,
                 "head_2d": world_head_2d,
                 "world_rotation_3d": world_rotation_3d,
-                "world_basis_2d": _orthonormalize_2x2(world_basis_2d),
+                # Preserve scale in the cached world basis so descendants
+                # inherit the chained scale. The previous orthonormalization
+                # discarded it and was the root cause of the disconnected
+                # joint visuals.
+                "world_basis_2d": world_basis_2d,
                 "original_name": original_name,
             }
 
@@ -945,6 +982,7 @@ def bvh_to_flatrig_animation(
                     "x": local_x,
                     "y": local_y,
                     "rotation": _normalize_angle(local_rotation_deg),
+                    "scale_x": local_scale_x,
                 }
 
         for bone_name, pose in local_cache_2d.items():
@@ -957,7 +995,10 @@ def bvh_to_flatrig_animation(
             previous_rotation_values[bone_name] = rel_rotation
             rel_x = float(pose["x"]) - float(setup_bone.get("x", 0.0))
             rel_y = float(pose["y"]) - float(setup_bone.get("y", 0.0))
-            timelines = track_map.setdefault(bone_name, {"rotate": [], "translate": []})
+            scale_x = float(pose.get("scale_x", 1.0))
+            timelines = track_map.setdefault(
+                bone_name, {"rotate": [], "translate": [], "scale": []}
+            )
             timelines["rotate"].append(
                 {
                     "time": time_value,
@@ -973,16 +1014,32 @@ def bvh_to_flatrig_animation(
                         "y": round(rel_y, 4),
                     }
                 )
+            # Spine bone scale tracks store ABSOLUTE multipliers of the setup
+            # pose. Setup scale is 1.0 (extract_bone_hierarchy never writes
+            # anything else), so emitting the local_scale_x directly is the
+            # correct delta. Skip near-identity values to keep tracks compact.
+            setup_length_value = float(setup_bone.get("length", 0.0))
+            if setup_length_value > NUMERIC_EPSILON and abs(scale_x - 1.0) > 1e-3:
+                timelines["scale"].append(
+                    {
+                        "time": time_value,
+                        "x": round(scale_x, 4),
+                        "y": 1.0,
+                    }
+                )
 
     compressed_bones: dict[str, Any] = {}
     for bone_name, timelines in track_map.items():
         rotate = _compress_timeline_keys(timelines["rotate"], ("angle", "value"), tolerance=0.01)
         translate = _compress_timeline_keys(timelines["translate"], ("x", "y"), tolerance=1e-4)
+        scale = _compress_timeline_keys(timelines.get("scale", []), ("x", "y"), tolerance=1e-3)
         payload: dict[str, Any] = {}
         if rotate:
             payload["rotate"] = rotate
         if translate:
             payload["translate"] = translate
+        if scale:
+            payload["scale"] = scale
         if payload:
             compressed_bones[bone_name] = payload
 
