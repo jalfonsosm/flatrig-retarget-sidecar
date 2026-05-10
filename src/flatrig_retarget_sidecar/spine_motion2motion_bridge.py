@@ -546,7 +546,15 @@ def evaluate_local_pose_map(
         }
         timelines = animation_bones.get(bone.name)
         if timelines:
-            rotate = sample_timeline(timelines.get("rotate"), ("value", "angle"), time_value)
+            # Rotation timelines MUST interpolate along the shortest angular
+            # path: linear interpolation between e.g. +175° and -175° crosses
+            # 0° (a 350° detour for a 10° real motion), producing a violent
+            # one-frame pose flip after the source is sampled, exported to
+            # BVH and round-tripped through M2M. `angular=True` switches the
+            # interpolator to delta-mod-360.
+            rotate = sample_timeline(
+                timelines.get("rotate"), ("value", "angle"), time_value, angular=True
+            )
             if rotate is not None:
                 pose["rotation"] += get_rotate_key_value(rotate)
             translate = sample_timeline(timelines.get("translate"), ("x", "y"), time_value)
@@ -563,10 +571,22 @@ def evaluate_local_pose_map(
     return pose_by_name
 
 
+def _shortest_angular_delta(from_value: float, to_value: float) -> float:
+    """Signed shortest delta in degrees from `from_value` to `to_value`."""
+    delta = float(to_value) - float(from_value)
+    while delta > 180.0:
+        delta -= 360.0
+    while delta < -180.0:
+        delta += 360.0
+    return delta
+
+
 def sample_timeline(
     keys: Any,
     fields: tuple[str, ...],
     time_value: float,
+    *,
+    angular: bool = False,
 ) -> dict[str, float] | None:
     if not isinstance(keys, list) or not keys:
         return None
@@ -583,11 +603,16 @@ def sample_timeline(
         current_time = float(current.get("time", 0.0))
         span = next_time - current_time
         alpha = (time_value - current_time) / span if span > EPSILON else 0.0
-        return {
-            field: _resolve_key_value(current, field)
-            + (_resolve_key_value(next_key, field) - _resolve_key_value(current, field)) * alpha
-            for field in fields
-        }
+        result: dict[str, float] = {}
+        for field in fields:
+            current_value = _resolve_key_value(current, field)
+            next_value = _resolve_key_value(next_key, field)
+            if angular:
+                delta = _shortest_angular_delta(current_value, next_value)
+                result[field] = current_value + delta * alpha
+            else:
+                result[field] = current_value + (next_value - current_value) * alpha
+        return result
 
     last = keys[-1] or {}
     return {field: _resolve_key_value(last, field) for field in fields}
