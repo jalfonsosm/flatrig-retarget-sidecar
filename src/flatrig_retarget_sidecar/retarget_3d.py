@@ -66,8 +66,13 @@ def retarget_3d_animations_to_model(
     frame_start: int | None = None,
     frame_end: int | None = None,
     include_preview_3d: bool = False,
+    scale_blend: float = 1.0,
 ) -> dict[str, Any]:
-    """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON."""
+    """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON.
+
+    `scale_blend` ∈ [0, 1] is forwarded to `bvh_to_flatrig_animation` to
+    control how much per-bone stretch/contraction is emitted.
+    """
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target_model).expanduser().resolve()
     requested_names = [str(name) for name in (animation_names or []) if str(name).strip()]
@@ -113,6 +118,7 @@ def retarget_3d_animations_to_model(
                 frame_start=frame_start,
                 frame_end=frame_end,
                 include_preview_3d=include_preview_3d,
+                scale_blend=scale_blend,
             )
             clip_diagnostics.append(clip_result["diagnostics"])
             target_joint_count = max(
@@ -173,6 +179,7 @@ def _retarget_one_3d_clip(
     frame_start: int | None,
     frame_end: int | None,
     include_preview_3d: bool,
+    scale_blend: float = 1.0,
 ) -> dict[str, Any]:
     safe_clip_name = _safe_file_stem(clip_name)
     source_bvh = temp_dir / f"source_{safe_clip_name}.bvh"
@@ -296,6 +303,7 @@ def _retarget_one_3d_clip(
             retargeted_bvh,
             target_metadata,
             animation_name=clip_name,
+            scale_blend=scale_blend,
         )
         preview_3d = (
             bvh_to_preview_3d_animation(
@@ -835,7 +843,25 @@ def bvh_to_flatrig_animation(
     target_metadata: dict[str, Any],
     *,
     animation_name: str,
+    scale_blend: float = 1.0,
 ) -> dict[str, Any]:
+    """Convert a retargeted BVH into one Spine animation.
+
+    `scale_blend` controls how much of the natural per-bone stretch/contraction
+    (current_length / setup_length) is emitted. 0.0 disables scale entirely
+    and matches the legacy "no scale" behavior — the basis chain is
+    orthonormalized end-to-end and Spine renders every bone at its setup
+    length. 1.0 emits the natural scale fully, which keeps children visually
+    attached to their parents' tail but can produce extreme deformations on
+    weak source motion. Intermediate values lerp the WORLD scale of every
+    bone (`emitted_world = lerp(1, natural_world, blend)`); the local scale
+    relative to the parent is then derived so the chain stays consistent.
+    """
+    blend = float(scale_blend)
+    if blend < 0.0:
+        blend = 0.0
+    elif blend > 1.0:
+        blend = 1.0
     animation = _load_bvh_animation(bvh_path)
     frame_count = int(animation.rotations.shape[0])
     frametime = float(animation.frametime)
@@ -913,25 +939,31 @@ def bvh_to_flatrig_animation(
             unit_axis = segment_2d / current_length
 
             setup_length = float(setup_bone.get("length", 0.0)) if setup_bone else 0.0
-            length_ratio = (
+            # Natural per-bone world scale change in 2D = how much the bone
+            # stretches/contracts in the rendered view vs. its setup length.
+            # Independent of the parent chain.
+            natural_world_scale = (
                 current_length / setup_length
                 if setup_length > NUMERIC_EPSILON
                 else 1.0
             )
+            # Blend with the "no-scale" baseline (1.0). This is the WORLD
+            # scale that we want Spine to reproduce at runtime for this bone.
+            emitted_world_scale = (1.0 - blend) * 1.0 + blend * natural_world_scale
 
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
                 local_y = float(world_head_2d[1])
                 local_rotation_deg = math.degrees(math.atan2(unit_axis[1], unit_axis[0]))
-                local_scale_x = length_ratio
+                local_scale_x = emitted_world_scale  # root: parent_world_scale = 1
                 world_basis_2d = _build_basis_2d(local_rotation_deg, local_scale_x)
             else:
                 parent_state = world_cache[parent_index]
                 assert parent_state is not None
-                # Parent's `world_basis_2d` carries the parent's scale (not
-                # orthonormalized) so children inherit the parent stretch
-                # automatically — matching `_compose_world_matrix` in the
-                # original Python implementation.
+                # Parent's `world_basis_2d` already carries the EMITTED scale
+                # chain. Inverting it gives the position in parent-local
+                # coordinates that Spine will then re-multiply by the same
+                # parent scale at runtime — recovering the real world head.
                 parent_basis = parent_state["world_basis_2d"]
                 local_position_2d = _safe_inverse_2x2(parent_basis) @ (
                     world_head_2d - parent_state["head_2d"]
@@ -941,24 +973,22 @@ def bvh_to_flatrig_animation(
                     rotation_basis = _orthonormalize_2x2(parent_basis)
                 else:
                     rotation_basis = parent_basis
-                # world_x_axis preserves the (current_length / setup_length)
-                # magnitude. Pulling it into local space via inv(rotation_basis)
-                # then yields a vector whose magnitude is the local scale_x:
-                # local_scale_x cancels parent_scale, so total world scale =
-                # parent_scale × local_scale_x = current_length / setup_length.
-                world_x_axis = (
-                    segment_2d / setup_length
-                    if setup_length > NUMERIC_EPSILON
-                    else unit_axis
+                # Local rotation comes from the unit direction projected
+                # through inv(rotation_basis) — independent of any scale.
+                local_axis_dir = _safe_inverse_2x2(rotation_basis) @ unit_axis
+                if float(np.linalg.norm(local_axis_dir)) <= NUMERIC_EPSILON:
+                    local_axis_dir = np.array((1.0, 0.0), dtype=np.float64)
+                local_axis_dir = local_axis_dir / float(np.linalg.norm(local_axis_dir))
+                local_rotation_deg = math.degrees(math.atan2(local_axis_dir[1], local_axis_dir[0]))
+                # Local scale is derived from the EMITTED world scale chain so
+                # parent_world_scale_emitted × local_scale_x = emitted_world_scale.
+                # That keeps the chain coherent for any blend value.
+                parent_world_scale = float(parent_state.get("world_scale_emitted", 1.0))
+                local_scale_x = (
+                    emitted_world_scale / parent_world_scale
+                    if parent_world_scale > NUMERIC_EPSILON
+                    else 1.0
                 )
-                local_x_axis = _safe_inverse_2x2(rotation_basis) @ world_x_axis
-                local_scale_x = float(np.linalg.norm(local_x_axis))
-                if local_scale_x <= NUMERIC_EPSILON:
-                    local_scale_x = 1.0
-                    unit_local = np.array((1.0, 0.0), dtype=np.float64)
-                else:
-                    unit_local = local_x_axis / local_scale_x
-                local_rotation_deg = math.degrees(math.atan2(unit_local[1], unit_local[0]))
                 local_x = float(local_position_2d[0])
                 local_y = float(local_position_2d[1])
                 world_basis_2d = rotation_basis @ _build_basis_2d(
@@ -969,11 +999,10 @@ def bvh_to_flatrig_animation(
                 "head_3d": head_3d,
                 "head_2d": world_head_2d,
                 "world_rotation_3d": world_rotation_3d,
-                # Preserve scale in the cached world basis so descendants
-                # inherit the chained scale. The previous orthonormalization
-                # discarded it and was the root cause of the disconnected
-                # joint visuals.
+                # The cached world basis carries the EMITTED scale chain so
+                # children inherit a consistent ancestry regardless of blend.
                 "world_basis_2d": world_basis_2d,
+                "world_scale_emitted": emitted_world_scale,
                 "original_name": original_name,
             }
 

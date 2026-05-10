@@ -90,6 +90,14 @@ def main() -> None:
     retarget_3d_parser.add_argument("--frame-end", type=int, default=None)
     retarget_3d_parser.add_argument("--mapping-file", default=None)
     retarget_3d_parser.add_argument("--matching-alpha", type=float, default=None)
+    retarget_3d_parser.add_argument(
+        "--scale-blend",
+        type=float,
+        default=1.0,
+        help="Per-bone stretch blend [0,1]. 0 = no scale (rigid bones, may "
+             "disconnect at extremes), 1 = full scale (joints stay attached "
+             "but extreme deforms can occur).",
+    )
     retarget_3d_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
     retarget_3d_parser.add_argument("--force-mapping-review", action="store_true", default=False)
     retarget_3d_parser.add_argument("--include-preview-3d", action="store_true", default=False)
@@ -301,6 +309,7 @@ def main() -> None:
             frame_start=args.frame_start,
             frame_end=args.frame_end,
             include_preview_3d=args.include_preview_3d,
+            scale_blend=args.scale_blend,
         )
         print(json.dumps(result, indent=2))
         if not result.get("ok"):
