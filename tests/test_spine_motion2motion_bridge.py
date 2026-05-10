@@ -221,5 +221,34 @@ def test_loop_closed_source_closes_retarget_clip() -> None:
     _force_spine_clip_loop_closure(clip, 1.0)
 
     arm_keys = clip["bones"]["mixamorig:RightArm"]["rotate"]
+    # Loop closure no longer overwrites a keyframe that already sits at the
+    # end_time — that destroyed real retargeted motion data and produced a
+    # visible jump on the very last frames of every loop. The retargeted
+    # last frame is preserved verbatim; loop closure only ADDS a closing key
+    # when one isn't already present at end_time.
+    assert arm_keys[-1]["time"] == 1.0
+    assert arm_keys[-1]["angle"] == 20.0  # original retargeted value, not overwritten
+
+
+def test_loop_closure_appends_when_last_key_is_short() -> None:
+    """When the retargeted clip ends BEFORE the source loop boundary, the
+    closure adds a fresh key at end_time mirroring the start (regression
+    coverage for the fix that stopped overwriting last frames)."""
+    clip = {
+        "bones": {
+            "mixamorig:RightArm": {
+                "rotate": [
+                    {"time": 0.0, "angle": 25.0, "value": 25.0},
+                    {"time": 0.5, "angle": -15.0, "value": -15.0},
+                    {"time": 0.9, "angle": 12.0, "value": 12.0},
+                ]
+            }
+        }
+    }
+    _force_spine_clip_loop_closure(clip, 1.0)
+    arm_keys = clip["bones"]["mixamorig:RightArm"]["rotate"]
     assert arm_keys[-1]["time"] == 1.0
     assert arm_keys[-1]["angle"] == arm_keys[0]["angle"]
+    assert len(arm_keys) == 4
+    assert arm_keys[-2]["time"] == 0.9
+    assert arm_keys[-2]["angle"] == 12.0  # the real last retargeted frame still sits at 0.9

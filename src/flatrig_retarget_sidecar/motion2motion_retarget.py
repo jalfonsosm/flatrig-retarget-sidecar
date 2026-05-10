@@ -1009,6 +1009,18 @@ def _animation_has_timed_keys(animation_payload: dict[str, Any]) -> bool:
 
 
 def _force_spine_clip_loop_closure(clip: dict[str, Any], duration: float) -> None:
+    """Append a closing keyframe at `duration` mirroring the first keyframe.
+
+    Previously this would also REPLACE an existing keyframe at end_time with
+    the start values, which silently overwrote the last frame produced by the
+    retarget — visible as a jump at the end of the loop because the retarget's
+    last frame might disagree with the first frame by a non-trivial amount.
+    Now we only ADD a closing keyframe when none is already present near
+    end_time; the retarget's own last frame is always preserved. The loop may
+    not be perfectly closed in that case (Spine will jump from the real last
+    value back to the start at loop boundary), which is the lesser evil
+    compared to discarding retargeted motion data.
+    """
     if duration <= NUMERIC_EPSILON:
         return
     end_time = round(float(duration), 4)
@@ -1025,11 +1037,12 @@ def _force_spine_clip_loop_closure(clip: dict[str, Any], duration: float) -> Non
             }
             if not start_key:
                 continue
-            end_key = {"time": end_time, **start_key}
             if abs(float((keys[-1] or {}).get("time", 0.0)) - end_time) <= 1e-4:
-                keys[-1] = end_key
-            else:
-                keys.append(end_key)
+                # A keyframe already exists at the loop boundary — keep the
+                # retargeted values intact even if they don't perfectly match
+                # the start key.
+                continue
+            keys.append({"time": end_time, **start_key})
 
 
 def _scan_animation_duration(animation_payload: dict[str, Any]) -> float:
@@ -1150,12 +1163,24 @@ def _compress_timeline_keys(
     *,
     tolerance: float,
 ) -> list[dict[str, float]]:
+    """Drop keyframes whose value is essentially the same as both real neighbors.
+
+    The previous version compared against `result[-1]` (the last KEPT key) and
+    `keys[index+1]` (the next RAW key). With slow drift between frames each
+    `current` would still be within tolerance of the (unchanged) last-kept
+    key, so the algorithm could drop arbitrarily many consecutive frames.
+    Spine then interpolates linearly across those deleted frames and the
+    animation loses motion detail in chunks — visually a "jump" of several
+    frames. Comparing against the REAL immediate neighbors fixes that:
+    a key only gets dropped when its true predecessor, itself and successor
+    are nearly identical, i.e. when the local motion really is flat.
+    """
     if len(keys) <= 2:
         return list(keys)
 
     result = [keys[0]]
     for index in range(1, len(keys) - 1):
-        previous = result[-1]
+        previous = keys[index - 1]
         current = keys[index]
         next_key = keys[index + 1]
         if all(
