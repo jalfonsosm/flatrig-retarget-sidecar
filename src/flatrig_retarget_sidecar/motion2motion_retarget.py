@@ -806,6 +806,22 @@ def bvh_to_spine_animation(
     frametime = float(animation.frametime)
     parents = list(animation.parents)
     names = [str(name) for name in animation.names]
+    # Slot bones: ordered list of (slot_index, slot_name, bone_spine_name).
+    # Used at the end of the loop to build a per-frame drawOrder timeline so
+    # sprites swap layer when the rig's left/right limbs cross the camera
+    # axis. Without this the rear sprite stays behind in the static slot
+    # order and the animation looks like the crossing leg "bounces back" or
+    # "doesn't touch the ground" — exactly the user-reported symptom.
+    slot_bones: list[tuple[int, str, str]] = []
+    for slot_index, slot in enumerate(target_package.slots or []):
+        slot_name = getattr(slot, "name", None)
+        bone_name = getattr(slot, "bone", None) or getattr(slot, "bone_name", None)
+        if isinstance(slot_name, str) and isinstance(bone_name, str):
+            slot_bones.append((slot_index, slot_name, bone_name))
+    # Per frame we'll record the depth (camera-axis projection) of each slot's
+    # bone. We compute the proper sign once from the setup pose so the
+    # ordering convention adapts to whichever side the camera looks at.
+    slot_depths_per_frame: list[dict[str, float]] = []
     offsets = np.asarray(animation.offsets, dtype=np.float64)
     positions = np.asarray(animation.positions, dtype=np.float64)
     rotations = np.asarray(animation.rotations, dtype=np.float64)
@@ -898,6 +914,26 @@ def bvh_to_spine_animation(
                 "rotation": _normalize_angle(local_rotation_deg),
             }
 
+        # Snapshot the depth of every slot bone for this frame. Depth here is
+        # the world X coordinate of the bone (the lateral axis in the rig's
+        # world space, perpendicular to the side-view camera). The sign is
+        # normalized later from the setup pose so we don't have to know the
+        # camera orientation up front.
+        per_slot_depth: dict[str, float] = {}
+        for _slot_index, slot_name, bone_name in slot_bones:
+            depth: float | None = None
+            for joint_index, bvh_name in enumerate(names):
+                cached = world_cache[joint_index]
+                if cached is None or cached.get("spine_name") != bone_name:
+                    continue
+                head_3d = cached.get("head_3d")
+                if head_3d is not None:
+                    depth = float(head_3d[0])
+                break
+            if depth is not None:
+                per_slot_depth[slot_name] = depth
+        slot_depths_per_frame.append(per_slot_depth)
+
         for spine_name, pose in local_cache_2d.items():
             setup_bone = target_bone_lookup[spine_name]
             raw_rotation = float(pose["rotation"]) - float(setup_bone.rotation)
@@ -940,7 +976,115 @@ def bvh_to_spine_animation(
             payload["translate"] = translate
         if payload:
             compressed_bones[spine_name] = payload
-    return {"bones": compressed_bones}
+
+    draw_order_timeline = _build_dynamic_draw_order_timeline(
+        slot_bones=slot_bones,
+        slot_depths_per_frame=slot_depths_per_frame,
+        target_package=target_package,
+        frametime=frametime,
+    )
+    result: dict[str, Any] = {"bones": compressed_bones}
+    if draw_order_timeline:
+        result["drawOrder"] = draw_order_timeline
+    return result
+
+
+def _build_dynamic_draw_order_timeline(
+    *,
+    slot_bones: list[tuple[int, str, str]],
+    slot_depths_per_frame: list[dict[str, float]],
+    target_package: SpinePackage,
+    frametime: float,
+) -> list[dict[str, Any]]:
+    """Build a per-frame drawOrder track that swaps slots when their bones
+    cross each other along the camera-facing axis.
+
+    Without this the appended Spine animation inherits the static slot order
+    of the setup pose, so when the rear leg's bone crosses in front of the
+    front leg's bone (or any pair of slots crosses), the rear sprite stays
+    visually behind — the user perceives this as the crossing limb "bouncing
+    back" or "not touching the ground". The convention sign is auto-detected
+    from the setup pose so this works regardless of which side the camera
+    looks at.
+    """
+    if not slot_bones or not slot_depths_per_frame:
+        return []
+
+    # Detect the camera-axis sign by counting which sign of X best agrees
+    # with the setup slot order in the FIRST frame: the more pairs that come
+    # out in the same order as the setup, the better the chosen sign. This
+    # adapts to rigs viewed from either side without hardcoding orientation.
+    if not slot_depths_per_frame:
+        return []
+    first_depths = slot_depths_per_frame[0]
+    setup_order = [(idx, name) for idx, name, _ in slot_bones]
+
+    def order_agreement(sign: float) -> int:
+        # Count how many adjacent setup pairs are kept in order when sorted
+        # by sign * depth.
+        ordered = sorted(
+            setup_order,
+            key=lambda item: (
+                sign * first_depths.get(item[1], float(item[0])),
+                item[0],
+            ),
+        )
+        ordered_indices = [idx for idx, _ in ordered]
+        # Number of inversions vs. the identity (setup) order.
+        agreements = 0
+        for i, idx in enumerate(ordered_indices):
+            if idx == i:
+                agreements += 1
+        return agreements
+
+    sign = +1.0 if order_agreement(+1.0) >= order_agreement(-1.0) else -1.0
+
+    timeline: list[dict[str, Any]] = []
+    previous_offsets: dict[str, int] | None = None
+    for frame_index, depths in enumerate(slot_depths_per_frame):
+        # Order the slots by depth (back-to-front). Slots without depth fall
+        # back to their setup index so they keep their original layer.
+        def slot_depth(item: tuple[int, str]) -> tuple[float, int]:
+            idx, name = item
+            depth = depths.get(name)
+            if depth is None:
+                return (float(idx), idx)  # stable fallback by setup index
+            return (sign * depth, idx)
+
+        ordered = sorted(setup_order, key=slot_depth)
+        # Compute offset = new_position - setup_position. Spine's drawOrder
+        # only requires entries whose offset is non-zero.
+        new_position_by_slot: dict[str, int] = {}
+        for new_pos, (_orig_idx, name) in enumerate(ordered):
+            new_position_by_slot[name] = new_pos
+        offsets: dict[str, int] = {}
+        for slot_index, slot_name in setup_order:
+            new_pos = new_position_by_slot[slot_name]
+            delta = new_pos - slot_index
+            if delta != 0:
+                offsets[slot_name] = delta
+
+        # Skip emission when nothing changed since the previous keyframe; Spine
+        # holds the previous drawOrder until the next key.
+        if offsets == previous_offsets:
+            continue
+        previous_offsets = offsets
+
+        offsets_payload = [
+            {"slot": name, "offset": offset}
+            for name, offset in sorted(offsets.items())
+        ]
+        timeline.append(
+            {
+                "time": round(frame_index * frametime, 4),
+                "offsets": offsets_payload,
+            }
+        )
+
+    # If the timeline never deviates from setup, don't emit it.
+    if all(not entry.get("offsets") for entry in timeline):
+        return []
+    return timeline
 
 
 def _resolve_target_package_with_exemplar(
