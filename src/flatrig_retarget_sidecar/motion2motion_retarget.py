@@ -505,10 +505,20 @@ def retarget_spine_animation(
             output_bvh=retargeted_bvh_path,
             matching_alpha=matching_alpha,
         )
+        # Build the set of TARGET spine bone names that the user actually paired
+        # in the joint mapping. M2M synthesizes rotations for every joint of
+        # the target rig, but the unmapped ones (e.g. fingers, toes when only
+        # the main biped chain was paired) are noise — they don't correspond
+        # to any source bone, so they jitter and bleed into sprite skinning.
+        # Restricting emission to mapped bones keeps the rest at setup pose.
+        mapped_target_bones = _resolve_mapped_target_spine_bones(
+            mapping_payload, target_metadata
+        )
         clip = bvh_to_spine_animation(
             retargeted_bvh_path,
             target_package,
             target_metadata,
+            mapped_target_bones=mapped_target_bones,
         )
         if source_loop_closed:
             _force_spine_clip_loop_closure(clip, source_duration)
@@ -689,10 +699,14 @@ def retarget_bvh_to_spine_animation(
             output_bvh=retargeted_bvh_path,
             matching_alpha=matching_alpha,
         )
+        mapped_target_bones = _resolve_mapped_target_spine_bones(
+            mapping_payload, target_metadata
+        )
         clip = bvh_to_spine_animation(
             retargeted_bvh_path,
             target_package,
             target_metadata,
+            mapped_target_bones=mapped_target_bones,
         )
 
         diagnostics = {
@@ -723,11 +737,68 @@ def retarget_bvh_to_spine_animation(
         )
 
 
+def _resolve_mapped_target_spine_bones(
+    mapping_payload: dict[str, Any],
+    target_metadata: ExportedSpineBvh,
+) -> set[str]:
+    """Translate the joint-mapping editor's target names to spine bone names.
+
+    The mapping payload stores target joints by their Motion2Motion-sanitized
+    `matching_name` (e.g. "mixamorig_Hips" — colon stripped). Spine animations
+    reference bones by their original name (e.g. "mixamorig:Hips"). This
+    helper walks the target_metadata.joints catalog to convert one set into
+    the other so the bvh→spine converter can filter on spine bone names.
+    """
+    matching_to_spine: dict[str, str] = {}
+    for joint in target_metadata.joints:
+        if joint.spine_name and joint.matching_name:
+            matching_to_spine[str(joint.matching_name)] = str(joint.spine_name)
+
+    mapped: set[str] = set()
+    for pair in mapping_payload.get("mapping") or []:
+        target_name = (
+            pair.get("target")
+            if isinstance(pair, dict)
+            else (pair[1] if isinstance(pair, (list, tuple)) and len(pair) > 1 else None)
+        )
+        if not target_name:
+            continue
+        target_name = str(target_name)
+        spine_name = matching_to_spine.get(target_name)
+        if spine_name is None:
+            # Some mapping files already store spine names directly (e.g. when
+            # the user authored them by hand); accept those too.
+            spine_name = target_name
+        mapped.add(spine_name)
+
+    # The root joint (if any) should also be considered mapped — it's the
+    # implicit pinning point of the retarget.
+    root_matching = mapping_payload.get("root_joint")
+    if isinstance(root_matching, str):
+        mapped.add(matching_to_spine.get(root_matching, root_matching))
+    return mapped
+
+
 def bvh_to_spine_animation(
     bvh_path: str | Path,
     target_package: SpinePackage,
     target_metadata: ExportedSpineBvh,
+    *,
+    mapped_target_bones: set[str] | None = None,
 ) -> dict[str, Any]:
+    """Convert a retargeted BVH to a Spine animation clip.
+
+    `mapped_target_bones` lists the target spine bone names that were
+    explicitly paired in the joint mapping editor. Bones NOT in this set
+    receive a "best guess" rotation from Motion2Motion (it has to fill in
+    every joint of the target rig), but those guesses are noise — there's no
+    source motion driving them. They surface as one-frame jitter on bones
+    like fingers and toes, which then leaks into sprites that share weights
+    with those bones (skinning blends parent + unmapped child motion). To
+    keep the animation faithful to what the user actually mapped, we skip
+    keyframe emission for unmapped bones — Spine then holds them at setup
+    pose. Pass None to keep the legacy behaviour and emit every bone.
+    """
     animation = _load_bvh_animation(bvh_path)
     joint_metadata_by_bvh_name = {joint.bvh_name: joint for joint in target_metadata.joints}
     target_bone_lookup = target_package.bones_by_name
@@ -814,6 +885,12 @@ def bvh_to_spine_animation(
                 "spine_name": spine_name,
             }
             if not spine_name or spine_name not in target_bone_lookup:
+                continue
+            # Skip bones that the user didn't explicitly pair in the mapping
+            # editor. Their values would be Motion2Motion guesses driven by no
+            # actual source motion — visible as jitter that bleeds into sprite
+            # skinning. The bone stays at setup pose in Spine.
+            if mapped_target_bones is not None and spine_name not in mapped_target_bones:
                 continue
             local_cache_2d[spine_name] = {
                 "x": local_x,
