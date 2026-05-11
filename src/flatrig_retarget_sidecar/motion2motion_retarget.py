@@ -484,10 +484,12 @@ def retarget_spine_animation(
                 "force_mapping_review": force_mapping_review,
                 "mapping_mode": "manual" if mapping_file else "auto",
                 "mapping_file": str(Path(mapping_file).expanduser()) if mapping_file else None,
+                "mapping_metadata": mapping_payload.get("metadata") or {},
                 "source_bone_count": source_bone_count,
                 "target_bone_count": target_bone_count,
                 "source_source_label": source.source_label,
                 "target_source_label": target.source_label,
+                "preflight_mapping_review": True,
             },
         )
 
