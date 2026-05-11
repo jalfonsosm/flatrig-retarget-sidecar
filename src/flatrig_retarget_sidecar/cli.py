@@ -62,6 +62,8 @@ def main() -> None:
     spine_parser.add_argument("--output", required=True)
     spine_parser.add_argument("--matching-alpha", type=float, default=None)
     spine_parser.add_argument("--mapping-file", default=None)
+    spine_parser.add_argument("--force-mapping-review", action="store_true", default=False)
+    spine_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
     spine_parser.add_argument("--backend", choices=backend_choices, default="auto")
 
     bvh_to_spine_parser = subparsers.add_parser(
@@ -291,6 +293,8 @@ def main() -> None:
             target_animation_name=args.target_animation,
             matching_alpha=args.matching_alpha,
             mapping_file=args.mapping_file,
+            force_mapping_review=args.force_mapping_review,
+            mapping_quality_threshold=args.mapping_quality_threshold,
         )
         output_path = Path(args.output).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)

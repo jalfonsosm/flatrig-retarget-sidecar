@@ -442,6 +442,8 @@ def retarget_spine_animation(
     target_animation_name: str | None = None,
     matching_alpha: float | None = None,
     mapping_file: str | Path | None = None,
+    force_mapping_review: bool = False,
+    mapping_quality_threshold: float = 0.55,
 ) -> Motion2MotionSpineRetargetResult:
     if animation_name not in source.animations:
         available = ", ".join(sorted(source.animations)) or "<none>"
@@ -456,6 +458,38 @@ def retarget_spine_animation(
         target,
         mapping_file=mapping_file,
     )
+
+    mapping_pair_count = len(mapping_payload.get("mapping") or [])
+    source_bone_count = len([b for b in (source.bones or []) if isinstance(b, dict)])
+    target_bone_count = len([b for b in (target.bones or []) if isinstance(b, dict)])
+    expected_pairs = max(1, min(12, source_bone_count, target_bone_count))
+    coverage = min(1.0, mapping_pair_count / expected_pairs) if not mapping_file else 1.0
+    mapping_quality = coverage
+    mapping_review_required = bool(
+        force_mapping_review or mapping_quality < mapping_quality_threshold
+    )
+    if mapping_review_required:
+        return Motion2MotionSpineRetargetResult(
+            animation_name=animation_name,
+            animation={},
+            diagnostics={
+                "backend_label": M2M_LABEL,
+                "mapping_review_required": True,
+                "mapping_payload": mapping_payload,
+                "mapping_pairs": list(mapping_payload.get("mapping") or []),
+                "mapping_pair_count": mapping_pair_count,
+                "mapping_root_joint": mapping_payload.get("root_joint"),
+                "mapping_quality_score": round(mapping_quality, 4),
+                "mapping_quality_threshold": mapping_quality_threshold,
+                "force_mapping_review": force_mapping_review,
+                "mapping_mode": "manual" if mapping_file else "auto",
+                "mapping_file": str(Path(mapping_file).expanduser()) if mapping_file else None,
+                "source_bone_count": source_bone_count,
+                "target_bone_count": target_bone_count,
+                "source_source_label": source.source_label,
+                "target_source_label": target.source_label,
+            },
+        )
 
     (
         target_package,
