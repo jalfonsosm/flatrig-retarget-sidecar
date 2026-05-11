@@ -1134,37 +1134,16 @@ def bvh_to_flatrig_animation(
                 "original_name": original_name,
             }
 
-            # Decompose the projected Y axis of the bone to extract the
-            # natural scale_y and shear_y. Both come from the 3D bone matrix
-            # projected to 2D and then pulled through the parent's rigid
-            # basis (so children measure their local DOFs against the parent's
-            # orientation, not its scale chain).
-            y_axis_world_3d = world_rotation_3d[:, 1]
-            y_axis_world_2d = projection_basis @ y_axis_world_3d
-            if parent_index < 0:
-                y_axis_local_2d = y_axis_world_2d
-            else:
-                # Rebuild the parent's RIGID (orthonormal) basis once for
-                # decomposition; we already have it via _orthonormalize_2x2
-                # in the rotation_basis when inherit_mode is NoScale, but
-                # for inherit_mode == "Normal" we computed `rotation_basis`
-                # from the parent_basis with scale. Use orthonormalized one
-                # explicitly to get a meaningful local_y magnitude.
-                parent_state = world_cache[parent_index]
-                rigid_parent = _orthonormalize_2x2(parent_state["world_basis_2d"])
-                y_axis_local_2d = _safe_inverse_2x2(rigid_parent) @ y_axis_world_2d
-            scale_y_natural = float(np.linalg.norm(y_axis_local_2d))
-            if scale_y_natural <= NUMERIC_EPSILON:
-                scale_y_natural = 1.0
-                shear_y_natural_deg = 0.0
-            else:
-                y_unit = y_axis_local_2d / scale_y_natural
-                y_angle_deg = math.degrees(math.atan2(float(y_unit[1]), float(y_unit[0])))
-                # Shear_y is the deviation of the Y axis from rotation+90°
-                # (the "natural" perpendicular to X). Wrapped to [-180, 180].
-                shear_y_natural_deg = _normalize_angle(
-                    y_angle_deg - float(local_rotation_deg) - 90.0
-                )
+            # scale_y and shear are NOT derived from the 3D rotation matrix
+            # projection (the Y axis maps to zero in the default front view,
+            # producing extreme deformations).  The reference Python project
+            # derives them from mesh vertex data via an error-minimising
+            # solver; the sidecar has no mesh, so the "natural" values are
+            # identity.  The _refine_scale_series infrastructure (clamp,
+            # smoothness, regularization) stays ready for the GMR backend
+            # which will supply meaningful natural values from 3D mesh data.
+            scale_y_natural = 1.0
+            shear_y_natural_deg = 0.0
 
             if original_name and str(original_name) in setup_bones:
                 bone_key = str(original_name)
