@@ -98,6 +98,49 @@ def main() -> None:
              "disconnect at extremes), 1 = full scale (joints stay attached "
              "but extreme deforms can occur).",
     )
+    retarget_3d_parser.add_argument(
+        "--scale-x-blend",
+        type=float,
+        default=None,
+        help="Per-bone stretch blend along bone axis [0,1]. "
+             "None = use --scale-blend value.",
+    )
+    retarget_3d_parser.add_argument(
+        "--scale-y-blend",
+        type=float,
+        default=0.0,
+        help="Volume-preservation Y scale blend [0,1].",
+    )
+    retarget_3d_parser.add_argument(
+        "--shear-blend",
+        type=float,
+        default=0.0,
+        help="Y-axis shear blend from 3D projection [0,1].",
+    )
+    retarget_3d_parser.add_argument(
+        "--scale-min",
+        type=float,
+        default=0.35,
+        help="Hard clamp minimum for scale values (default 0.35).",
+    )
+    retarget_3d_parser.add_argument(
+        "--scale-max",
+        type=float,
+        default=2.85,
+        help="Hard clamp maximum for scale values (default 2.85).",
+    )
+    retarget_3d_parser.add_argument(
+        "--scale-temporal-smoothness",
+        type=float,
+        default=0.35,
+        help="Frame-to-frame smoothness penalty for scale (0 = no smoothing).",
+    )
+    retarget_3d_parser.add_argument(
+        "--scale-regularization",
+        type=float,
+        default=0.2,
+        help="Pull scale toward identity (1.0). 0 = no regularization.",
+    )
     retarget_3d_parser.add_argument("--mapping-quality-threshold", type=float, default=0.55)
     retarget_3d_parser.add_argument("--force-mapping-review", action="store_true", default=False)
     retarget_3d_parser.add_argument("--include-preview-3d", action="store_true", default=False)
@@ -310,6 +353,13 @@ def main() -> None:
             frame_end=args.frame_end,
             include_preview_3d=args.include_preview_3d,
             scale_blend=args.scale_blend,
+            scale_x_blend=args.scale_x_blend,
+            scale_y_blend=args.scale_y_blend,
+            shear_blend=args.shear_blend,
+            scale_min=args.scale_min,
+            scale_max=args.scale_max,
+            scale_temporal_smoothness=args.scale_temporal_smoothness,
+            scale_regularization=args.scale_regularization,
         )
         print(json.dumps(result, indent=2))
         if not result.get("ok"):

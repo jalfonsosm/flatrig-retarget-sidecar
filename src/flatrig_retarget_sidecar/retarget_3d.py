@@ -67,11 +67,25 @@ def retarget_3d_animations_to_model(
     frame_end: int | None = None,
     include_preview_3d: bool = False,
     scale_blend: float = 0.0,
+    scale_x_blend: float | None = None,
+    scale_y_blend: float = 0.0,
+    shear_blend: float = 0.0,
+    scale_min: float = 0.35,
+    scale_max: float = 2.85,
+    scale_temporal_smoothness: float = 0.35,
+    scale_regularization: float = 0.2,
 ) -> dict[str, Any]:
     """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON.
 
-    `scale_blend` ∈ [0, 1] is forwarded to `bvh_to_flatrig_animation` to
-    control how much per-bone stretch/contraction is emitted.
+    Scale/shear controls forwarded to `bvh_to_flatrig_animation`:
+    - `scale_x_blend`: per-bone stretch along bone axis [0,1] (defaults to scale_blend for backward compat)
+    - `scale_y_blend`: volume-preservation Y scale blend [0,1]
+    - `shear_blend`: Y-axis shear blend from 3D projection [0,1]
+    - `scale_min`/`scale_max`: hard clamp on scale values (default 0.35..2.85)
+    - `scale_temporal_smoothness`: frame-to-frame delta penalty (default 0.35)
+    - `scale_regularization`: pull toward identity (default 0.2)
+
+    `scale_blend` ∈ [0, 1] is kept as a backward-compat alias for `scale_x_blend`.
     """
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target_model).expanduser().resolve()
@@ -119,6 +133,13 @@ def retarget_3d_animations_to_model(
                 frame_end=frame_end,
                 include_preview_3d=include_preview_3d,
                 scale_blend=scale_blend,
+                scale_x_blend=scale_x_blend,
+                scale_y_blend=scale_y_blend,
+                shear_blend=shear_blend,
+                scale_min=scale_min,
+                scale_max=scale_max,
+                scale_temporal_smoothness=scale_temporal_smoothness,
+                scale_regularization=scale_regularization,
             )
             clip_diagnostics.append(clip_result["diagnostics"])
             target_joint_count = max(
@@ -180,6 +201,13 @@ def _retarget_one_3d_clip(
     frame_end: int | None,
     include_preview_3d: bool,
     scale_blend: float = 0.0,
+    scale_x_blend: float | None = None,
+    scale_y_blend: float = 0.0,
+    shear_blend: float = 0.0,
+    scale_min: float = 0.35,
+    scale_max: float = 2.85,
+    scale_temporal_smoothness: float = 0.35,
+    scale_regularization: float = 0.2,
 ) -> dict[str, Any]:
     safe_clip_name = _safe_file_stem(clip_name)
     source_bvh = temp_dir / f"source_{safe_clip_name}.bvh"
@@ -304,6 +332,13 @@ def _retarget_one_3d_clip(
             target_metadata,
             animation_name=clip_name,
             scale_blend=scale_blend,
+            scale_x_blend=scale_x_blend,
+            scale_y_blend=scale_y_blend,
+            shear_blend=shear_blend,
+            scale_min=scale_min,
+            scale_max=scale_max,
+            scale_temporal_smoothness=scale_temporal_smoothness,
+            scale_regularization=scale_regularization,
         )
         preview_3d = (
             bvh_to_preview_3d_animation(
@@ -838,30 +873,113 @@ def build_generic_skeleton_from_exported_3d_metadata(
     )
 
 
+def _lerp_scalar(a: float, b: float, t: float) -> float:
+    return float(a) + (float(b) - float(a)) * float(t)
+
+
+def _refine_scale_series(
+    natural: np.ndarray,
+    *,
+    identity: float,
+    clamp_min: float,
+    clamp_max: float,
+    regularization: float,
+    temporal_smoothness: float,
+) -> np.ndarray:
+    """Smooth, regularize and clamp a per-frame natural scale/shear buffer.
+
+    Direct port of the spirit of `_solve_temporal_scale_series` from the
+    Python reference. Solves a tridiagonal system that minimises:
+        Σ (refined_i - natural_i)²        (data fidelity)
+      + regularization · Σ (refined_i - identity)²
+      + temporal_smoothness · Σ (refined_{i+1} - refined_i)²
+    then clamps the result to [clamp_min, clamp_max].
+
+    Returns the refined series of the same length as `natural`.
+    """
+    natural = np.asarray(natural, dtype=np.float64)
+    count = natural.shape[0]
+    if count == 0:
+        return natural
+    if regularization <= 0.0 and temporal_smoothness <= 0.0:
+        return np.clip(natural, clamp_min, clamp_max)
+
+    matrix = np.zeros((count, count), dtype=np.float64)
+    diagonal = np.ones(count, dtype=np.float64) + float(regularization)
+    rhs = natural.copy() + float(regularization) * float(identity)
+
+    if count > 1 and temporal_smoothness > 0.0:
+        diagonal[0] += temporal_smoothness
+        diagonal[-1] += temporal_smoothness
+        if count > 2:
+            diagonal[1:-1] += 2.0 * temporal_smoothness
+        for index in range(count - 1):
+            matrix[index, index + 1] = -temporal_smoothness
+            matrix[index + 1, index] = -temporal_smoothness
+
+    np.fill_diagonal(matrix, diagonal + 1e-8)
+    try:
+        solved = np.linalg.solve(matrix, rhs)
+    except np.linalg.LinAlgError:
+        solved = natural
+    return np.clip(solved, clamp_min, clamp_max)
+
+
 def bvh_to_flatrig_animation(
     bvh_path: str | Path,
     target_metadata: dict[str, Any],
     *,
     animation_name: str,
     scale_blend: float = 0.0,
+    scale_x_blend: float | None = None,
+    scale_y_blend: float = 0.0,
+    shear_blend: float = 0.0,
+    scale_min: float = 0.35,
+    scale_max: float = 2.85,
+    scale_temporal_smoothness: float = 0.35,
+    scale_regularization: float = 0.2,
 ) -> dict[str, Any]:
     """Convert a retargeted BVH into one Spine animation.
 
-    `scale_blend` controls how much of the natural per-bone stretch/contraction
-    (current_length / setup_length) is emitted. 0.0 disables scale entirely
-    and matches the legacy "no scale" behavior — the basis chain is
-    orthonormalized end-to-end and Spine renders every bone at its setup
-    length. 1.0 emits the natural scale fully, which keeps children visually
-    attached to their parents' tail but can produce extreme deformations on
-    weak source motion. Intermediate values lerp the WORLD scale of every
-    bone (`emitted_world = lerp(1, natural_world, blend)`); the local scale
-    relative to the parent is then derived so the chain stays consistent.
+    Three independent per-bone DOF blends, each in [0, 1]:
+
+    - `scale_x_blend`: how much of the natural per-bone stretch
+      (current_length / setup_length) along the bone axis is emitted.
+      0 = bone keeps its setup length (rigid, joints can detach when the
+      source rig stretches), 1 = full natural stretch (joints stay attached
+      but extreme deformations possible). `scale_blend` is kept as a
+      back-compat alias for `scale_x_blend`.
+    - `scale_y_blend`: how much volume-preservation scaling along the bone's
+      Y axis is emitted. The natural scale_y is derived from decomposing the
+      projected 3D bone basis (rotation × scale × shear). Helps reduce
+      sprite squashing when scale_x changes.
+    - `shear_blend`: how much shear_y is emitted. Captures the Y-axis tilt
+      that emerges when 3D bones rotate out of the projection plane.
+
+    Anti-deformation controls (from the Python original's
+    `refine_exported_scale_y_timelines` solver) applied to each bone's
+    natural buffer BEFORE blending:
+    - `scale_min` / `scale_max`: hard clamp on scale values
+      (defaults 0.35 .. 2.85 mirror the Python reference).
+    - `scale_temporal_smoothness`: penalizes frame-to-frame deltas in scale
+      via a tridiagonal solver (mirrors `_solve_temporal_scale_series`).
+    - `scale_regularization`: pulls scales toward 1.0 (identity) so weak
+      retarget signal doesn't push the bone far from its setup length.
     """
-    blend = float(scale_blend)
-    if blend < 0.0:
-        blend = 0.0
-    elif blend > 1.0:
-        blend = 1.0
+
+    def _clamp01(value: float) -> float:
+        return max(0.0, min(1.0, float(value)))
+
+    x_blend = _clamp01(scale_x_blend if scale_x_blend is not None else scale_blend)
+    y_blend = _clamp01(scale_y_blend)
+    sh_blend = _clamp01(shear_blend)
+    blend = x_blend  # legacy name used further below in the FK loop
+    smin = float(scale_min)
+    smax = float(scale_max)
+    if smax < smin:
+        smin, smax = smax, smin
+    smoothness_penalty = max(0.0, float(scale_temporal_smoothness))
+    regularization = max(0.0, float(scale_regularization))
     animation = _load_bvh_animation(bvh_path)
     frame_count = int(animation.rotations.shape[0])
     frametime = float(animation.frametime)
@@ -881,9 +999,19 @@ def bvh_to_flatrig_animation(
     children = _metadata_children(target_metadata)
     track_map: dict[str, dict[str, list[dict[str, float]]]] = {}
     previous_rotation_values: dict[str, float] = {}
+    # Per-bone, per-frame buffers of NATURAL scale/shear values derived from
+    # the projected 3D bone basis. We accumulate them during the FK loop and
+    # post-process them (smoothing + clamp + regularization) before deciding
+    # what to actually emit. Keys are spine bone names.
+    natural_scale_x: dict[str, list[float]] = {}
+    natural_scale_y: dict[str, list[float]] = {}
+    natural_shear_y_deg: dict[str, list[float]] = {}
+    bone_first_frame: dict[str, int] = {}
+    sample_times: list[float] = []
 
     for frame_index in range(frame_count):
         time_value = round(frame_index * frametime, 4)
+        sample_times.append(time_value)
         world_cache: list[dict[str, Any] | None] = [None] * len(names)
         local_cache_2d: dict[str, dict[str, float]] = {}
 
@@ -1006,13 +1134,68 @@ def bvh_to_flatrig_animation(
                 "original_name": original_name,
             }
 
+            # Decompose the projected Y axis of the bone to extract the
+            # natural scale_y and shear_y. Both come from the 3D bone matrix
+            # projected to 2D and then pulled through the parent's rigid
+            # basis (so children measure their local DOFs against the parent's
+            # orientation, not its scale chain).
+            y_axis_world_3d = world_rotation_3d[:, 1]
+            y_axis_world_2d = projection_basis @ y_axis_world_3d
+            if parent_index < 0:
+                y_axis_local_2d = y_axis_world_2d
+            else:
+                # Rebuild the parent's RIGID (orthonormal) basis once for
+                # decomposition; we already have it via _orthonormalize_2x2
+                # in the rotation_basis when inherit_mode is NoScale, but
+                # for inherit_mode == "Normal" we computed `rotation_basis`
+                # from the parent_basis with scale. Use orthonormalized one
+                # explicitly to get a meaningful local_y magnitude.
+                parent_state = world_cache[parent_index]
+                rigid_parent = _orthonormalize_2x2(parent_state["world_basis_2d"])
+                y_axis_local_2d = _safe_inverse_2x2(rigid_parent) @ y_axis_world_2d
+            scale_y_natural = float(np.linalg.norm(y_axis_local_2d))
+            if scale_y_natural <= NUMERIC_EPSILON:
+                scale_y_natural = 1.0
+                shear_y_natural_deg = 0.0
+            else:
+                y_unit = y_axis_local_2d / scale_y_natural
+                y_angle_deg = math.degrees(math.atan2(float(y_unit[1]), float(y_unit[0])))
+                # Shear_y is the deviation of the Y axis from rotation+90°
+                # (the "natural" perpendicular to X). Wrapped to [-180, 180].
+                shear_y_natural_deg = _normalize_angle(
+                    y_angle_deg - float(local_rotation_deg) - 90.0
+                )
+
             if original_name and str(original_name) in setup_bones:
-                local_cache_2d[str(original_name)] = {
+                bone_key = str(original_name)
+                local_cache_2d[bone_key] = {
                     "x": local_x,
                     "y": local_y,
                     "rotation": _normalize_angle(local_rotation_deg),
                     "scale_x": local_scale_x,
+                    "scale_y_natural": scale_y_natural,
+                    "shear_y_natural_deg": shear_y_natural_deg,
                 }
+                # Accumulate into the per-bone buffers used by the
+                # post-process smoothing/clamp solver.
+                if bone_key not in natural_scale_x:
+                    natural_scale_x[bone_key] = []
+                    natural_scale_y[bone_key] = []
+                    natural_shear_y_deg[bone_key] = []
+                    bone_first_frame[bone_key] = frame_index
+                # Pad with the previous value if this bone missed earlier
+                # frames (M2M sometimes skips joints).
+                pad_to = frame_index - bone_first_frame[bone_key]
+                while len(natural_scale_x[bone_key]) < pad_to:
+                    last_x = natural_scale_x[bone_key][-1] if natural_scale_x[bone_key] else 1.0
+                    last_y = natural_scale_y[bone_key][-1] if natural_scale_y[bone_key] else 1.0
+                    last_sh = natural_shear_y_deg[bone_key][-1] if natural_shear_y_deg[bone_key] else 0.0
+                    natural_scale_x[bone_key].append(last_x)
+                    natural_scale_y[bone_key].append(last_y)
+                    natural_shear_y_deg[bone_key].append(last_sh)
+                natural_scale_x[bone_key].append(float(local_scale_x))
+                natural_scale_y[bone_key].append(scale_y_natural)
+                natural_shear_y_deg[bone_key].append(shear_y_natural_deg)
 
         for bone_name, pose in local_cache_2d.items():
             setup_bone = setup_bones[bone_name]
@@ -1024,9 +1207,8 @@ def bvh_to_flatrig_animation(
             previous_rotation_values[bone_name] = rel_rotation
             rel_x = float(pose["x"]) - float(setup_bone.get("x", 0.0))
             rel_y = float(pose["y"]) - float(setup_bone.get("y", 0.0))
-            scale_x = float(pose.get("scale_x", 1.0))
             timelines = track_map.setdefault(
-                bone_name, {"rotate": [], "translate": [], "scale": []}
+                bone_name, {"rotate": [], "translate": [], "scale": [], "shear": []}
             )
             timelines["rotate"].append(
                 {
@@ -1043,18 +1225,83 @@ def bvh_to_flatrig_animation(
                         "y": round(rel_y, 4),
                     }
                 )
-            # Spine bone scale tracks store ABSOLUTE multipliers of the setup
-            # pose. Setup scale is 1.0 (extract_bone_hierarchy never writes
-            # anything else), so emitting the local_scale_x directly is the
-            # correct delta. Skip near-identity values to keep tracks compact.
-            setup_length_value = float(setup_bone.get("length", 0.0))
-            if setup_length_value > NUMERIC_EPSILON and abs(scale_x - 1.0) > 1e-3:
+
+    # ---- Post-process scale_x / scale_y / shear_y buffers ------------------
+    # For each bone, smooth + clamp + regularize the natural buffers, then
+    # blend toward identity (1.0 for scale, 0.0 for shear). The smoothed
+    # values feed the scale and shear tracks below.
+    refined_scale_x: dict[str, list[float]] = {}
+    refined_scale_y: dict[str, list[float]] = {}
+    refined_shear_y_deg: dict[str, list[float]] = {}
+    for bone_name in natural_scale_x:
+        # Pad each bone buffer up to the full sample length (in case the
+        # bone's last frame is missing).
+        for buf, identity in (
+            (natural_scale_x[bone_name], 1.0),
+            (natural_scale_y[bone_name], 1.0),
+            (natural_shear_y_deg[bone_name], 0.0),
+        ):
+            while len(buf) < frame_count:
+                buf.append(buf[-1] if buf else identity)
+
+        if x_blend > 0.0 and float(setup_bones[bone_name].get("length", 0.0)) > NUMERIC_EPSILON:
+            refined = _refine_scale_series(
+                np.asarray(natural_scale_x[bone_name], dtype=np.float64),
+                identity=1.0,
+                clamp_min=smin,
+                clamp_max=smax,
+                regularization=regularization,
+                temporal_smoothness=smoothness_penalty,
+            )
+            refined_scale_x[bone_name] = [
+                _lerp_scalar(1.0, float(value), x_blend) for value in refined
+            ]
+        if y_blend > 0.0 and float(setup_bones[bone_name].get("length", 0.0)) > NUMERIC_EPSILON:
+            refined = _refine_scale_series(
+                np.asarray(natural_scale_y[bone_name], dtype=np.float64),
+                identity=1.0,
+                clamp_min=smin,
+                clamp_max=smax,
+                regularization=regularization,
+                temporal_smoothness=smoothness_penalty,
+            )
+            refined_scale_y[bone_name] = [
+                _lerp_scalar(1.0, float(value), y_blend) for value in refined
+            ]
+        if sh_blend > 0.0 and float(setup_bones[bone_name].get("length", 0.0)) > NUMERIC_EPSILON:
+            # Shear follows the same solver but with identity 0° and looser
+            # clamps (shear isn't a multiplier; clamping ±90° avoids absurd
+            # tilts while keeping useful signal).
+            refined = _refine_scale_series(
+                np.asarray(natural_shear_y_deg[bone_name], dtype=np.float64),
+                identity=0.0,
+                clamp_min=-90.0,
+                clamp_max=+90.0,
+                regularization=regularization,
+                temporal_smoothness=smoothness_penalty,
+            )
+            refined_shear_y_deg[bone_name] = [
+                _lerp_scalar(0.0, float(value), sh_blend) for value in refined
+            ]
+
+    # Push the per-frame scale/shear keys to each bone's timelines.
+    for bone_name, timelines in track_map.items():
+        bone_scale_x = refined_scale_x.get(bone_name)
+        bone_scale_y = refined_scale_y.get(bone_name)
+        bone_shear_y = refined_shear_y_deg.get(bone_name)
+        if bone_scale_x is None and bone_scale_y is None and bone_shear_y is None:
+            continue
+        for sample_index, sample_time in enumerate(sample_times):
+            sx = float(bone_scale_x[sample_index]) if bone_scale_x else 1.0
+            sy = float(bone_scale_y[sample_index]) if bone_scale_y else 1.0
+            shy = float(bone_shear_y[sample_index]) if bone_shear_y else 0.0
+            if abs(sx - 1.0) > 1e-3 or abs(sy - 1.0) > 1e-3:
                 timelines["scale"].append(
-                    {
-                        "time": time_value,
-                        "x": round(scale_x, 4),
-                        "y": 1.0,
-                    }
+                    {"time": sample_time, "x": round(sx, 4), "y": round(sy, 4)}
+                )
+            if abs(shy) > 1e-2:
+                timelines["shear"].append(
+                    {"time": sample_time, "x": 0.0, "y": round(shy, 3)}
                 )
 
     compressed_bones: dict[str, Any] = {}
@@ -1062,6 +1309,7 @@ def bvh_to_flatrig_animation(
         rotate = _compress_timeline_keys(timelines["rotate"], ("angle", "value"), tolerance=0.01)
         translate = _compress_timeline_keys(timelines["translate"], ("x", "y"), tolerance=1e-4)
         scale = _compress_timeline_keys(timelines.get("scale", []), ("x", "y"), tolerance=1e-3)
+        shear = _compress_timeline_keys(timelines.get("shear", []), ("x", "y"), tolerance=1e-2)
         payload: dict[str, Any] = {}
         if rotate:
             payload["rotate"] = rotate
@@ -1069,6 +1317,8 @@ def bvh_to_flatrig_animation(
             payload["translate"] = translate
         if scale:
             payload["scale"] = scale
+        if shear:
+            payload["shear"] = shear
         if payload:
             compressed_bones[bone_name] = payload
 
