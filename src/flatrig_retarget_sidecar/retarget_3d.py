@@ -1227,9 +1227,12 @@ def bvh_to_flatrig_animation(
                 )
 
     # ---- Post-process scale_x / scale_y / shear_y buffers ------------------
-    # For each bone, smooth + clamp + regularize the natural buffers, then
-    # blend toward identity (1.0 for scale, 0.0 for shear). The smoothed
-    # values feed the scale and shear tracks below.
+    # scale_x: MUST be kept consistent with FK translate positions (which were
+    # computed using the same raw scale values embedded in world_basis_2d).
+    # We only blend (same as the FK loop) — NO refinement/smoothing — so
+    # Spine's runtime reconstruction matches the FK chain exactly.
+    # scale_y / shear_y: these are independent of FK positions, so refinement
+    # (smoothing + clamp + regularization) is safe and beneficial.
     refined_scale_x: dict[str, list[float]] = {}
     refined_scale_y: dict[str, list[float]] = {}
     refined_shear_y_deg: dict[str, list[float]] = {}
@@ -1245,16 +1248,9 @@ def bvh_to_flatrig_animation(
                 buf.append(buf[-1] if buf else identity)
 
         if x_blend > 0.0 and float(setup_bones[bone_name].get("length", 0.0)) > NUMERIC_EPSILON:
-            refined = _refine_scale_series(
-                np.asarray(natural_scale_x[bone_name], dtype=np.float64),
-                identity=1.0,
-                clamp_min=smin,
-                clamp_max=smax,
-                regularization=regularization,
-                temporal_smoothness=smoothness_penalty,
-            )
             refined_scale_x[bone_name] = [
-                _lerp_scalar(1.0, float(value), x_blend) for value in refined
+                _lerp_scalar(1.0, float(v), x_blend)
+                for v in natural_scale_x[bone_name]
             ]
         if y_blend > 0.0 and float(setup_bones[bone_name].get("length", 0.0)) > NUMERIC_EPSILON:
             refined = _refine_scale_series(
