@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -244,7 +243,7 @@ def build_exported_motion2motion_mapping(
         target_name = target_original_to_matching.get(pair["target"])
         add_pair(source_name, target_name)
 
-    mapping_result = {
+    return {
         "source_name": payload["source_name"],
         "target_name": payload["target_name"],
         "root_joint": target_export_root,
@@ -261,7 +260,6 @@ def build_exported_motion2motion_mapping(
             "semantic_pair_count": len(semantic_pairs),
         },
     }
-    return mapping_result
 
 
 def _suggest_semantic_biped_mapping(
