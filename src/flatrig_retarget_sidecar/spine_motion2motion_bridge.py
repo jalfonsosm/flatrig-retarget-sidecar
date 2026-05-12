@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -260,7 +261,7 @@ def build_exported_motion2motion_mapping(
             "semantic_pair_count": len(semantic_pairs),
         },
     }
-    print(f"[DEBUG_APPEND_MAPPING] AUTO path mapping_payload: source={source.source_label} target={target.source_label} root_joint={target_export_root} pair_count={len(rewritten_mapping)} pairs={json.dumps(rewritten_mapping)}", flush=True)
+    print(f"[DEBUG_APPEND_MAPPING] AUTO path mapping_payload: source={source.source_label} target={target.source_label} root_joint={target_export_root} pair_count={len(rewritten_mapping)} pairs={json.dumps(rewritten_mapping)}", file=sys.stderr, flush=True)
     return mapping_result
 
 
@@ -426,7 +427,7 @@ def _build_user_exported_motion2motion_mapping(
     if not isinstance(raw_pairs, list):
         raise ValueError("Mapping file must contain a 'mapping' or 'pairs' array.")
 
-    print(f"[DEBUG_APPEND_MAPPING] USER raw mapping file: root_joint={raw_payload.get('root_joint')} raw_pair_count={len(raw_pairs)} raw_pairs={json.dumps(raw_pairs)}", flush=True)
+    print(f"[DEBUG_APPEND_MAPPING] USER raw mapping file: root_joint={raw_payload.get('root_joint')} raw_pair_count={len(raw_pairs)} raw_pairs={json.dumps(raw_pairs)}", file=sys.stderr, flush=True)
 
     source_lookup = _exported_matching_lookup(source_joints)
     target_lookup = _exported_matching_lookup(target_joints)
@@ -488,7 +489,7 @@ def _build_user_exported_motion2motion_mapping(
             "target_bvh_joint_count": len(target_joints),
         },
     }
-    print(f"[DEBUG_APPEND_MAPPING] USER path mapping_payload: source={source.source_label} target={target.source_label} root_joint={root_joint} pair_count={len(rewritten_mapping)} source_export_root={source_export_root} target_export_root={target_export_root} pairs={json.dumps(rewritten_mapping)}", flush=True)
+    print(f"[DEBUG_APPEND_MAPPING] USER path mapping_payload: source={source.source_label} target={target.source_label} root_joint={root_joint} pair_count={len(rewritten_mapping)} source_export_root={source_export_root} target_export_root={target_export_root} pairs={json.dumps(rewritten_mapping)}", file=sys.stderr, flush=True)
     return user_result
 
 
