@@ -459,8 +459,6 @@ def retarget_spine_animation(
         mapping_file=mapping_file,
     )
 
-    print(f"[DEBUG_APPEND_MAPPING] retarget_spine_animation: mapping_file={'NONE' if mapping_file is None else str(mapping_file)} animation={animation_name} root_joint={mapping_payload.get('root_joint')}", file=sys.stderr, flush=True)
-
     mapping_pair_count = len(mapping_payload.get("mapping") or [])
     source_bone_count = len([b for b in (source.bones or []) if isinstance(b, dict)])
     target_bone_count = len([b for b in (target.bones or []) if isinstance(b, dict)])
@@ -814,9 +812,6 @@ def _resolve_mapped_target_spine_bones(
     root_matching = mapping_payload.get("root_joint")
     if isinstance(root_matching, str):
         mapped.add(matching_to_spine.get(root_matching, root_matching))
-    all_target_spine_names = set(str(joint.spine_name) for joint in target_metadata.joints if joint.spine_name)
-    excluded = all_target_spine_names - mapped
-    print(f"[DEBUG_APPEND_MAPPING] _resolve_mapped_target_spine_bones: mapped_targets={sorted(mapped)} excluded_targets={sorted(excluded)} total_target_spine_bones={len(all_target_spine_names)}", file=sys.stderr, flush=True)
     return mapped
 
 
