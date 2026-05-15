@@ -69,8 +69,10 @@ def retarget_3d_animations_to_model(
 ) -> dict[str, Any]:
     """Retarget 3D source actions onto the target model rig, then emit FlatRig animation JSON.
 
-    Scale/shear handling lives entirely in the C++ optimizer; the sidecar
-    only emits rotation + translate per bone.
+    Emits rotation + translate + natural scale_x per bone. scale_y and shear
+    stay at identity here; the C++ Spine global optimizer discovers them
+    against mesh vertex targets and applies the granular per-DOF blends at
+    emission time.
     """
     source_path = Path(source).expanduser().resolve()
     target_path = Path(target_model).expanduser().resolve()
@@ -842,11 +844,18 @@ def bvh_to_flatrig_animation(
 ) -> dict[str, Any]:
     """Convert a retargeted BVH into one Spine animation.
 
-    Emits ROTATION and TRANSLATE per bone only. scale_x / scale_y / shear
-    are intentionally NOT computed here — the C++ Spine global optimizer
-    owns all scale/shear handling (it optimizes them against mesh vertex
-    targets and applies the granular blend factors). Emitting them here
-    too would duplicate work and create double-blending.
+    Emits ROTATION, TRANSLATE and natural SCALE_X per bone:
+      - rotation: bone direction in 2D (parent-local).
+      - translate: child head in parent's RIGID 2D frame (no scale).
+      - scale_x: |projected segment| / setup_length (full natural value).
+    scale_y and shear_y are NOT emitted (left at identity); the C++ optimizer
+    discovers them against mesh vertex targets.
+
+    scale_x must be emitted full-natural here (not blended) so the translate
+    keys are coherent with the bone basis Spine reconstructs at runtime —
+    otherwise children detach from their parent's tail when scale_x != 1.
+    The granular blend factors are applied later by the C++ optimizer at
+    emission time, not by the sidecar.
     """
     animation = _load_bvh_animation(bvh_path)
     frame_count = int(animation.rotations.shape[0])
@@ -916,13 +925,24 @@ def bvh_to_flatrig_animation(
                 current_length = 1.0
             unit_axis = segment_2d / current_length
 
-            # Rotation-only world basis. scale_x/y and shear are emitted as
-            # identity here; the C++ optimizer fits them to mesh targets.
+            # Natural per-bone world scale = projected length / setup length.
+            # Always full-natural (no blending here): the basis must agree
+            # with the translate keys we emit, otherwise children detach
+            # from their parent's tail. The C++ optimizer applies the
+            # granular blend at output time.
+            setup_length = float(setup_bone.get("length", 0.0)) if setup_bone else 0.0
+            natural_world_scale = (
+                current_length / setup_length
+                if setup_length > NUMERIC_EPSILON
+                else 1.0
+            )
+
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
                 local_y = float(world_head_2d[1])
                 local_rotation_deg = math.degrees(math.atan2(unit_axis[1], unit_axis[0]))
-                world_basis_2d = _build_basis_2d(local_rotation_deg)
+                local_scale_x = natural_world_scale  # root: parent_world_scale = 1
+                world_basis_2d = _build_basis_2d(local_rotation_deg, local_scale_x)
             else:
                 parent_state = world_cache[parent_index]
                 assert parent_state is not None
@@ -930,20 +950,35 @@ def bvh_to_flatrig_animation(
                 local_position_2d = _safe_inverse_2x2(parent_basis) @ (
                     world_head_2d - parent_state["head_2d"]
                 )
-                local_axis_dir = _safe_inverse_2x2(parent_basis) @ unit_axis
+                inherit_mode = setup_bone.get("inherit", "Normal") if setup_bone else "Normal"
+                rotation_basis = (
+                    _orthonormalize_2x2(parent_basis)
+                    if inherit_mode == "NoScale"
+                    else parent_basis
+                )
+                local_axis_dir = _safe_inverse_2x2(rotation_basis) @ unit_axis
                 if float(np.linalg.norm(local_axis_dir)) <= NUMERIC_EPSILON:
                     local_axis_dir = np.array((1.0, 0.0), dtype=np.float64)
                 local_axis_dir = local_axis_dir / float(np.linalg.norm(local_axis_dir))
                 local_rotation_deg = math.degrees(math.atan2(local_axis_dir[1], local_axis_dir[0]))
+                # local_scale_x = natural_world_scale / parent_world_scale
+                # so the chain stays coherent when Spine recomposes.
+                parent_world_scale = float(parent_state.get("world_scale", 1.0))
+                local_scale_x = (
+                    natural_world_scale / parent_world_scale
+                    if parent_world_scale > NUMERIC_EPSILON
+                    else 1.0
+                )
                 local_x = float(local_position_2d[0])
                 local_y = float(local_position_2d[1])
-                world_basis_2d = parent_basis @ _build_basis_2d(local_rotation_deg)
+                world_basis_2d = rotation_basis @ _build_basis_2d(local_rotation_deg, local_scale_x)
 
             world_cache[joint_index] = {
                 "head_3d": head_3d,
                 "head_2d": world_head_2d,
                 "world_rotation_3d": world_rotation_3d,
                 "world_basis_2d": world_basis_2d,
+                "world_scale": natural_world_scale,
                 "original_name": original_name,
             }
 
@@ -952,6 +987,7 @@ def bvh_to_flatrig_animation(
                     "x": local_x,
                     "y": local_y,
                     "rotation": _normalize_angle(local_rotation_deg),
+                    "scale_x": local_scale_x,
                 }
 
         for bone_name, pose in local_cache_2d.items():
@@ -964,8 +1000,9 @@ def bvh_to_flatrig_animation(
             previous_rotation_values[bone_name] = rel_rotation
             rel_x = float(pose["x"]) - float(setup_bone.get("x", 0.0))
             rel_y = float(pose["y"]) - float(setup_bone.get("y", 0.0))
+            scale_x = float(pose["scale_x"])
             timelines = track_map.setdefault(
-                bone_name, {"rotate": [], "translate": []}
+                bone_name, {"rotate": [], "translate": [], "scale": []}
             )
             timelines["rotate"].append(
                 {
@@ -982,16 +1019,29 @@ def bvh_to_flatrig_animation(
                         "y": round(rel_y, 4),
                     }
                 )
+            # Always emit scale_x; scale_y stays at identity (1.0). The C++
+            # optimizer will refine both against mesh targets and apply the
+            # per-DOF blend factors at output time.
+            timelines["scale"].append(
+                {
+                    "time": time_value,
+                    "x": round(scale_x, 4),
+                    "y": 1.0,
+                }
+            )
 
     compressed_bones: dict[str, Any] = {}
     for bone_name, timelines in track_map.items():
         rotate = _compress_timeline_keys(timelines["rotate"], ("angle", "value"), tolerance=0.01)
         translate = _compress_timeline_keys(timelines["translate"], ("x", "y"), tolerance=1e-4)
+        scale = _compress_timeline_keys(timelines.get("scale", []), ("x", "y"), tolerance=1e-3)
         payload: dict[str, Any] = {}
         if rotate:
             payload["rotate"] = rotate
         if translate:
             payload["translate"] = translate
+        if scale:
+            payload["scale"] = scale
         if payload:
             compressed_bones[bone_name] = payload
 

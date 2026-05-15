@@ -983,7 +983,7 @@ def bvh_to_spine_animation(
 
             timelines = track_map.setdefault(
                 spine_name,
-                {"rotate": [], "translate": [], "scale": []},
+                {"rotate": [], "translate": []},
             )
             timelines["rotate"].append(
                 {
