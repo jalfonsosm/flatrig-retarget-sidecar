@@ -928,14 +928,22 @@ def bvh_to_flatrig_animation(
             # Natural per-bone world scale = projected length / setup length.
             # Always full-natural (no blending here): the basis must agree
             # with the translate keys we emit, otherwise children detach
-            # from their parent's tail. The C++ optimizer applies the
-            # granular blend at output time.
+            # from their parent's tail.
+            # CRITICAL: accessory bones (sword, hat, etc.) can have a very
+            # small setup_length (e.g. 0.01), so a moderate projected length
+            # explodes the ratio to 100×+. That value flows into Spine's
+            # scale_x, the optimizer's initial log_sx, and the target world
+            # matrices — anywhere downstream that hits it produces sprites
+            # stretched to kilometers. Clamp to a reasonable range so the
+            # chain stays coherent even for accessories with tiny setup
+            # lengths; the optimizer can still refine within this range.
             setup_length = float(setup_bone.get("length", 0.0)) if setup_bone else 0.0
-            natural_world_scale = (
+            raw_natural_scale = (
                 current_length / setup_length
                 if setup_length > NUMERIC_EPSILON
                 else 1.0
             )
+            natural_world_scale = max(0.1, min(10.0, raw_natural_scale))
 
             if parent_index < 0:
                 local_x = float(world_head_2d[0])
