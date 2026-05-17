@@ -24,6 +24,7 @@ from flatrig_retarget_sidecar.scene_formats import (
     export_3d_animation_bvh,
     export_3d_rest_bvh,
     extract_animations,
+    extract_mesh_targets,
     extract_scene,
     inspect_3d_source,
     probe_scene_backend,
@@ -200,6 +201,24 @@ def main() -> None:
     _add_projection_args(export_3d_rest_bvh_parser)
     export_3d_rest_bvh_parser.add_argument("--fps", type=float, default=30.0)
     export_3d_rest_bvh_parser.add_argument("--frame-count", type=int, default=None)
+
+    extract_mesh_targets_parser = subparsers.add_parser(
+        "extract-mesh-targets",
+        help="evaluate animated mesh per frame and project vertices to 2D",
+    )
+    extract_mesh_targets_parser.add_argument("source")
+    extract_mesh_targets_parser.add_argument("--output", required=True)
+    _add_projection_args(extract_mesh_targets_parser)
+    extract_mesh_targets_parser.add_argument("--target-spec", required=True)
+    extract_mesh_targets_parser.add_argument(
+        "--mesh-target-vertices", type=int, default=5000
+    )
+    extract_mesh_targets_parser.add_argument(
+        "--no-mesh-reduction",
+        dest="mesh_reduction",
+        action="store_false",
+        default=True,
+    )
 
     render_sprites_parser = subparsers.add_parser(
         "render-sprites",
@@ -431,6 +450,26 @@ def main() -> None:
             drop_problematic_frames=args.drop_problematic_frames,
             preserve_root_motion=args.preserve_root_motion,
             preserve_root_rotation=args.preserve_root_rotation,
+        )
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "extract-mesh-targets":
+        result = extract_mesh_targets(
+            args.source,
+            args.output,
+            target_spec=args.target_spec,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
+            projection_space=args.projection_space,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
         )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:

@@ -770,6 +770,7 @@ def parse_args() -> argparse.Namespace:
             "render-sprites",
             "export-3d-animation-bvh",
             "export-3d-rest-bvh",
+            "extract-mesh-targets",
         ),
     )
     parser.add_argument("source")
@@ -866,6 +867,11 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         default=True,
         help="Disable source mesh reduction",
+    )
+    parser.add_argument(
+        "--target-spec",
+        default=None,
+        help="JSON file describing per-animation sample_times for extract-mesh-targets",
     )
     return parser.parse_args(script_args)
 
@@ -2815,6 +2821,193 @@ def render_sprites_cli(
         return {"ok": False, "detail": f"Sprite rendering not available: {e}"}
 
 
+def extract_mesh_targets_cli(
+    source_path: str,
+    output_path: str,
+    *,
+    view_preset: str = "front",
+    view_dir=None,
+    view_up=None,
+    view_roll: float = 0.0,
+    source_frame: int = None,
+    use_rest_pose: bool = False,
+    projection_space: str = "world",
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
+    target_spec_path: str = None,
+) -> dict[str, object]:
+    """Evaluate the animated mesh per frame and project vertices to 2D.
+
+    Produces Blender-skinned ground-truth targets for the C++ Spine global
+    optimizer. The dedup map (source_vertex_indices) is rebuilt with the same
+    extract_2d_mesh call used during extract-scene so vertex ordering matches.
+
+    The target spec JSON has the form:
+        {
+          "fps": 30.0,
+          "animations": [
+            {"name": "Walk", "sample_times": [0.0, 0.0333, ...]}
+          ]
+        }
+    """
+    import json as json_module
+
+    if not target_spec_path:
+        return {"ok": False, "detail": "target-spec is required"}
+    spec_path = Path(target_spec_path).expanduser().resolve()
+    if not spec_path.exists():
+        return {"ok": False, "detail": f"target-spec not found: {spec_path}"}
+    try:
+        spec = json_module.loads(spec_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "detail": f"target-spec parse failed: {exc}"}
+
+    fps = float(spec.get("fps") or 30.0)
+    if fps <= 0.0:
+        return {"ok": False, "detail": "fps must be > 0"}
+    requested_animations = list(spec.get("animations") or [])
+    if not requested_animations:
+        return {"ok": False, "detail": "target-spec has no animations"}
+
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+
+    mesh_obj, armature_obj = find_mesh_and_armature()
+    if mesh_obj is None:
+        return {"ok": False, "detail": "No mesh found in scene"}
+    if armature_obj is None:
+        return {"ok": False, "detail": "No armature found in scene"}
+
+    setup_frame = _resolve_setup_frame(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+        neutral_auto_pose=True,
+    )
+    bpy.context.scene.frame_set(setup_frame)
+    _apply_auto_setup_pose(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+    )
+    reduce_mesh_object(
+        mesh_obj,
+        target_vertices=mesh_target_vertices,
+        enabled=mesh_reduction,
+    )
+
+    view_cfg = get_view_config(
+        view_name=view_preset,
+        view_dir=tuple(view_dir) if view_dir is not None else None,
+        up_hint=tuple(view_up) if view_up is not None else None,
+        roll_degrees=view_roll,
+    )
+
+    # Rebuild dedup map using the same call extract-scene uses on the bind
+    # frame. Vertex order in the output matches the C++ optimizer's
+    # mesh_data.vertices_2d index space.
+    bind_mesh = extract_2d_mesh(
+        mesh_obj,
+        view_cfg,
+        source_frame=setup_frame,
+        use_rest_pose=use_rest_pose,
+    )
+    source_vertex_indices = [int(i) for i in (bind_mesh.get("source_vertex_indices") or [])]
+    if not source_vertex_indices:
+        return {"ok": False, "detail": "bind dedup map is empty"}
+
+    basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
+    actions = [action for action in bpy.data.actions if is_pose_action(action)]
+    if not actions:
+        return {"ok": False, "detail": "No pose animations in scene"}
+    if armature_obj.animation_data is None:
+        armature_obj.animation_data_create()
+
+    output_animations: list[dict[str, object]] = []
+
+    for anim_spec in requested_animations:
+        name = str(anim_spec.get("name") or "").strip()
+        sample_times = [float(t) for t in (anim_spec.get("sample_times") or [])]
+        if not name or not sample_times:
+            continue
+
+        try:
+            action = _resolve_action_for_export(armature_obj, [name])
+        except ValueError as exc:
+            output_animations.append({
+                "name": name,
+                "sample_times": sample_times,
+                "target_positions_2d": [],
+                "ok": False,
+                "detail": str(exc),
+            })
+            continue
+        if action is None:
+            output_animations.append({
+                "name": name,
+                "sample_times": sample_times,
+                "target_positions_2d": [],
+                "ok": False,
+                "detail": "action not found",
+            })
+            continue
+
+        armature_obj.animation_data.action = action
+        action_start = float(action.frame_range[0])
+
+        frame_positions: list[list[list[float]]] = []
+        for sample_time in sample_times:
+            frame_float = action_start + sample_time * fps
+            frame_int = int(math.floor(frame_float))
+            subframe = float(frame_float - frame_int)
+            bpy.context.scene.frame_set(frame_int, subframe=subframe)
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            depsgraph.update()
+
+            eval_obj = mesh_obj.evaluated_get(depsgraph)
+            eval_mesh = None
+            try:
+                eval_mesh = eval_obj.to_mesh()
+                world_mat = eval_obj.matrix_world
+                eval_verts = eval_mesh.vertices
+
+                vertex_positions: list[list[float]] = []
+                for source_index in source_vertex_indices:
+                    if source_index < 0 or source_index >= len(eval_verts):
+                        vertex_positions.append([0.0, 0.0])
+                        continue
+                    co_world = world_mat @ eval_verts[source_index].co
+                    co_world_np = np.array(
+                        (co_world.x, co_world.y, co_world.z), dtype=np.float64
+                    )
+                    co_projected = _transform_point_to_projection_space(
+                        co_world_np, projection_inverse=None
+                    )
+                    co_2d = basis_2d @ co_projected
+                    vertex_positions.append([float(co_2d[0]), float(co_2d[1])])
+                frame_positions.append(vertex_positions)
+            finally:
+                if eval_mesh is not None:
+                    eval_obj.to_mesh_clear()
+
+        output_animations.append({
+            "name": name,
+            "sample_times": sample_times,
+            "target_positions_2d": frame_positions,
+            "ok": True,
+        })
+
+    return {
+        "ok": True,
+        "detail": "extracted",
+        "source": source_path,
+        "setup_frame": setup_frame,
+        "vertex_count": len(source_vertex_indices),
+        "fps": fps,
+        "animations": output_animations,
+    }
+
+
 def main() -> None:
     args = parse_args()
     source_path = str(Path(args.source).expanduser().resolve())
@@ -2922,6 +3115,28 @@ def main() -> None:
             projection_space=args.projection_space,
             fps=args.fps,
             frame_count=args.frame_count,
+        )
+    elif args.command == "extract-mesh-targets":
+        view_dir = None
+        view_up = None
+        if args.view_dir:
+            view_dir = tuple(float(x) for x in args.view_dir.split(","))
+        if args.view_up:
+            view_up = tuple(float(x) for x in args.view_up.split(","))
+
+        payload = extract_mesh_targets_cli(
+            source_path,
+            str(output_path),
+            view_preset=args.view_preset,
+            view_dir=view_dir,
+            view_up=view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
+            projection_space=args.projection_space,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
+            target_spec_path=args.target_spec,
         )
     elif args.command == "render-sprites":
         view_dir = None

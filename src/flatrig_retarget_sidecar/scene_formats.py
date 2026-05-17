@@ -696,5 +696,59 @@ def render_sprites(
     return _run_blender_command_with_args("render-sprites", source, output, extra_args)
 
 
+def extract_mesh_targets(
+    source: str,
+    output: str,
+    target_spec: str,
+    *,
+    view_preset: str = "side",
+    view_dir: str = None,
+    view_up: str = None,
+    view_roll: float = 0.0,
+    source_frame: int = None,
+    use_rest_pose: bool = False,
+    projection_space: str = "world",
+    mesh_reduction: bool = True,
+    mesh_target_vertices: int = 5000,
+) -> SceneCommandResult:
+    """Evaluate per-frame skinned mesh vertex positions in 2D.
+
+    Produces the optimizer's `target_positions_2d` by running the source
+    armature through Blender's depsgraph per sample frame. The dedup map is
+    rebuilt deterministically to match the bind mesh extracted earlier.
+    """
+    extra_args = [
+        "--view-preset",
+        view_preset,
+        "--projection-space",
+        projection_space,
+        "--target-spec",
+        target_spec,
+    ]
+    if mesh_reduction:
+        extra_args.extend(["--mesh-target-vertices", str(mesh_target_vertices)])
+    else:
+        extra_args.append("--no-mesh-reduction")
+    if view_dir:
+        extra_args.extend(["--view-dir", view_dir])
+    if view_up:
+        extra_args.extend(["--view-up", view_up])
+    if view_roll != 0.0:
+        extra_args.extend(["--view-roll", str(view_roll)])
+    if source_frame is not None:
+        extra_args.extend(["--source-frame", str(source_frame)])
+    if use_rest_pose:
+        extra_args.append("--use-rest-pose")
+
+    probe = probe_scene_backend_impl()
+    if probe.mode == "bpy_module" and probe.available:
+        return _run_bpy_command_with_args(
+            "extract-mesh-targets", source, output, extra_args
+        )
+    return _run_blender_command_with_args(
+        "extract-mesh-targets", source, output, extra_args
+    )
+
+
 def probe_scene_backend() -> dict[str, Any]:
     return asdict(probe_scene_backend_impl())
