@@ -1,0 +1,20 @@
+{
+  "device": "auto",
+  "resolution": 128,
+  "views": [
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0]
+  ],
+  "points_per_batch": 8,
+  "pred_iou_thresh": 0.8,
+  "stability_score_thresh": 0.85,
+  "edge_agreement": 0.5,
+  "rig_guidance": true,
+  "require_rig_guidance": true,
+  "minimum_branch_fraction": 0.012,
+  "rig_minimum_faces": 4,
+  "max_parts_per_rig_region": 2,
+  "minimum_faces": 4
+}
