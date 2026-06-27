@@ -3249,6 +3249,9 @@ def _build_3d_bvh_layout(armature_obj, source_frame=None, use_rest_pose=True):
                 offset_vec = head_vec - parent_head_vec
             tail_offset_vec = tail_vec - head_vec
             length = float(tail_offset_vec.length)
+            rest_world_rotation = _world_rotation_3x3(
+                armature_world @ rest_bone.matrix_local
+            )
 
             joint = {
                 "index": index,
@@ -3261,6 +3264,7 @@ def _build_3d_bvh_layout(armature_obj, source_frame=None, use_rest_pose=True):
                 "head": _vector_to_json(head_vec),
                 "tail": _vector_to_json(tail_vec),
                 "tail_offset": _vector_to_json(tail_offset_vec),
+                "rest_world_rotation": _matrix3_to_json(rest_world_rotation),
                 "length": length,
                 "synthetic": False,
             }
