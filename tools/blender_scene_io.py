@@ -274,6 +274,37 @@ def get_view_config(view_name="side", *, view_dir=None, up_hint=None, roll_degre
     return config
 
 
+def get_scene_view_config(
+    view_name="side",
+    *,
+    view_dir=None,
+    up_hint=None,
+    roll_degrees=0.0,
+    armature_obj=None,
+):
+    """Return a view config for the scene.
+
+    Orientation is resolved geometrically at import time by
+    ``normalize_model_orientation`` (it rotates the rig to the canonical forward
+    using the structural *deform* root, ignoring any control rig). There is no
+    name-based left/right mirror flip here: the anatomical handedness of a
+    bilaterally symmetric humanoid is not recoverable from geometry alone
+    (its only asymmetry reference is bone names), so guessing it from ``_l``/``_r``
+    tokens was rig-format-specific and is intentionally gone. ``armature_obj`` is
+    retained for callers and any future geometry-based view adaptation.
+    """
+    _ = armature_obj
+    config = get_view_config(
+        view_name=view_name,
+        view_dir=view_dir,
+        up_hint=up_hint,
+        roll_degrees=roll_degrees,
+    )
+    config["auto_lateral_flip"] = False
+    config["lateral_sign"] = None
+    return config
+
+
 def _project_projection_space_direction(direction_3d, view_cfg):
     """Project a 3D direction onto the 2D view plane."""
     direction_3d = np.asarray(direction_3d, dtype=np.float64)
@@ -419,17 +450,151 @@ def _rest_local_quat(data_bone):
     return matrix.to_quaternion()
 
 
+def _quat_to_stable_json(quat):
+    quat = quat.copy()
+    quat.normalize()
+    if quat.w < 0.0:
+        quat.negate()
+    return [float(quat.w), float(quat.x), float(quat.y), float(quat.z)]
+
+
+def _quat_angle_degrees(a, b) -> float:
+    dot = abs(
+        float(a.w) * float(b.w)
+        + float(a.x) * float(b.x)
+        + float(a.y) * float(b.y)
+        + float(a.z) * float(b.z)
+    )
+    dot = max(-1.0, min(1.0, dot))
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def _local_bind_pose_signature(armature_obj, bone_names=None) -> dict[str, dict[str, object]]:
+    if armature_obj is None:
+        return {}
+    include = set(bone_names or [])
+    if not include:
+        include = {bone.name for bone in armature_obj.data.bones}
+    result = {}
+    for bone in armature_obj.data.bones:
+        if bone.name not in include:
+            continue
+        result[bone.name] = {
+            "parent": bone.parent.name if bone.parent is not None else None,
+            "local_rotation": _quat_to_stable_json(_rest_local_quat(bone)),
+            "length": float(bone.length),
+        }
+    return result
+
+
 def _pose_bone_stem(name):
     colon = name.find(":")
     return name[colon + 1 :] if colon >= 0 else name
 
 
-def _stem_pose_bone_map(source_arm, target_arm):
-    """Map source pose-bone names to target pose-bone names by namespace stem.
+def _pose_bone_tokens(name):
+    stem = _pose_bone_stem(str(name or ""))
+    stem = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", stem)
+    stem = re.sub(r"[^A-Za-z0-9]+", "_", stem)
+    return [token for token in stem.lower().split("_") if token]
 
-    The exact flat matching `_extract_transferred_animation` uses (prefix
-    before ':' stripped, case-insensitive). Shared so the bind borrow and the
-    per-frame animation transfer can never disagree about which bones pair up.
+
+def _pose_bone_side(tokens):
+    joined = "".join(tokens)
+    if "left" in tokens or "l" in tokens or joined.startswith("left"):
+        return "l"
+    if "right" in tokens or "r" in tokens or joined.startswith("right"):
+        return "r"
+    return None
+
+
+def _pose_bone_role(name):
+    """Infer a coarse humanoid role for cross-format pose transfer.
+
+    Exact name matching remains the primary path. This role fallback is only for
+    common humanoid rigs whose names differ by convention (Mixamo, UE-style,
+    KayKit, VRoid). The pose copy still writes rotations onto the target's own
+    bones, preserving target joint positions and lengths.
+    """
+    tokens = _pose_bone_tokens(name)
+    if not tokens:
+        return None
+    joined = "".join(tokens)
+    side = _pose_bone_side(tokens)
+
+    if "end" in tokens or "leaf" in tokens or "top" in tokens:
+        return None
+    if any(token in tokens for token in ("hips", "pelvis", "waist")):
+        return "hips"
+    if "head" in tokens:
+        return "head"
+    if "neck" in tokens:
+        return "neck"
+
+    if "spine" in tokens or joined.startswith("spine"):
+        if "03" in tokens or "3" in tokens or joined.endswith("3") or joined.endswith("03"):
+            return "spine2"
+        if "02" in tokens or "2" in tokens or joined.endswith("2") or joined.endswith("02"):
+            return "spine1"
+        if "01" in tokens or "1" in tokens or joined.endswith("1") or joined.endswith("01"):
+            return "spine0"
+        return "spine0"
+    if "upperchest" in joined or ("upper" in tokens and "chest" in tokens):
+        return "spine2"
+    if "chest" in tokens or "torso" in tokens:
+        return "spine2"
+
+    if side is None:
+        return None
+    prefix = f"{side}_"
+
+    if "clavicle" in tokens or "shoulder" in tokens:
+        return prefix + "shoulder"
+    if (
+        "forearm" in joined
+        or ("fore" in tokens and "arm" in tokens)
+        or ("lower" in tokens and "arm" in tokens)
+    ):
+        return prefix + "lower_arm"
+    if "upperarm" in joined or ("upper" in tokens and "arm" in tokens):
+        return prefix + "upper_arm"
+    if "arm" in tokens or joined.endswith("arm"):
+        return prefix + "upper_arm"
+    if "hand" in tokens or "wrist" in tokens:
+        return prefix + "hand"
+
+    if "upleg" in joined or ("up" in tokens and "leg" in tokens) or "thigh" in tokens:
+        return prefix + "thigh"
+    if (
+        ("lower" in tokens and "leg" in tokens)
+        or "calf" in tokens
+        or "shin" in tokens
+        or (joined.endswith("leg") and "up" not in tokens)
+    ):
+        return prefix + "calf"
+    if "foot" in tokens:
+        return prefix + "foot"
+    if "toe" in tokens or "toes" in tokens or "toebase" in joined:
+        return prefix + "toe"
+
+    return None
+
+
+def _role_fallbacks(role):
+    if role == "spine1":
+        return ("spine1", "spine2", "spine0")
+    if role == "spine2":
+        return ("spine2", "spine1", "spine0")
+    return (role,)
+
+
+def _stem_pose_bone_map(source_arm, target_arm):
+    """Map source pose-bone names to target pose-bone names.
+
+    Exact namespace-stripped stem matching is preferred. If that misses, fall
+    back to a coarse humanoid role map so a Mixamo donor can pose common
+    non-Mixamo humanoid rigs without copying donor translations or bone lengths.
+    Shared so the bind borrow and per-frame transfer never disagree.
     """
     bone_map = {}
     target_by_stem = {}
@@ -442,6 +607,38 @@ def _stem_pose_bone_map(source_arm, target_arm):
         tgt_name = target_by_stem.get(stem)
         if tgt_name is not None:
             bone_map[src_bone.name] = tgt_name
+
+    used_targets = set(bone_map.values())
+    target_by_role = {}
+    for tgt_bone in target_arm.pose.bones:
+        if tgt_bone.name in used_targets:
+            continue
+        role = _pose_bone_role(tgt_bone.name)
+        if role and role not in target_by_role:
+            target_by_role[role] = tgt_bone.name
+
+    semantic_matches = 0
+    for src_bone in source_arm.pose.bones:
+        if src_bone.name in bone_map:
+            continue
+        role = _pose_bone_role(src_bone.name)
+        if not role:
+            continue
+        for candidate_role in _role_fallbacks(role):
+            tgt_name = target_by_role.get(candidate_role)
+            if tgt_name is None or tgt_name in used_targets:
+                continue
+            bone_map[src_bone.name] = tgt_name
+            used_targets.add(tgt_name)
+            semantic_matches += 1
+            break
+
+    if semantic_matches:
+        print(
+            "[blender_scene_io] added "
+            f"{semantic_matches} semantic humanoid pose-map match(es) "
+            f"({len(bone_map)} total)."
+        )
     return bone_map
 
 
@@ -479,6 +676,74 @@ def build_target_fk_cache(target_arm) -> dict:
             rl = bone.bone.matrix_local
         rest_local[bone.name] = _matrix3_to_np(rl.to_3x3())
     return {"order": order, "rest_local": rest_local}
+
+
+def _can_use_same_rig_local_pose_transfer(source_arm, target_arm, bone_map) -> bool:
+    """Return true only when local pose channels are safe to copy verbatim.
+
+    Same-rig animation should not pass through the direction-only retargeter:
+    Blender already has the correct local channels, including any real
+    translate/scale keys. The guard is structural: every source and target pose
+    bone must map exactly once, parent links must agree under that mapping, and
+    the mapped bones must share the same local rest orientation. Equal names are
+    not enough: local animation channels are expressed in each bone's parent
+    frame, so copying them is only mathematically valid when those frames match.
+    """
+    if source_arm is None or target_arm is None or not bone_map:
+        return False
+    source_bones = source_arm.pose.bones
+    target_bones = target_arm.pose.bones
+    mapped = [
+        (src_name, tgt_name)
+        for src_name, tgt_name in bone_map.items()
+        if source_bones.get(src_name) is not None and target_bones.get(tgt_name) is not None
+    ]
+    if len(mapped) != len(source_bones) or len(mapped) != len(target_bones):
+        return False
+
+    for src_name, tgt_name in mapped:
+        src_bone = source_bones.get(src_name)
+        tgt_bone = target_bones.get(tgt_name)
+        if src_bone is None or tgt_bone is None:
+            return False
+
+        src_parent = src_bone.parent.name if src_bone.parent is not None else None
+        tgt_parent = tgt_bone.parent.name if tgt_bone.parent is not None else None
+        mapped_src_parent = bone_map.get(src_parent) if src_parent is not None else None
+        if src_parent is None or tgt_parent is None:
+            if src_parent != tgt_parent:
+                return False
+        elif mapped_src_parent != tgt_parent:
+            return False
+        src_rest = _rest_local_quat(src_bone.bone)
+        tgt_rest = _rest_local_quat(tgt_bone.bone)
+        if _quat_angle_degrees(src_rest, tgt_rest) > 2.0:
+            return False
+    return True
+
+
+def _copy_source_local_pose_to_target(source_arm, target_arm, bone_map) -> int:
+    """Copy evaluated local pose channels from source to target.
+
+    This is only valid for the guarded same-rig path. It preserves real source
+    action location/rotation/scale keys while keeping the target armature's own
+    rest head/tail positions and bone lengths.
+    """
+    for tgt_bone in target_arm.pose.bones:
+        tgt_bone.location = (0.0, 0.0, 0.0)
+        tgt_bone.rotation_mode = "QUATERNION"
+        tgt_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        tgt_bone.scale = (1.0, 1.0, 1.0)
+
+    posed = 0
+    for src_name, tgt_name in bone_map.items():
+        src_bone = source_arm.pose.bones.get(src_name)
+        tgt_bone = target_arm.pose.bones.get(tgt_name)
+        if src_bone is None or tgt_bone is None:
+            continue
+        tgt_bone.matrix_basis = src_bone.matrix_basis.copy()
+        posed += 1
+    return posed
 
 
 def _rotation_between_np(source, target) -> np.ndarray:
@@ -638,11 +903,8 @@ def _maybe_borrow_bind_from_animation(
     # Always override the model's own action with the bind donor when
     # the caller has provided one. Detecting whether a model's
     # auto-generated action is "real" or "T-pose dummy" turns out to
-    # be unreliable across FBX exporters — Mixamo "Without Animation"
-    # downloads sometimes come with a frame_range > 1 action that still
-    # encodes nothing but the T-pose. The user's directive is to ALWAYS
-    # use the optimization animation's first frame as bind, regardless
-    # of what unknown animation data the model may carry. Animations
+    # be unreliable across FBX exporters; the caller's contract is that
+    # bind_from_animation is the canonical setup-pose donor. Animations
     # the model brings remain available in `bpy.data.actions` so the
     # animation-extraction pass can still pick them up by name.
 
@@ -1302,7 +1564,110 @@ def _strip_object_transform_animation(objects) -> int:
     return removed
 
 
+def _build_mixamo_to_mannequin_map() -> dict:
+    """Canonical Mixamo bone names -> UE-mannequin (mesh2motion/quaternius) names.
+
+    Renaming gives downstream mappers a shared semantic vocabulary. It does not
+    make local action channels equivalent; direct local-channel transfer still
+    has to verify the bones' local bind frames.
+    """
+    mapping = {
+        "Hips": "pelvis",
+        "Spine": "spine_01",
+        "Spine1": "spine_02",
+        "Spine2": "spine_03",
+        "Neck": "neck_01",
+        "Head": "head",
+        "HeadTop_End": "head_leaf",
+    }
+    side_pairs = (("Left", "l"), ("Right", "r"))
+    for mx_side, mn_side in side_pairs:
+        mapping[f"{mx_side}Shoulder"] = f"clavicle_{mn_side}"
+        mapping[f"{mx_side}Arm"] = f"upperarm_{mn_side}"
+        mapping[f"{mx_side}ForeArm"] = f"lowerarm_{mn_side}"
+        mapping[f"{mx_side}Hand"] = f"hand_{mn_side}"
+        mapping[f"{mx_side}UpLeg"] = f"thigh_{mn_side}"
+        mapping[f"{mx_side}Leg"] = f"calf_{mn_side}"
+        mapping[f"{mx_side}Foot"] = f"foot_{mn_side}"
+        mapping[f"{mx_side}ToeBase"] = f"ball_{mn_side}"
+        mapping[f"{mx_side}Toe_End"] = f"ball_leaf_{mn_side}"
+        for mx_finger, mn_finger in (
+            ("Thumb", "thumb"),
+            ("Index", "index"),
+            ("Middle", "middle"),
+            ("Ring", "ring"),
+            ("Pinky", "pinky"),
+        ):
+            # Mixamo joints 1-3 are the mannequin's _01.._03; Mixamo's joint-4
+            # tip maps to the mannequin's _04_leaf so both rigs end with the
+            # same finger-tip bone and the deform signatures line up.
+            for joint in (1, 2, 3):
+                mapping[f"{mx_side}Hand{mx_finger}{joint}"] = f"{mn_finger}_0{joint}_{mn_side}"
+            mapping[f"{mx_side}Hand{mx_finger}4"] = f"{mn_finger}_04_leaf_{mn_side}"
+    return mapping
+
+
+MIXAMO_TO_MANNEQUIN = _build_mixamo_to_mannequin_map()
+_MIXAMO_PREFIX_RE = re.compile(r"^mixamorig\d*[:_]?", re.IGNORECASE)
+_LAST_IMPORT_CANONICALIZED_MIXAMO = False
+
+
+def _strip_mixamo_prefix(name: str) -> str:
+    stem = str(name or "")
+    if ":" in stem:
+        stem = stem.rsplit(":", 1)[-1]
+    return _MIXAMO_PREFIX_RE.sub("", stem)
+
+
+def canonicalize_mixamo_to_mannequin(imported_objects) -> bool:
+    """Rename a detected Mixamo rig (and its vertex groups) to UE-mannequin names.
+
+    No-op unless a quorum of core Mixamo bones is present, so non-Mixamo rigs are
+    untouched. This improves name-based mapping; it does not assert same-rig
+    local transform compatibility.
+    """
+    armatures = [obj for obj in imported_objects if obj.type == "ARMATURE"]
+    if not armatures:
+        return False
+    applied = False
+    for armature_obj in armatures:
+        rename_map = {}
+        for bone in armature_obj.data.bones:
+            mannequin = MIXAMO_TO_MANNEQUIN.get(_strip_mixamo_prefix(bone.name))
+            if mannequin and mannequin not in rename_map.values():
+                rename_map[bone.name] = mannequin
+        # Require the core spine+limb roots, not just a stray match, before
+        # rewriting names.
+        core = {"pelvis", "spine_01", "upperarm_l", "upperarm_r", "thigh_l", "thigh_r"}
+        if not core.issubset(set(rename_map.values())):
+            continue
+        existing = {bone.name for bone in armature_obj.data.bones}
+        for old_name, new_name in rename_map.items():
+            if new_name in existing and new_name != old_name:
+                continue  # never collide onto an existing bone
+            armature_obj.data.bones[old_name].name = new_name
+        meshes = [
+            obj
+            for obj in imported_objects
+            if obj.type == "MESH" and _mesh_uses_armature(obj, armature_obj)
+        ]
+        for mesh_obj in meshes:
+            for group in mesh_obj.vertex_groups:
+                target = rename_map.get(group.name)
+                if target:
+                    group.name = target
+        armature_obj["_flatrig_canonicalized_mixamo_to_mannequin"] = True
+        print(
+            f"[blender_scene_io] canonicalized Mixamo rig '{armature_obj.name}' to UE-mannequin "
+            f"names ({len(rename_map)} bones) for mapping."
+        )
+        applied = True
+    return applied
+
+
 def import_model(filepath: str) -> None:
+    global _LAST_IMPORT_CANONICALIZED_MIXAMO
+    _LAST_IMPORT_CANONICALIZED_MIXAMO = False
     extension = Path(filepath).suffix.lower()
     before = set(bpy.context.scene.objects)
     if extension == ".fbx":
@@ -1314,26 +1679,58 @@ def import_model(filepath: str) -> None:
         raise ValueError(f"Unsupported format: {extension}. Use .fbx, .glb, or .gltf.")
     imported = [obj for obj in bpy.context.scene.objects if obj not in before]
     _strip_object_transform_animation(imported)
+    # Canonicalize a detected Mixamo rig to UE-mannequin names at the single
+    # import entry point. After this, a Mixamo user input exposes mannequin-like
+    # names for mapping/review. The payload also records that canonicalization
+    # happened so C++ can avoid treating name overlap as native same-rig direct.
+    _LAST_IMPORT_CANONICALIZED_MIXAMO = canonicalize_mixamo_to_mannequin(imported)
     normalize_model_orientation(imported)
     sanitize_imported_armature_terminal_geometry(imported)
 
 
 def _structural_root_bone(armature_obj):
-    """Choose the top-level bone that owns the largest part of the hierarchy."""
+    """Choose the top-level bone that owns the largest part of the *deform* rig.
+
+    Name-agnostic and geometry/weight-based: a control rig (IK targets, pole
+    bones, driver hierarchy) can carry MORE bones than the deform skeleton and
+    would otherwise win a raw descendant count, handing the forward/orientation
+    inference a control root whose bone axes are arbitrary. We restrict the
+    choice to roots whose subtree actually skins the mesh, so the structural
+    root is the real deform root (e.g. ``root`` over a larger ``DRV_root``).
+    When no skin weights are available (BVH / animation-only rigs) this reduces
+    to the original largest-subtree rule.
+    """
     roots = [bone for bone in armature_obj.data.bones if bone.parent is None]
     if not roots:
         return None
 
-    def descendant_count(root):
+    deform_names = _deform_bone_names(armature_obj)
+
+    def deform_descendant_count(root):
         pending = list(root.children)
         count = 0
         while pending:
             child = pending.pop()
-            count += 1
+            if not deform_names or child.name in deform_names:
+                count += 1
             pending.extend(child.children)
         return count
 
-    return max(roots, key=lambda bone: (descendant_count(bone), float(bone.length)))
+    def subtree_has_deform(root):
+        if not deform_names:
+            return True
+        if root.name in deform_names:
+            return True
+        pending = list(root.children)
+        while pending:
+            child = pending.pop()
+            if child.name in deform_names:
+                return True
+            pending.extend(child.children)
+        return False
+
+    candidates = [root for root in roots if subtree_has_deform(root)] or roots
+    return max(candidates, key=lambda bone: (deform_descendant_count(bone), float(bone.length)))
 
 
 def _horizontal_direction(vector):
@@ -1542,6 +1939,62 @@ def _disambiguate_forward_with_mesh(forward, mesh_objects):
     return forward
 
 
+def _feet_forward_sign(armature_obj, forward):
+    """Return ``forward`` with its front/back sign corrected by the feet.
+
+    The structural-root axis fixes the forward *line*, but the sign a root bone
+    encodes is unreliable. For a legged rig the planted feet/toes point forward,
+    a robust name-agnostic sign cue: the low bones that point horizontally are
+    the feet, and their mean horizontal direction picks the sign. No-op when
+    there are no clear low horizontal bones (e.g. limbless rigs) or when the feet
+    do not line up with the forward axis (so a 90°-off axis is never trusted).
+    """
+    if armature_obj is None or forward is None:
+        return forward
+    bones = list(armature_obj.data.bones)
+    if not bones:
+        return forward
+    world = armature_obj.matrix_world
+    heads = [world @ bone.head_local for bone in bones]
+    tails = [world @ bone.tail_local for bone in bones]
+    zs = [p.z for p in heads] + [p.z for p in tails]
+    z_min, z_max = min(zs), max(zs)
+    if z_max - z_min < 1e-6:
+        return forward
+    low_cut = z_min + 0.25 * (z_max - z_min)
+    feet = mathutils.Vector((0.0, 0.0, 0.0))
+    count = 0
+    for head, tail in zip(heads, tails):
+        if max(head.z, tail.z) > low_cut:
+            continue
+        direction = tail - head
+        if direction.length < 1e-6:
+            continue
+        direction = direction.normalized()
+        if abs(direction.z) > 0.6:  # too vertical to be a forward-pointing foot
+            continue
+        feet += mathutils.Vector((direction.x, direction.y, 0.0))
+        count += 1
+    if count == 0 or feet.length < 1e-6:
+        return forward
+    feet.normalize()
+    forward_2d = mathutils.Vector((forward.x, forward.y, 0.0))
+    if forward_2d.length < 1e-6:
+        return forward
+    forward_2d.normalize()
+    alignment = forward_2d.x * feet.x + forward_2d.y * feet.y
+    if abs(alignment) < 0.3:  # feet not along the forward axis — do not trust
+        return forward
+    if alignment < 0.0:
+        print(
+            "[blender_scene_io] flipped forward sign using feet direction "
+            f"(feet={tuple(round(float(v), 2) for v in feet)}, "
+            f"was={tuple(round(float(v), 2) for v in forward)})"
+        )
+        return mathutils.Vector((-forward.x, -forward.y, forward.z))
+    return forward
+
+
 def normalize_model_orientation(objects=None, target_forward=NORMALIZE_TARGET_FORWARD) -> float:
     """Rotate just-imported rig objects about world Z so the rig faces the canonical -Y.
 
@@ -1565,6 +2018,12 @@ def normalize_model_orientation(objects=None, target_forward=NORMALIZE_TARGET_FO
     mesh_objects = [obj for obj in objects if obj.type == "MESH" and len(obj.data.vertices) > 0]
     if mesh_objects:
         forward = _disambiguate_forward_with_mesh(forward, mesh_objects)
+    # Correct the front/back SIGN from the feet. The structural-root axis fixes
+    # the forward line but its sign is unreliable (a UE/mesh2motion root bone's
+    # +Y points at the character's BACK), and a featureless mannequin head gives
+    # the mesh no protrusion to disambiguate it. Planted feet/toes point forward
+    # and are a robust, name-agnostic sign reference.
+    forward = _feet_forward_sign(armature_obj, forward)
     target = mathutils.Vector((float(target_forward[0]), float(target_forward[1]), 0.0))
     if target.length < 1e-6:
         return 0.0
@@ -1628,6 +2087,82 @@ def _weighted_bone_names(mesh_objects):
                 if name:
                     weighted_names.add(name)
     return weighted_names
+
+
+def _meshes_using_armature(armature_obj):
+    """Meshes skinned by ``armature_obj`` (parented or via an armature modifier)."""
+    meshes = []
+    for obj in bpy.data.objects:
+        if obj.type != "MESH" or not getattr(obj.data, "vertices", None):
+            continue
+        if len(obj.data.vertices) == 0:
+            continue
+        if obj.parent is armature_obj or any(
+            modifier.type == "ARMATURE" and modifier.object is armature_obj
+            for modifier in obj.modifiers
+        ):
+            meshes.append(obj)
+    return meshes
+
+
+# Per-process cache: the deform-bone classification scans every skin weight, so
+# we compute it once per armature (each CLI call is its own process / one rig).
+_DEFORM_BONE_NAME_CACHE: dict = {}
+
+
+def _deform_bone_names(armature_obj, mesh_objects=None):
+    """Name-agnostic deform skeleton: bones that skin the mesh, plus their
+    structural ancestors (pass-through connectors up to the root) and their
+    descendant tips (unweighted leaf/``*_leaf`` bones that hang off a deform
+    bone).
+
+    This is the rig-format-independent way to separate the deform skeleton from
+    a control rig: control bones (IK/pole/driver) carry no skin weight and live
+    in their own subtree, so they are excluded, while the genuine deform tree —
+    including tips that different authoring tools weight inconsistently — is kept
+    whole. Two rigs that share a skeleton (e.g. mesh2motion vs quaternius) then
+    yield the *same* deform set even though one wraps it in a control rig.
+    Returns an empty set when there are no skin weights (BVH / anim-only rigs).
+    """
+    if armature_obj is None:
+        return set()
+    cache_key = getattr(armature_obj, "name", None)
+    if cache_key:
+        cached = _DEFORM_BONE_NAME_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+    if mesh_objects is None:
+        mesh_objects = _meshes_using_armature(armature_obj)
+    weighted = _weighted_bone_names(mesh_objects) if mesh_objects else set()
+
+    bones = list(armature_obj.data.bones)
+    parent_of = {bone.name: (bone.parent.name if bone.parent else None) for bone in bones}
+    children_of: dict = {}
+    for name, parent in parent_of.items():
+        children_of.setdefault(parent, []).append(name)
+
+    deform = set(weighted)
+    # Structural ancestors of every weighted bone (keeps pass-through connectors
+    # such as the root above the pelvis).
+    for name in weighted:
+        cursor = parent_of.get(name)
+        while cursor is not None and cursor not in deform:
+            deform.add(cursor)
+            cursor = parent_of.get(cursor)
+    # Descendant tips of weighted bones (keeps unweighted leaves so tool-specific
+    # leaf weighting differences do not change the deform set).
+    stack = list(weighted)
+    while stack:
+        name = stack.pop()
+        for child in children_of.get(name, []):
+            if child not in deform:
+                deform.add(child)
+                stack.append(child)
+
+    if cache_key:
+        _DEFORM_BONE_NAME_CACHE[cache_key] = deform
+    return deform
 
 
 def _mesh_uses_armature(mesh_obj, armature_obj):
@@ -1989,10 +2524,21 @@ def inspect_source(source_path: str) -> dict[str, object]:
         }
 
     if armature_obj is not None:
+        deform_bone_names = sorted(_deform_bone_names(armature_obj, all_meshes))
+        bind_signature_bones = deform_bone_names or sorted(bone.name for bone in armature_obj.data.bones)
         payload["armature"] = {
             "name": armature_obj.name,
             "bone_count": int(len(armature_obj.data.bones)),
             "bone_names": sorted(bone.name for bone in armature_obj.data.bones),
+            # Name-agnostic deform skeleton (skin-weighted bones + connectors +
+            # tips). Lets the C++ "same rig" check compare deform skeletons and
+            # treat a control-rig-wrapped rig (mesh2motion) as identical to the
+            # bare same skeleton (quaternius) for direct retarget.
+            "deform_bone_names": deform_bone_names,
+            "local_bind_pose": _local_bind_pose_signature(armature_obj, bind_signature_bones),
+            "canonicalized_mixamo_to_mannequin": bool(
+                _LAST_IMPORT_CANONICALIZED_MIXAMO
+            ),
         }
         payload["actions"] = list_actions(armature_obj)
 
@@ -2062,86 +2608,6 @@ def get_bone_world_matrix(armature_obj, bone_name: str) -> list[list[float]]:
     ]
 
 
-def extract_mesh_data(mesh_obj) -> dict[str, Any]:
-    """Extract mesh vertices, normals, UVs, and weights from a mesh object."""
-    if mesh_obj is None:
-        return {"vertex_count": 0, "vertices": [], "triangles": []}
-
-    mesh = mesh_obj.data
-    if hasattr(mesh, "calc_loop_triangles"):
-        mesh.calc_loop_triangles()
-
-    # Get vertex groups for skinning weights
-    vertex_groups = {}
-    for i, vg in enumerate(mesh_obj.vertex_groups):
-        vertex_groups[vg.name] = i
-
-    vertices = []
-    normals = []
-    weights = []  # List of (bone_index, weight) pairs per vertex
-
-    mesh.calc_loop_triangles()
-
-    for vert in mesh.vertices:
-        # Position
-        co = vert.co
-        vertices.extend([co.x, co.y, co.z])
-
-        # Normal
-        no = vert.normal
-        normals.extend([no.x, no.y, no.z])
-
-        # Weights - collect from vertex groups
-        vertex_weights = []
-        for group in vert.groups:
-            if group.weight > 0.001:  # Skip very small weights
-                vertex_weights.append((group.group, group.weight))
-        if not vertex_weights:
-            vertex_weights = [(0, 1.0)]  # Default to first bone with full weight
-        weights.append(vertex_weights)
-
-    # Extract UVs from the first UV map
-    uv_layer = None
-    if hasattr(mesh, "uv_layers") and mesh.uv_layers:
-        uv_layer = mesh.uv_layers[0].data
-
-    # Build triangles from loop triangles
-    triangles = []
-    tri_uvs = []
-    for tri in mesh.loop_triangles:
-        triangles.extend([tri.vertices[0], tri.vertices[1], tri.vertices[2]])
-        if uv_layer:
-            tri_uvs.extend(
-                [
-                    [uv_layer[tri.loops[0]].uv.x, uv_layer[tri.loops[0]].uv.y],
-                    [uv_layer[tri.loops[1]].uv.x, uv_layer[tri.loops[1]].uv.y],
-                    [uv_layer[tri.loops[2]].uv.x, uv_layer[tri.loops[2]].uv.y],
-                ]
-            )
-
-    result = {
-        "vertex_count": len(mesh.vertices),
-        "triangle_count": len(mesh.loop_triangles),
-        "vertices": vertices,
-        "normals": normals,
-        "triangles": triangles,
-        "weights": weights,
-    }
-
-    if uv_layer:
-        result["uvs"] = tri_uvs if tri_uvs else []
-
-    # Extract base color texture from materials
-    base_color_data = extract_base_color_texture(mesh_obj)
-    if base_color_data:
-        result["base_color_rgba"] = base_color_data["rgba"]
-        result["base_color_width"] = base_color_data["width"]
-        result["base_color_height"] = base_color_data["height"]
-        result["base_color_channels"] = base_color_data["channels"]
-
-    return result
-
-
 def _base_color_image(mesh_obj):
     """Return the first image driving a material's base color."""
     if mesh_obj is None:
@@ -2191,27 +2657,6 @@ def _base_color_image(mesh_obj):
                         return image
 
     return None
-
-
-def extract_base_color_texture(mesh_obj) -> dict[str, Any] | None:
-    """Extract full-resolution base-color pixels as flattened RGBA."""
-    image = _base_color_image(mesh_obj)
-    if image is None:
-        return None
-    width, height = image.size
-    pixels = list(image.pixels)
-    rgba = []
-    for index in range(0, len(pixels), 4):
-        rgba.append(int(pixels[index] * 255))
-        rgba.append(int(pixels[index + 1] * 255))
-        rgba.append(int(pixels[index + 2] * 255))
-        rgba.append(int(pixels[index + 3] * 255))
-    return {
-        "rgba": rgba,
-        "width": width,
-        "height": height,
-        "channels": 4,
-    }
 
 
 def save_base_color_texture(mesh_obj, output_path: str) -> dict[str, Any] | None:
@@ -2717,6 +3162,8 @@ def _view_config_to_json(view_cfg):
         "basis_2d": np.asarray(view_cfg["basis_2d"], dtype=np.float64).tolist(),
         "basis_3d": np.asarray(view_cfg["basis_3d"], dtype=np.float64).tolist(),
         "roll_degrees": float(view_cfg.get("roll_degrees", 0.0)),
+        "auto_lateral_flip": bool(view_cfg.get("auto_lateral_flip", False)),
+        "lateral_sign": view_cfg.get("lateral_sign"),
     }
 
 
@@ -3274,28 +3721,29 @@ def export_3d_rest_bvh_cli(
         source_frame=source_frame,
         use_rest_pose=use_rest_pose,
     )
-    view_cfg = get_view_config(
+    view_cfg = get_scene_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
         up_hint=tuple(view_up) if view_up is not None else None,
         roll_degrees=view_roll,
+        armature_obj=armature_obj,
     )
-    bones_2d = extract_bone_hierarchy(
+    bones_2d = extract_setup_bone_hierarchy(
         armature_obj,
         view_cfg,
         source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
         projection_space=projection_space,
         projection_reference_root=None,
+        bind_borrow_info=bind_borrow_info,
     )
-    # Capture the 3D bind pose (head + world rotation per bone) at the same
-    # frame the sprite vertices were extracted from. Native LBS skinning needs
-    # this as the M_bind matrix; deriving it from head/tail alone loses the
-    # bone roll and causes z-fighting on off-axis vertices.
-    bind_pose_3d = extract_bone_hierarchy_3d(
+    # Capture the 3D bind orientation at the same donor setup frame used for
+    # sprites, but never borrow donor head/tail positions as target morphology.
+    bind_pose_3d = extract_setup_bone_hierarchy_3d(
         armature_obj,
         source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
+        bind_borrow_info=bind_borrow_info,
     )
     # The "rest" BVH that external matcher uses as the target reference must be
     # built from the actual 3D rest pose of the rig, NOT from the bind frame
@@ -3628,6 +4076,40 @@ def extract_bone_hierarchy(
     return bones
 
 
+def extract_setup_bone_hierarchy(
+    armature,
+    view_cfg,
+    *,
+    source_frame=None,
+    use_rest_pose=False,
+    projection_space="world",
+    projection_reference_root=None,
+    bind_borrow_info=None,
+):
+    """Extract setup bones from the target rig's retargeted donor pose.
+
+    `_copy_source_pose_to_target` writes rotations only and explicitly clears
+    pose-bone locations/scales. Evaluated heads/tails therefore come from the
+    target rig's own rest offsets under donor rotations, which is the pose the
+    mesh is rendered in. Do not splice rest-projected 2D lengths into this pose:
+    projection foreshortening changes with joint rotation and the resulting
+    hybrid skeleton no longer lines up with the rendered sprites.
+    """
+    bind_borrow_info = bind_borrow_info or {}
+    if bind_borrow_info.get("applied") and not use_rest_pose:
+        bind_borrow_info["setup_pose_mode"] = "target_retargeted_pose_no_translations"
+        bind_borrow_info["setup_morphology_source"] = "target_fk_offsets"
+        bind_borrow_info["setup_rotation_source"] = "donor_retarget"
+    return extract_bone_hierarchy(
+        armature,
+        view_cfg,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+        projection_space=projection_space,
+        projection_reference_root=projection_reference_root,
+    )
+
+
 def _weights_to_json(weights):
     """Convert weight dicts to JSON-serializable format."""
     serialized = []
@@ -3690,6 +4172,26 @@ def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
     return bones
 
 
+def extract_setup_bone_hierarchy_3d(
+    armature,
+    *,
+    source_frame=None,
+    use_rest_pose=False,
+    bind_borrow_info=None,
+):
+    """Extract 3D setup bones from the target rig's retargeted donor pose."""
+    bind_borrow_info = bind_borrow_info or {}
+    if bind_borrow_info.get("applied") and not use_rest_pose:
+        bind_borrow_info["setup_3d_pose_mode"] = "target_retargeted_pose_no_translations"
+        bind_borrow_info["setup_3d_morphology_source"] = "target_fk_offsets"
+        bind_borrow_info["setup_3d_rotation_source"] = "donor_retarget"
+    return extract_bone_hierarchy_3d(
+        armature,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+    )
+
+
 def _timeline_duration(timeline: dict[str, object]) -> float:
     duration = 0.0
     for key in ("rotate", "translate", "scale", "shear"):
@@ -3715,6 +4217,10 @@ def _serialize_animations(animations: dict[str, dict[str, object]]) -> list[dict
                 "duration": round(_animation_duration(payload), 4),
                 "bones": dict(payload.get("bones") or {}),
                 "frame_filter": dict(payload.get("frame_filter") or {}),
+                "source_authored_transform_keys": bool(
+                    payload.get("source_authored_transform_keys", False)
+                ),
+                "transfer_mode": str(payload.get("transfer_mode") or ""),
             }
         )
     records.sort(key=lambda record: str(record.get("name", "")).lower())
@@ -3737,8 +4243,9 @@ def _extract_scene_mesh_payload(
     Returns ``(mesh_data, mesh_reduction_report, source_weights)`` where
     ``source_weights`` is a per-2D-vertex list of {bone_index: weight} dicts.
     Used once per mesh object in the scene so each object becomes its own
-    sprite/slot. ``base_color_texture_output`` saves the diffuse texture to a
-    path (primary mesh only); when ``None`` the colour is embedded inline.
+    sprite/slot. ``base_color_texture_output`` is the PNG path the diffuse
+    texture is written to; the payload only ever carries a path reference,
+    never inline pixels.
     """
     mesh_reduction_report = reduce_mesh_object(
         mesh_obj,
@@ -3765,6 +4272,12 @@ def _extract_scene_mesh_payload(
         mesh_reduction_report["reason"] = "target_reached_before_uv_split"
     mesh_data["mesh_reduction"] = mesh_reduction_report
 
+    # Always write the diffuse/base-color texture to a separate PNG and emit a
+    # path reference — never embed pixels inline. A full-resolution inline RGBA
+    # array bloats the scene JSON to hundreds of MB (a 4K texture is ~67M ints)
+    # and is pure overhead for consumers that only need the bone hierarchy
+    # (e.g. the joint-mapping rig inspection, which silently failed when it had
+    # to parse the giant payload). Native consumers load the PNG on demand.
     if base_color_texture_output:
         texture_data = save_base_color_texture(mesh_obj, base_color_texture_output)
         if texture_data:
@@ -3772,13 +4285,6 @@ def _extract_scene_mesh_payload(
             mesh_data["base_color_texture_width"] = texture_data["width"]
             mesh_data["base_color_texture_height"] = texture_data["height"]
             mesh_data["base_color_texture_channels"] = texture_data["channels"]
-    else:
-        base_color_data = extract_base_color_texture(mesh_obj)
-        if base_color_data:
-            mesh_data["base_color_rgba"] = base_color_data["rgba"]
-            mesh_data["base_color_width"] = base_color_data["width"]
-            mesh_data["base_color_height"] = base_color_data["height"]
-            mesh_data["base_color_channels"] = base_color_data["channels"]
 
     try:
         from flatrig.mesh import transfer_3d_weights_to_2d
@@ -3834,18 +4340,17 @@ def extract_scene_cli(
 
     all_meshes, armature_obj = find_all_meshes_and_armature()
     mesh_obj = all_meshes[0] if all_meshes else None
-    if mesh_obj is None:
-        return {"ok": False, "detail": "No mesh found in scene"}
+    # Animation-only sources (e.g. Mixamo training clips exported without a
+    # skinned mesh) still carry a full armature. They cannot be built as 2D
+    # sprite characters, but they ARE valid rigs to inspect for joint mapping,
+    # so fall through with an empty mesh payload whenever an armature exists.
+    # Only a scene with neither mesh nor armature is truly uninspectable.
+    if mesh_obj is None and armature_obj is None:
+        return {"ok": False, "detail": "No mesh or armature found in scene"}
 
-    # Borrow a bind pose from an external animation when the source model
-    # didn't ship its own action. The animation FBX is imported into the
-    # same Blender scene; its action gets attached to the target
-    # armature, the scene frame snaps to the action's first frame, and
-    # the rest of the extraction runs against that posed armature. The
-    # mesh deformation captured by extract_2d_mesh / extract_bone_hierarchy
-    # then reflects the borrowed pose, giving the generated 2D rig a
-    # natural starting silhouette (typical walking step) instead of the
-    # bare T-pose that produces arm-flap on cross-rig retargets.
+    # Borrow the canonical setup pose from the donor animation whenever the
+    # caller provides one. The donor contributes retargeted joint rotations;
+    # setup extraction below keeps the target rig's own offsets/lengths.
     bind_borrow_info = _maybe_borrow_bind_from_animation(
         armature_obj,
         bind_from_animation,
@@ -3874,28 +4379,31 @@ def extract_scene_cli(
     )
 
     # Build view configuration
-    view_cfg = get_view_config(
+    view_cfg = get_scene_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
         up_hint=tuple(view_up) if view_up is not None else None,
         roll_degrees=view_roll,
+        armature_obj=armature_obj,
     )
 
     # Extract bone hierarchy
     bones = []
     if armature_obj is not None:
-        bones = extract_bone_hierarchy(
+        bones = extract_setup_bone_hierarchy(
             armature_obj,
             view_cfg,
             source_frame=setup_frame,
             use_rest_pose=use_rest_pose,
             projection_space=projection_space,
             projection_reference_root=None,
+            bind_borrow_info=bind_borrow_info,
         )
-    bones_3d = extract_bone_hierarchy_3d(
+    bones_3d = extract_setup_bone_hierarchy_3d(
         armature_obj,
         source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
+        bind_borrow_info=bind_borrow_info,
     )
 
     # Re-bind offset (EXPERIMENTAL, OFF by default — opt-in via env).
@@ -3950,8 +4458,18 @@ def extract_scene_cli(
     primary_mesh_data = None
     primary_source_weights = None
     primary_reduction = None
+    # Every mesh writes its base-color texture to its own PNG beside the output
+    # JSON (never inline). Honour an explicit --base-color-texture-output for the
+    # primary mesh; derive the rest so multi-object scenes (body + sword) each
+    # get a distinct file.
+    _output_path = Path(output_path)
+    _texture_stem = _output_path.parent / _output_path.stem
     for mesh_index, scene_mesh in enumerate(all_meshes):
         is_primary = mesh_index == 0
+        if is_primary and base_color_texture_output:
+            mesh_texture_output = base_color_texture_output
+        else:
+            mesh_texture_output = f"{_texture_stem}_basecolor_{mesh_index}.png"
         mesh_data, mesh_reduction_report, source_weights = _extract_scene_mesh_payload(
             scene_mesh,
             view_cfg,
@@ -3961,7 +4479,7 @@ def extract_scene_cli(
             mesh_reduction,
             mesh_target_vertices,
             weight_aware_decimation,
-            base_color_texture_output if is_primary else None,
+            mesh_texture_output,
         )
         meshes_payload.append(
             {
@@ -3984,11 +4502,15 @@ def extract_scene_cli(
         "setup_pose": setup_pose,
         "bind_borrow": bind_borrow_info,
         "use_rest_pose": bool(use_rest_pose),
-        "mesh": primary_mesh_data,
+        "view_config": _view_config_to_json(view_cfg),
+        # Meshless (animation-only) rigs leave the primary mesh None; emit an
+        # empty object so native consumers that read mesh sub-keys don't choke
+        # on a null while inspection still gets the populated bone hierarchy.
+        "mesh": primary_mesh_data if primary_mesh_data is not None else {},
         "meshes": meshes_payload,
         "bones": bones,
         "bones_3d": bones_3d,
-        "source_weights": _weights_to_json(primary_source_weights),
+        "source_weights": _weights_to_json(primary_source_weights or []),
         "mesh_reduction": primary_reduction,
     }
 
@@ -4068,20 +4590,23 @@ def extract_animations_cli(
     # its asymmetric stride would mislead the yaw inference).
     _align_root_unless_bind_borrowed(armature_obj, setup_frame, bind_borrow_info)
     # Build view configuration
-    view_cfg = get_view_config(
+    view_cfg = get_scene_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
         up_hint=tuple(view_up) if view_up is not None else None,
         roll_degrees=view_roll,
+        armature_obj=armature_obj,
     )
 
     # Extract bone hierarchy
-    bones = extract_bone_hierarchy(
+    bones = extract_setup_bone_hierarchy(
         armature_obj,
         view_cfg,
         source_frame=setup_frame,
+        use_rest_pose=False,
         projection_space=projection_space,
         projection_reference_root=None,
+        bind_borrow_info=bind_borrow_info,
     )
 
     # When bind_from_animation is set, the imported source armature was
@@ -4201,6 +4726,12 @@ def extract_animations_cli(
         "source": source_path,
         "setup_frame": setup_frame,
         "bones": bones,
+        # Name-agnostic deform skeleton so rig-only consumers (the pseudo-2D
+        # animation library) can drop control-rig / auxiliary joints from the
+        # preview. Empty when the clip carries no skin weights.
+        "deform_bone_names": sorted(
+            _deform_bone_names(armature_obj, [mesh_obj] if mesh_obj is not None else None)
+        ),
         "animations": serialized_animations,
         "preview_3d_animations": preview_3d_animations,
     }
@@ -4463,13 +4994,29 @@ def _extract_transferred_animation(
         _optimize_keyframes,
         _stabilize_frame_local_poses_2d,
         _collect_problem_frame_metrics,
+        _evaluate_problem_frame_sample,
         _select_problem_frame_samples,
+        _prepare_rotation_flatten,
+        _prepare_leaf_ik_refine,
+        _prepare_problem_frame_filter,
+        _build_leaf_ik_chains,
+        _build_local_rotation_reference,
+        _refine_frame_local_poses_with_leaf_ik,
+        _is_rotation_pose_mode,
     )
 
     # Build bone name mapping (source → target) — the same flat stem map the
     # bind borrow uses, so bind pose and transferred frames can never pair
     # bones differently.
     bone_map = _stem_pose_bone_map(source_arm, target_arm)
+    use_local_pose_transfer = _can_use_same_rig_local_pose_transfer(
+        source_arm, target_arm, bone_map
+    )
+    if use_local_pose_transfer:
+        print(
+            "[blender_scene_io] direct same-rig local transfer enabled "
+            f"({len(bone_map)} mapped pose bone(s)); preserving source local channels."
+        )
     # The target topology + rest rotations are constant across frames; derive
     # them once so the per-frame world-rotation copy stays cheap.
     fk_cache = build_target_fk_cache(target_arm)
@@ -4490,6 +5037,22 @@ def _extract_transferred_animation(
         frame_end = action_end
     fps = max(1.0, fps)
     total_duration = max(0.0, (frame_end - frame_start) / fps)
+    rotation_flatten_config = _prepare_rotation_flatten(
+        {
+            "amount": rotation_flatten or 0.0,
+            "scope": rotation_flatten_scope or "all",
+        }
+    )
+    leaf_ik_refine = _prepare_leaf_ik_refine(
+        {
+            "enabled": ik_leaf_refine_enabled,
+            "strength": ik_leaf_strength,
+            "iterations": ik_leaf_iterations,
+            "max_chain_length": ik_leaf_max_chain_length,
+            "preserve_scale": ik_leaf_preserve_scale,
+        }
+    )
+    leaf_ik_chains = _build_leaf_ik_chains(bones_setup, leaf_ik_refine)
 
     # Build sample times
     sample_points = []
@@ -4506,8 +5069,22 @@ def _extract_transferred_animation(
     scene.frame_set(setup_frame if setup_frame is not None else frame_start)
     bpy.context.view_layer.update()
     setup_segments = _sample_projected_bone_segments_2d(target_arm, bones_setup, view_cfg)
+    local_rotation_reference = None
+    if pose_mode == "local_rotation":
+        local_rotation_reference = _build_local_rotation_reference(
+            target_arm,
+            bones_setup,
+            view_cfg,
+        )
     setup_poses = _compute_frame_local_bone_poses_2d(
-        target_arm, bones_setup, view_cfg, projected_segments=setup_segments, pose_mode=pose_mode
+        target_arm,
+        bones_setup,
+        view_cfg,
+        projected_segments=setup_segments,
+        pose_mode=pose_mode,
+        rotation_flatten=rotation_flatten_config,
+        local_rotation_reference=local_rotation_reference,
+        decouple_scale=decouple_scale,
     )
 
     # Build stretch guard config
@@ -4522,7 +5099,9 @@ def _extract_transferred_animation(
     )
 
     # Build problem frame filter config
-    problem_frame_filter = {"enabled": drop_problematic_frames} if drop_problematic_frames else None
+    problem_frame_filter = _prepare_problem_frame_filter(
+        {"enabled": True} if drop_problematic_frames else None
+    )
 
     # Extract animation with stabilization and filtering
     bone_timelines = {}
@@ -4531,6 +5110,7 @@ def _extract_transferred_animation(
 
     previous_rotation = {}
     previous_stable_poses = None
+    previous_leaf_ik_poses = None
     previous_sample_metrics = None
     sample_records = []
 
@@ -4539,15 +5119,19 @@ def _extract_transferred_animation(
         scene.frame_set(frame, subframe=subframe)
         bpy.context.view_layer.update()
 
-        # Copy source pose to target bones (shared routine with the bind
-        # borrow — see _copy_source_pose_to_target).
-        _copy_source_pose_to_target(
-            source_arm,
-            target_arm,
-            bone_map,
-            copy_root_location=preserve_root_motion,
-            fk_cache=fk_cache,
-        )
+        if use_local_pose_transfer:
+            _copy_source_local_pose_to_target(source_arm, target_arm, bone_map)
+        else:
+            # Cross-rig transfer: match source bone directions while preserving
+            # the target roll/morphology. This intentionally does not copy
+            # donor/source translations or scales as anatomy compensation.
+            _copy_source_pose_to_target(
+                source_arm,
+                target_arm,
+                bone_map,
+                copy_root_location=preserve_root_motion,
+                fk_cache=fk_cache,
+            )
 
         bpy.context.view_layer.update()
 
@@ -4559,6 +5143,8 @@ def _extract_transferred_animation(
             view_cfg,
             projected_segments=segments,
             pose_mode=pose_mode,
+            rotation_flatten=rotation_flatten_config,
+            local_rotation_reference=local_rotation_reference,
             decouple_scale=decouple_scale,
         )
 
@@ -4571,13 +5157,32 @@ def _extract_transferred_animation(
             frame_poses = raw_poses
         previous_stable_poses = {name: pose.copy() for name, pose in frame_poses.items()}
 
+        if (
+            not _is_rotation_pose_mode(pose_mode)
+            and leaf_ik_refine.get("enabled", False)
+            and leaf_ik_chains
+        ):
+            frame_poses = _refine_frame_local_poses_with_leaf_ik(
+                frame_poses,
+                previous_leaf_ik_poses,
+                bones_setup,
+                segments,
+                leaf_ik_chains,
+                leaf_ik_refine,
+            )
+            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
+        elif leaf_ik_refine.get("enabled", False):
+            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
+
         # Collect problem frame metrics
         current_metrics = _collect_problem_frame_metrics(bones_setup, segments, frame_poses)
-        frame_filter = {
-            "drop": False,
-            "time": time,
-            "bones": current_metrics,
-        }
+        frame_filter = _evaluate_problem_frame_sample(
+            current_metrics,
+            previous_sample_metrics,
+            problem_frame_filter,
+            time_value=time,
+            fps=fps,
+        )
 
         # World-space 3D bone snapshot for this sample (same fields as
         # extract_bone_hierarchy_3d). Consumed by the native optimizer's
@@ -4686,26 +5291,26 @@ def _extract_transferred_animation(
         for name, tl in list(bone_timelines.items()):
             bone_timelines[name] = _optimize_keyframes(tl)
 
-    # Normalize frame 0 to identity: when the bind donor (shared across
-    # all extractions) differs from the animation source's first-frame
-    # pose, the raw deltas at frame 0 are non-zero because
-    # current_rot != setup_rot. Subtracting the frame-0 offset makes
-    # every animation start from identity (delta=0 at t=0) while
-    # preserving the full relative motion, so the weight optimizer can
-    # fit a single set of weights that works for all clips.
-    for name, tl in bone_timelines.items():
-        for channel in ("rotate",):
-            frames = tl.get(channel, [])
-            if len(frames) < 1:
-                continue
-            first_values = {}
-            for field in ("angle", "value"):
-                if field in frames[0]:
-                    first_values[field] = frames[0][field]
-            for f in frames:
-                for field, offset in first_values.items():
-                    if field in f:
-                        f[field] = round(f[field] - offset, 4)
+    if not use_local_pose_transfer:
+        # Normalize frame 0 to identity for cross-rig optimization clips: when
+        # the bind donor differs from the source first frame, direction-only
+        # transfer otherwise starts with a constant retarget bias. Same-rig
+        # local transfer deliberately skips this: the exported setup may be a
+        # donor pose, and the first animation key must carry the real source
+        # action from that setup to Blender's evaluated frame 0.
+        for name, tl in bone_timelines.items():
+            for channel in ("rotate",):
+                frames = tl.get(channel, [])
+                if len(frames) < 1:
+                    continue
+                first_values = {}
+                for field in ("angle", "value"):
+                    if field in frames[0]:
+                        first_values[field] = frames[0][field]
+                for f in frames:
+                    for field, offset in first_values.items():
+                        if field in f:
+                            f[field] = round(f[field] - offset, 4)
 
     anim_name = animation_names[0] if animation_names else src_action.name
     # Per-sample 3D bone snapshots (post problem-frame filter) in the same
@@ -4720,6 +5325,8 @@ def _extract_transferred_animation(
             "bones": bone_timelines,
             "frame_filter": {},
             "preview_3d": {"name": anim_name, "frames": preview_frames},
+            "source_authored_transform_keys": bool(use_local_pose_transfer),
+            "transfer_mode": "same_rig_local" if use_local_pose_transfer else "direction_retarget",
         }
     }
 
@@ -4819,11 +5426,12 @@ def render_sprites_cli(
     bpy.context.view_layer.update()
 
     # Build view configuration
-    view_cfg = get_view_config(
+    view_cfg = get_scene_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
         up_hint=tuple(view_up) if view_up is not None else None,
         roll_degrees=view_roll,
+        armature_obj=armature_obj,
     )
 
     # Get projection reference
@@ -5009,11 +5617,12 @@ def extract_mesh_targets_cli(
         weight_aware_decimation=weight_aware_decimation,
     )
 
-    view_cfg = get_view_config(
+    view_cfg = get_scene_view_config(
         view_name=view_preset,
         view_dir=tuple(view_dir) if view_dir is not None else None,
         up_hint=tuple(view_up) if view_up is not None else None,
         roll_degrees=view_roll,
+        armature_obj=armature_obj,
     )
 
     # Rebuild dedup map using the same call extract-scene uses on the
