@@ -532,11 +532,18 @@ def _pose_bone_role(name):
         return "neck"
 
     if "spine" in tokens or joined.startswith("spine"):
-        if "03" in tokens or "3" in tokens or joined.endswith("3") or joined.endswith("03"):
+        compact_suffix = None
+        if len(tokens) == 1 and joined.startswith("spine") and joined != "spine":
+            compact_suffix = joined[len("spine") :]
+        if (
+            "03" in tokens
+            or "3" in tokens
+            or compact_suffix in {"2", "02", "3", "03"}
+        ):
             return "spine2"
-        if "02" in tokens or "2" in tokens or joined.endswith("2") or joined.endswith("02"):
+        if "02" in tokens or "2" in tokens or compact_suffix in {"1", "01"}:
             return "spine1"
-        if "01" in tokens or "1" in tokens or joined.endswith("1") or joined.endswith("01"):
+        if "01" in tokens or "1" in tokens:
             return "spine0"
         return "spine0"
     if "upperchest" in joined or ("upper" in tokens and "chest" in tokens):
@@ -552,6 +559,7 @@ def _pose_bone_role(name):
         return prefix + "shoulder"
     if (
         "forearm" in joined
+        or "lowerarm" in joined
         or ("fore" in tokens and "arm" in tokens)
         or ("lower" in tokens and "arm" in tokens)
     ):
@@ -675,7 +683,17 @@ def build_target_fk_cache(target_arm) -> dict:
         else:
             rl = bone.bone.matrix_local
         rest_local[bone.name] = _matrix3_to_np(rl.to_3x3())
-    return {"order": order, "rest_local": rest_local}
+    # Static rest world rotation per bone (parent chain under an identity root).
+    # `order` is parent-first, so each parent is resolved before its children.
+    # Used by the twist transfer to re-anchor the donor's roll on the target's
+    # own rest mounting (independent of the posed parent -> no double-count).
+    rest_world = {}
+    for bone in order:
+        parent_rw = rest_world.get(bone.parent.name) if bone.parent is not None else None
+        if parent_rw is None:
+            parent_rw = np.eye(3, dtype=np.float64)
+        rest_world[bone.name] = parent_rw @ rest_local[bone.name]
+    return {"order": order, "rest_local": rest_local, "rest_world": rest_world}
 
 
 def _can_use_same_rig_local_pose_transfer(source_arm, target_arm, bone_map) -> bool:
@@ -779,29 +797,61 @@ def _rotation_between_np(source, target) -> np.ndarray:
     return np.eye(3) + skew + skew @ skew * (1.0 / (1.0 + c))
 
 
+def _twist_about_y_np(rot3) -> np.ndarray:
+    """Twist component of a 3x3 rotation about the bone axis (+Y), as 3x3.
+
+    Swing-twist decomposition keeping only the rotation about +Y and discarding
+    any swing that tilts Y. Used to graft the donor's roll *motion* onto a
+    direction-matched target bone without disturbing its aimed direction — the
+    direction-only copy preserves the target's rest roll and therefore drops the
+    donor's wrist/finger twist (12-60deg on this fixture). At the donor's rest
+    frame this is identity (no twist), so a static roll mismatch never spins the
+    target's mesh (the auto-rig "face backwards" regression stays fixed).
+    """
+    if mathutils is None:
+        return np.eye(3, dtype=np.float64)
+    q = mathutils.Matrix(np.asarray(rot3, dtype=np.float64).tolist()).to_quaternion()
+    n = math.hypot(q.w, q.y)
+    if n < 1e-9:
+        return np.eye(3, dtype=np.float64)
+    twist = mathutils.Quaternion((q.w / n, 0.0, q.y / n, 0.0))
+    return _matrix3_to_np(twist.to_matrix())
+
+
 def _copy_source_pose_to_target(
-    source_arm, target_arm, bone_map, *, copy_root_location=False, fk_cache=None
+    source_arm, target_arm, bone_map, *, copy_root_location=False, fk_cache=None,
+    transfer_twist=True,
 ) -> int:
     """Reproduce the source pose on the target by matching each mapped bone's
-    world DIRECTION while keeping the target rig's own roll (world-direction
-    retargeting), solved top-down.
+    world DIRECTION (plus the donor's twist motion about that direction) while
+    keeping the target rig's own rest roll, solved top-down.
 
     Both rigs are facing-normalized at import, so pointing each target bone
-    along its source bone's world direction follows the donor's motion. Crucially
-    the target bone's ROLL is left at its rest value (only the minimal rotation
-    that aligns the directions is applied) — this is what makes it work on rigs
-    whose bone axes differ from the donor's:
+    along its source bone's world direction follows the donor's motion. The
+    target bone's REST ROLL is preserved (only the minimal rotation that aligns
+    the directions is applied) — this is what makes it work on rigs whose bone
+    axes differ from the donor's:
 
     * A raw local-channel copy applies the donor's swing about the target's
       differently-rolled local axis → a forward/back walk swung the auto-rigged
       piggy's legs sideways (plane rotated 90°).
-    * Copying the donor's FULL world rotation (direction + roll) fixes the swing
-      but forces the donor's roll onto the target; since the piggy's auto-rig
-      mounts its mesh against different local axes, that spun the head/face
-      around — the character animated correctly but faced backwards.
+    * Copying the donor's FULL ABSOLUTE world rotation forces the donor's static
+      roll onto the target; since the piggy's auto-rig mounts its mesh against
+      different local axes, that spun the head/face around (animated correctly
+      but faced backwards).
     * Matching only the world DIRECTION fixes the swing AND preserves how the
-      target mounts its mesh (face stays forward). Reduces to an exact copy when
-      the rolls already agree (Mixamo Walk.fbx / Ch36 stay correct).
+      target mounts its mesh, but it DISCARDS the donor's twist about the bone
+      axis. On a renamed-but-not-reoriented rig (e.g. a Mixamo target whose rest
+      rolls differ 90-180° from a Mannequin donor) that lost twist reaches
+      12-60° on upper arms / hands / fingers and visibly deforms hands.
+
+    `transfer_twist` adds back only the donor's twist MOTION about the aimed
+    axis (swing-twist split, `_twist_about_y_np`). It is rest-relative: the twist
+    is the difference between the direction-only frame and the donor's
+    rest-compensated rotation re-anchored on the target's own static rest, so at
+    the donor's rest frame it is identity (no static roll is forced → the piggy
+    face-spin stays fixed) and it degenerates to an exact copy when the rolls
+    already agree (Mixamo Walk.fbx / Ch36 stay correct).
 
     The bind borrow and `_extract_transferred_animation` both call this so the
     bind/setup pose stays consistent with the transferred clip at the setup
@@ -810,6 +860,7 @@ def _copy_source_pose_to_target(
     cache = fk_cache or build_target_fk_cache(target_arm)
     order = cache["order"]
     rest_local = cache["rest_local"]
+    rest_world_static = cache.get("rest_world", {})
 
     inverse_map = {}
     for src_name, tgt_name in bone_map.items():
@@ -834,11 +885,24 @@ def _copy_source_pose_to_target(
         src_name = inverse_map.get(tgt_bone.name)
         src_bone = source_arm.pose.bones.get(src_name) if src_name else None
         if src_bone is not None:
-            # Source bone direction (its local +Y) in the target's armature space.
-            src_dir = aw_tgt_inv @ (aw_src @ (_matrix3_to_np(src_bone.matrix.to_3x3()) @ bone_y))
+            # Source bone full rotation and direction (+Y) in target armature space.
+            src_pose_w = aw_tgt_inv @ (aw_src @ _matrix3_to_np(src_bone.matrix.to_3x3()))
+            src_dir = src_pose_w @ bone_y
             rest_dir = rest_world @ bone_y
             align = _rotation_between_np(rest_dir, src_dir)
             desired_world = align @ rest_world  # reorient direction, keep target roll
+            tgt_rest_static = rest_world_static.get(tgt_bone.name)
+            if transfer_twist and tgt_rest_static is not None:
+                # Graft the donor's twist about the aimed axis. rc_world is the
+                # donor's rotation-from-rest re-anchored on the target's static
+                # rest; keep only the twist of (direction-only)^-1 @ rc_world so
+                # the aimed direction is untouched.
+                src_rest_w = aw_tgt_inv @ (
+                    aw_src @ _matrix3_to_np(src_bone.bone.matrix_local.to_3x3())
+                )
+                rc_world = (src_pose_w @ np.linalg.inv(src_rest_w)) @ tgt_rest_static
+                twist = _twist_about_y_np(np.linalg.inv(desired_world) @ rc_world)
+                desired_world = desired_world @ twist
             posed += 1
         else:
             # Unmapped target bone: leave it at its rest orientation.
