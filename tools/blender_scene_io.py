@@ -3780,6 +3780,7 @@ def export_3d_rest_bvh_cli(
         "projection_space": projection_space,
         "setup_frame": setup_frame,
         "setup_pose": setup_pose,
+        "bind_borrow_info": bind_borrow_info,
         "use_rest_pose": bool(use_rest_pose),
         "retarget_use_rest_pose": bool(use_rest_pose),
         "view": _view_config_to_json(view_cfg),
@@ -5241,7 +5242,7 @@ def _extract_transferred_animation(
             current = frame_poses[name]
             setup = setup_poses[name]
 
-            raw_rotation = current["rotation"] - setup["rotation"]
+            raw_rotation = _normalize_angle(current["rotation"] - setup["rotation"])
             rel_rotation = _unwrap_angle_near(raw_rotation, previous_rotation.get(name))
             previous_rotation[name] = rel_rotation
 
@@ -5294,27 +5295,6 @@ def _extract_transferred_animation(
     if optimize_animation_keys:
         for name, tl in list(bone_timelines.items()):
             bone_timelines[name] = _optimize_keyframes(tl)
-
-    if not use_local_pose_transfer:
-        # Normalize frame 0 to identity for cross-rig optimization clips: when
-        # the bind donor differs from the source first frame, direction-only
-        # transfer otherwise starts with a constant retarget bias. Same-rig
-        # local transfer deliberately skips this: the exported setup may be a
-        # donor pose, and the first animation key must carry the real source
-        # action from that setup to Blender's evaluated frame 0.
-        for name, tl in bone_timelines.items():
-            for channel in ("rotate",):
-                frames = tl.get(channel, [])
-                if len(frames) < 1:
-                    continue
-                first_values = {}
-                for field in ("angle", "value"):
-                    if field in frames[0]:
-                        first_values[field] = frames[0][field]
-                for f in frames:
-                    for field, offset in first_values.items():
-                        if field in f:
-                            f[field] = round(f[field] - offset, 4)
 
     anim_name = animation_names[0] if animation_names else src_action.name
     # Per-sample 3D bone snapshots (post problem-frame filter) in the same
@@ -5936,6 +5916,7 @@ def main() -> None:
             projection_space=args.projection_space,
             fps=args.fps,
             frame_count=args.frame_count,
+            bind_from_animation=getattr(args, "bind_from_animation", None),
         )
     elif args.command == "dump-rig-animation":
         payload = dump_rig_animation_cli(
