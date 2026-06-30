@@ -1865,6 +1865,10 @@ def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
     bpy.ops.export_scene.fbx(
         filepath=str(flat_path), use_selection=False, object_types={"ARMATURE", "MESH"},
         add_leaf_bones=False, bake_anim=False,
+        # Carry the source textures into the reduced FBX (the source packs them);
+        # a plain export drops the packed image data and the build renders magenta.
+        # The downstream extract-scene still writes a separate PNG -- nothing inline.
+        path_mode="COPY", embed_textures=True,
     )
     report["flat_output"] = str(flat_path)
     return report
