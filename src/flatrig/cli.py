@@ -22,6 +22,7 @@ from flatrig.scene_formats import (
     extract_scene,
     inspect_3d_source,
     probe_scene_backend,
+    reduce_rig_to_canonical,
     render_sprites,
 )
 
@@ -185,6 +186,17 @@ def main() -> None:
     bake_rig_parser.add_argument("--output", required=True)
     bake_rig_parser.add_argument("--bake-spec", required=True)
     bake_rig_parser.add_argument("--flat-output", required=True)
+
+    reduce_rig_parser = subparsers.add_parser(
+        "reduce-rig-to-canonical",
+        help=(
+            "reduce a biped-humanoid rig to the canonical KayKit skeleton in place "
+            "on the mesh (rename/drop/reparent bones, transfer weights) and export"
+        ),
+    )
+    reduce_rig_parser.add_argument("source")
+    reduce_rig_parser.add_argument("--output", required=True)
+    reduce_rig_parser.add_argument("--flat-output", required=True)
 
 
     extract_mesh_targets_parser = subparsers.add_parser(
@@ -370,6 +382,17 @@ def main() -> None:
             args.source,
             args.output,
             bake_spec=args.bake_spec,
+            flat_output=args.flat_output,
+        )
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "reduce-rig-to-canonical":
+        result = reduce_rig_to_canonical(
+            args.source,
+            args.output,
             flat_output=args.flat_output,
         )
         print(json.dumps(result.payload, indent=2))

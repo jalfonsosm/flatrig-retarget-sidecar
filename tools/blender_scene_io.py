@@ -1358,6 +1358,7 @@ def parse_args() -> argparse.Namespace:
             "extract-mesh-targets",
             "dump-rig-animation",
             "bake-rig-animation",
+            "reduce-rig-to-canonical",
         ),
     )
     parser.add_argument("source")
@@ -1727,6 +1728,146 @@ def canonicalize_mixamo_to_mannequin(imported_objects) -> bool:
         )
         applied = True
     return applied
+
+
+# --- Canonical KayKit rig reduction (input-side) ----------------------------
+# Collapse a BIPED HUMANOID rig to the 21-bone canonical KayKit skeleton in place
+# on the user's mesh: rename the bones that map, drop the surplus (fingers,
+# clavicles, neck, the 3rd spine, leaf/twist bones) transferring their skin
+# weights to the nearest kept ancestor, and reparent the survivors into the
+# canonical hierarchy WITHOUT moving them (offsets preserved). The source side is
+# the UE-mannequin deform naming that ``canonicalize_mixamo_to_mannequin`` and the
+# importer normalize Mixamo/Quaternius/Mesh2Motion to.
+_UE_TO_KAYKIT = {
+    "root": "root", "pelvis": "hips", "spine_01": "spine", "spine_03": "chest",
+    "head": "head",
+    "upperarm_l": "upperarm.l", "upperarm_r": "upperarm.r",
+    "lowerarm_l": "lowerarm.l", "lowerarm_r": "lowerarm.r",
+    "hand_l": "wrist.l", "hand_r": "wrist.r",
+    "thigh_l": "upperleg.l", "thigh_r": "upperleg.r",
+    "calf_l": "lowerleg.l", "calf_r": "lowerleg.r",
+    "foot_l": "foot.l", "foot_r": "foot.r",
+    "ball_l": "toes.l", "ball_r": "toes.r",
+}
+_CANON_HUMANOID_CORE = {"hips", "head", "upperarm.l", "upperarm.r", "upperleg.l", "upperleg.r"}
+
+
+def is_humanoid_biped(bone_names) -> bool:
+    """Only biped humanoids may be reduced; quadruped/winged/limbless are left as
+    is (their names resolve almost nothing under the map)."""
+    resolved = {_UE_TO_KAYKIT.get(n) for n in bone_names}
+    resolved.discard(None)
+    return _CANON_HUMANOID_CORE.issubset(resolved) and ("spine" in resolved or "chest" in resolved)
+
+
+def _reduce_armature_to_canonical(armature_obj, meshes):
+    data = armature_obj.data
+    canon = {b.name: _UE_TO_KAYKIT.get(b.name) for b in data.bones}
+    kept_original_by_canon = {c: name for name, c in canon.items() if c}
+
+    survivor = {}
+    dropped = []
+    for bone in data.bones:
+        if canon.get(bone.name):
+            continue
+        dropped.append(bone.name)
+        parent = bone.parent
+        surv = None
+        while parent is not None:
+            if canon.get(parent.name):
+                surv = canon[parent.name]
+                break
+            parent = parent.parent
+        survivor[bone.name] = surv
+
+    # Merge dropped bones' skin weights into the survivor's vertex group, then drop
+    # the empty groups and rename the kept groups to canonical.
+    for mesh in meshes:
+        vgs = mesh.vertex_groups
+        for dropped_name in dropped:
+            surv_canon = survivor.get(dropped_name)
+            surv_original = kept_original_by_canon.get(surv_canon) if surv_canon else None
+            src = vgs.get(dropped_name)
+            dst = vgs.get(surv_original) if surv_original else None
+            if src is None or dst is None:
+                continue
+            src_index = src.index
+            for vert in mesh.data.vertices:
+                for ge in vert.groups:
+                    if ge.group == src_index and ge.weight > 0.0:
+                        dst.add([vert.index], ge.weight, "ADD")
+        for dropped_name in dropped:
+            g = vgs.get(dropped_name)
+            if g is not None:
+                vgs.remove(g)
+        for original, canon_name in canon.items():
+            if canon_name:
+                g = vgs.get(original)
+                if g is not None and g.name != canon_name:
+                    g.name = canon_name
+
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    ebs = data.edit_bones
+    nearest_kept_original = {}
+    for name, canon_name in canon.items():
+        if not canon_name:
+            continue
+        anc = ebs[name].parent
+        while anc is not None and not canon.get(anc.name):
+            anc = anc.parent
+        nearest_kept_original[name] = anc.name if anc is not None else None
+    for name, parent_name in nearest_kept_original.items():
+        # Disconnect FIRST so a connected bone does not snap onto the new parent's
+        # tail (that yanks shoulders onto the chest -- "shoulders out of the neck").
+        ebs[name].use_connect = False
+        ebs[name].parent = ebs.get(parent_name) if parent_name else None
+    for dropped_name in dropped:
+        eb = ebs.get(dropped_name)
+        if eb is not None:
+            ebs.remove(eb)
+    for name, canon_name in list(canon.items()):
+        if canon_name and name in ebs and canon_name not in ebs:
+            ebs[name].name = canon_name
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return {"kept_count": len([c for c in canon.values() if c]), "dropped_count": len(dropped)}
+
+
+def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
+    """Reduce a humanoid rig to canonical and export to ``flat_output`` (.fbx).
+
+    Non-humanoid rigs are exported unchanged with ``reduced=False`` so the caller
+    can fall back to the existing cross-rig retarget path.
+    """
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+    mesh_obj, armature_obj = find_mesh_and_armature()
+    if armature_obj is None:
+        return {"ok": False, "detail": "No armature found in source."}
+    meshes = [o for o in bpy.data.objects if o.type == "MESH" and _mesh_uses_armature(o, armature_obj)]
+    bone_names = [b.name for b in armature_obj.data.bones]
+    before = len(armature_obj.data.bones)
+    report = {"ok": True, "source": source_path, "reduced": False, "bones_before": before}
+    if is_humanoid_biped(bone_names):
+        report.update(_reduce_armature_to_canonical(armature_obj, meshes))
+        report["reduced"] = True
+        report["bones_after"] = len(armature_obj.data.bones)
+        unweighted = 0
+        for mesh in meshes:
+            for v in mesh.data.vertices:
+                if not any(g.weight > 0.0 for g in v.groups):
+                    unweighted += 1
+        report["unweighted_vertices"] = unweighted
+    else:
+        report["detail"] = "not_humanoid_biped"
+    flat_path = Path(flat_output).expanduser().resolve()
+    flat_path.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.export_scene.fbx(
+        filepath=str(flat_path), use_selection=False, object_types={"ARMATURE", "MESH"},
+        add_leaf_bones=False, bake_anim=False,
+    )
+    report["flat_output"] = str(flat_path)
+    return report
 
 
 def import_model(filepath: str) -> None:
@@ -6000,6 +6141,14 @@ def main() -> None:
             str(output_path),
             bake_spec=args.bake_spec,
             flat_output=args.flat_output,
+        )
+    elif args.command == "reduce-rig-to-canonical":
+        if not args.flat_output:
+            raise ValueError("--flat-output is required for reduce-rig-to-canonical")
+        payload = reduce_rig_to_canonical_cli(
+            source_path,
+            str(output_path),
+            args.flat_output,
         )
     elif args.command == "extract-mesh-targets":
         view_dir = None

@@ -668,6 +668,22 @@ def bake_rig_animation(
     return _run_blender_command_with_args("bake-rig-animation", source, output, extra_args)
 
 
+def reduce_rig_to_canonical(
+    source: str,
+    output: str,
+    *,
+    flat_output: str,
+) -> SceneCommandResult:
+    """Reduce a biped-humanoid rig to the canonical KayKit skeleton in place on the
+    mesh and export it to ``flat_output``. Non-humanoid rigs export unchanged
+    (``reduced=False`` in the report)."""
+    extra_args = ["--flat-output", str(Path(flat_output).expanduser().resolve())]
+    probe = probe_scene_backend_impl()
+    if probe.mode == "bpy_module" and probe.available:
+        return _run_bpy_command_with_args("reduce-rig-to-canonical", source, output, extra_args)
+    return _run_blender_command_with_args("reduce-rig-to-canonical", source, output, extra_args)
+
+
 def export_3d_animation_bvh(
     source: str,
     output: str,
