@@ -5111,6 +5111,21 @@ def bake_rig_animation_cli(
     scene = bpy.context.scene
     scene.frame_start = frames[0]
     scene.frame_end = frames[-1]
+
+    # FBX exports the armature's CURRENT pose as the bind/rest transform while
+    # also exporting actions as takes. Leaving the newly baked action active at
+    # its first frame therefore bakes frame 1 into the FBX rest pose and the
+    # re-imported action comes back nearly identity (the apparent "root/rest is
+    # tilted" regression). Keep the action in bpy.data for all-actions export,
+    # but detach it and reset the evaluated pose to the canonical rest before
+    # writing the file.
+    if armature_obj.animation_data is not None:
+        armature_obj.animation_data.action = None
+    for pose_bone in armature_obj.pose.bones:
+        pose_bone.location = (0.0, 0.0, 0.0)
+        pose_bone.rotation_mode = "QUATERNION"
+        pose_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+        pose_bone.scale = (1.0, 1.0, 1.0)
     scene.frame_set(frames[0])
     bpy.context.view_layer.update()
 
