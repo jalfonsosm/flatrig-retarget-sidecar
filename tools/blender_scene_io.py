@@ -1629,52 +1629,7 @@ def _strip_object_transform_animation(objects) -> int:
     return removed
 
 
-def _build_mixamo_to_mannequin_map() -> dict:
-    """Canonical Mixamo bone names -> UE-mannequin (mesh2motion/quaternius) names.
-
-    Renaming gives downstream mappers a shared semantic vocabulary. It does not
-    make local action channels equivalent; direct local-channel transfer still
-    has to verify the bones' local bind frames.
-    """
-    mapping = {
-        "Hips": "pelvis",
-        "Spine": "spine_01",
-        "Spine1": "spine_02",
-        "Spine2": "spine_03",
-        "Neck": "neck_01",
-        "Head": "head",
-        "HeadTop_End": "head_leaf",
-    }
-    side_pairs = (("Left", "l"), ("Right", "r"))
-    for mx_side, mn_side in side_pairs:
-        mapping[f"{mx_side}Shoulder"] = f"clavicle_{mn_side}"
-        mapping[f"{mx_side}Arm"] = f"upperarm_{mn_side}"
-        mapping[f"{mx_side}ForeArm"] = f"lowerarm_{mn_side}"
-        mapping[f"{mx_side}Hand"] = f"hand_{mn_side}"
-        mapping[f"{mx_side}UpLeg"] = f"thigh_{mn_side}"
-        mapping[f"{mx_side}Leg"] = f"calf_{mn_side}"
-        mapping[f"{mx_side}Foot"] = f"foot_{mn_side}"
-        mapping[f"{mx_side}ToeBase"] = f"ball_{mn_side}"
-        mapping[f"{mx_side}Toe_End"] = f"ball_leaf_{mn_side}"
-        for mx_finger, mn_finger in (
-            ("Thumb", "thumb"),
-            ("Index", "index"),
-            ("Middle", "middle"),
-            ("Ring", "ring"),
-            ("Pinky", "pinky"),
-        ):
-            # Mixamo joints 1-3 are the mannequin's _01.._03; Mixamo's joint-4
-            # tip maps to the mannequin's _04_leaf so both rigs end with the
-            # same finger-tip bone and the deform signatures line up.
-            for joint in (1, 2, 3):
-                mapping[f"{mx_side}Hand{mx_finger}{joint}"] = f"{mn_finger}_0{joint}_{mn_side}"
-            mapping[f"{mx_side}Hand{mx_finger}4"] = f"{mn_finger}_04_leaf_{mn_side}"
-    return mapping
-
-
-MIXAMO_TO_MANNEQUIN = _build_mixamo_to_mannequin_map()
 _MIXAMO_PREFIX_RE = re.compile(r"^mixamorig\d*[:_]?", re.IGNORECASE)
-
 
 
 def _strip_mixamo_prefix(name: str) -> str:
@@ -1682,52 +1637,6 @@ def _strip_mixamo_prefix(name: str) -> str:
     if ":" in stem:
         stem = stem.rsplit(":", 1)[-1]
     return _MIXAMO_PREFIX_RE.sub("", stem)
-
-
-def canonicalize_mixamo_to_mannequin(imported_objects) -> bool:
-    """Rename a detected Mixamo rig (and its vertex groups) to UE-mannequin names.
-
-    No-op unless a quorum of core Mixamo bones is present, so non-Mixamo rigs are
-    untouched. This improves name-based mapping; it does not assert same-rig
-    local transform compatibility.
-    """
-    armatures = [obj for obj in imported_objects if obj.type == "ARMATURE"]
-    if not armatures:
-        return False
-    applied = False
-    for armature_obj in armatures:
-        rename_map = {}
-        for bone in armature_obj.data.bones:
-            mannequin = MIXAMO_TO_MANNEQUIN.get(_strip_mixamo_prefix(bone.name))
-            if mannequin and mannequin not in rename_map.values():
-                rename_map[bone.name] = mannequin
-        # Require the core spine+limb roots, not just a stray match, before
-        # rewriting names.
-        core = {"pelvis", "spine_01", "upperarm_l", "upperarm_r", "thigh_l", "thigh_r"}
-        if not core.issubset(set(rename_map.values())):
-            continue
-        existing = {bone.name for bone in armature_obj.data.bones}
-        for old_name, new_name in rename_map.items():
-            if new_name in existing and new_name != old_name:
-                continue  # never collide onto an existing bone
-            armature_obj.data.bones[old_name].name = new_name
-        meshes = [
-            obj
-            for obj in imported_objects
-            if obj.type == "MESH" and _mesh_uses_armature(obj, armature_obj)
-        ]
-        for mesh_obj in meshes:
-            for group in mesh_obj.vertex_groups:
-                target = rename_map.get(group.name)
-                if target:
-                    group.name = target
-        armature_obj["_flatrig_canonicalized_mixamo_to_mannequin"] = True
-        print(
-            f"[blender_scene_io] canonicalized Mixamo rig '{armature_obj.name}' to UE-mannequin "
-            f"names ({len(rename_map)} bones) for mapping."
-        )
-        applied = True
-    return applied
 
 
 # --- FlatRig HML22 rig reduction (input-side) -------------------------------
