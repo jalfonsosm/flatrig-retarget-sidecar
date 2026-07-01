@@ -1674,7 +1674,7 @@ def _build_mixamo_to_mannequin_map() -> dict:
 
 MIXAMO_TO_MANNEQUIN = _build_mixamo_to_mannequin_map()
 _MIXAMO_PREFIX_RE = re.compile(r"^mixamorig\d*[:_]?", re.IGNORECASE)
-_LAST_IMPORT_CANONICALIZED_MIXAMO = False
+
 
 
 def _strip_mixamo_prefix(name: str) -> str:
@@ -1787,6 +1787,23 @@ _CANONICAL_ALIASES = {
     "left_arm": "shoulder.l", "right_arm": "shoulder.r",
     "left_forearm": "elbow.l", "right_forearm": "elbow.r",
     "left_hand": "wrist.l", "right_hand": "wrist.r",
+    # VRoid aliases.
+    "jbipchest": "spine.2",
+    "jbipupperchest": "spine.3",
+    "jbiplupperarm": "shoulder.l",
+    "jbiprupperarm": "shoulder.r",
+    "jbipllowerarm": "elbow.l",
+    "jbiprlowerarm": "elbow.r",
+    "jbiplhand": "wrist.l",
+    "jbiprhand": "wrist.r",
+    "jbiplupperleg": "hip.l",
+    "jbiprupperleg": "hip.r",
+    "jbipllowerleg": "knee.l",
+    "jbiprlowerleg": "knee.r",
+    "jbiplfoot": "ankle.l",
+    "jbiprfoot": "ankle.r",
+    "jbipltoes": "foot.l",
+    "jbiprtoes": "foot.r",
 }
 _CANONICAL_ALIAS_KEYS = {}
 for _alias_name, _canon_name in _CANONICAL_ALIASES.items():
@@ -1928,15 +1945,13 @@ def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
         # Carry the source textures into the reduced FBX (the source packs them);
         # a plain export drops the packed image data and the build renders magenta.
         # The downstream extract-scene still writes a separate PNG -- nothing inline.
-        path_mode="COPY", embed_textures=True,
+        path_mode="COPY", embed_textures=True, bake_space_transform=True,
     )
     report["flat_output"] = str(flat_path)
     return report
 
 
 def import_model(filepath: str) -> None:
-    global _LAST_IMPORT_CANONICALIZED_MIXAMO
-    _LAST_IMPORT_CANONICALIZED_MIXAMO = False
     extension = Path(filepath).suffix.lower()
     before = set(bpy.context.scene.objects)
     if extension == ".fbx":
@@ -1948,11 +1963,7 @@ def import_model(filepath: str) -> None:
         raise ValueError(f"Unsupported format: {extension}. Use .fbx, .glb, or .gltf.")
     imported = [obj for obj in bpy.context.scene.objects if obj not in before]
     _strip_object_transform_animation(imported)
-    # Canonicalize a detected Mixamo rig to UE-mannequin names at the single
-    # import entry point. After this, a Mixamo user input exposes mannequin-like
-    # names for mapping/review. The payload also records that canonicalization
-    # happened so C++ can avoid treating name overlap as native same-rig direct.
-    _LAST_IMPORT_CANONICALIZED_MIXAMO = canonicalize_mixamo_to_mannequin(imported)
+    # (Removed) Mixamo is no longer canonicalized to mannequin; it maps directly to canonical later.
     normalize_model_orientation(imported)
     sanitize_imported_armature_terminal_geometry(imported)
 
@@ -2805,9 +2816,7 @@ def inspect_source(source_path: str) -> dict[str, object]:
             # bare same skeleton (quaternius) for direct retarget.
             "deform_bone_names": deform_bone_names,
             "local_bind_pose": _local_bind_pose_signature(armature_obj, bind_signature_bones),
-            "canonicalized_mixamo_to_mannequin": bool(
-                _LAST_IMPORT_CANONICALIZED_MIXAMO
-            ),
+            "canonicalized_mixamo_to_mannequin": False,
         }
         payload["actions"] = list_actions(armature_obj)
 
@@ -5201,6 +5210,7 @@ def bake_rig_animation_cli(
             bake_anim=True,
             bake_anim_use_all_bones=True,
             bake_anim_use_nla_strips=False,
+            bake_space_transform=True,
             # One take per action, named after the action. With the scene
             # bake (all_actions=False) the take is always called "Scene", so
             # the re-imported clip loses its name and downstream
