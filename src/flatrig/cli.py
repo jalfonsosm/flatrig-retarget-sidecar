@@ -190,7 +190,7 @@ def main() -> None:
     reduce_rig_parser = subparsers.add_parser(
         "reduce-rig-to-canonical",
         help=(
-            "reduce a biped-humanoid rig to the canonical KayKit skeleton in place "
+            "reduce a biped-humanoid rig to the FlatRig HML22 canonical skeleton in place "
             "on the mesh (rename/drop/reparent bones, transfer weights) and export"
         ),
     )

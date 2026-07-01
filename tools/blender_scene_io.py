@@ -1730,39 +1730,93 @@ def canonicalize_mixamo_to_mannequin(imported_objects) -> bool:
     return applied
 
 
-# --- Canonical KayKit rig reduction (input-side) ----------------------------
-# Collapse a BIPED HUMANOID rig to the 21-bone canonical KayKit skeleton in place
-# on the user's mesh: rename the bones that map, drop the surplus (fingers,
-# clavicles, neck, the 3rd spine, leaf/twist bones) transferring their skin
-# weights to the nearest kept ancestor, and reparent the survivors into the
-# canonical hierarchy WITHOUT moving them (offsets preserved). The source side is
-# the UE-mannequin deform naming that ``canonicalize_mixamo_to_mannequin`` and the
-# importer normalize Mixamo/Quaternius/Mesh2Motion to.
-_UE_TO_KAYKIT = {
-    "root": "root", "pelvis": "hips", "spine_01": "spine", "spine_03": "chest",
-    "head": "head",
-    "upperarm_l": "upperarm.l", "upperarm_r": "upperarm.r",
-    "lowerarm_l": "lowerarm.l", "lowerarm_r": "lowerarm.r",
+# --- FlatRig HML22 rig reduction (input-side) -------------------------------
+# Collapse a BIPED HUMANOID rig to the FlatRig 22-bone canonical skeleton in
+# place on the user's mesh. The topology mirrors HumanML3D/T2M, but the internal
+# names are owned by FlatRig: core, spine.1/2/3, collar/shoulder/elbow/wrist,
+# hip/knee/ankle/foot, neck, head. Unknown/non-humanoid rigs are exported
+# untouched so the caller can use the generic/GMR path.
+_CANONICAL_ALIASES = {
+    # UE mannequin / Quaternius / Mesh2Motion deform names.
+    "root": "core", "pelvis": "core",
+    "spine_01": "spine.1", "spine_02": "spine.2", "spine_03": "spine.3",
+    "neck_01": "neck", "head": "head",
+    "clavicle_l": "collar.l", "clavicle_r": "collar.r",
+    "upperarm_l": "shoulder.l", "upperarm_r": "shoulder.r",
+    "lowerarm_l": "elbow.l", "lowerarm_r": "elbow.r",
     "hand_l": "wrist.l", "hand_r": "wrist.r",
-    "thigh_l": "upperleg.l", "thigh_r": "upperleg.r",
-    "calf_l": "lowerleg.l", "calf_r": "lowerleg.r",
-    "foot_l": "foot.l", "foot_r": "foot.r",
-    "ball_l": "toes.l", "ball_r": "toes.r",
+    "thigh_l": "hip.l", "thigh_r": "hip.r",
+    "calf_l": "knee.l", "calf_r": "knee.r",
+    "foot_l": "ankle.l", "foot_r": "ankle.r",
+    "ball_l": "foot.l", "ball_r": "foot.r",
+    # HumanML3D / SMPL-style names.
+    "left_hip": "hip.l", "right_hip": "hip.r",
+    "spine1": "spine.1", "spine2": "spine.2", "spine3": "spine.3",
+    "left_knee": "knee.l", "right_knee": "knee.r",
+    "left_ankle": "ankle.l", "right_ankle": "ankle.r",
+    "left_foot": "foot.l", "right_foot": "foot.r",
+    "left_collar": "collar.l", "right_collar": "collar.r",
+    "left_shoulder": "shoulder.l", "right_shoulder": "shoulder.r",
+    "left_elbow": "elbow.l", "right_elbow": "elbow.r",
+    "left_wrist": "wrist.l", "right_wrist": "wrist.r",
+    # Mixamo names for callers that bypass import-time mannequin normalization.
+    "Hips": "core", "Spine": "spine.1", "Spine1": "spine.2", "Spine2": "spine.3",
+    "Neck": "neck", "Head": "head",
+    "LeftShoulder": "collar.l", "RightShoulder": "collar.r",
+    "LeftArm": "shoulder.l", "RightArm": "shoulder.r",
+    "LeftForeArm": "elbow.l", "RightForeArm": "elbow.r",
+    "LeftHand": "wrist.l", "RightHand": "wrist.r",
+    "LeftUpLeg": "hip.l", "RightUpLeg": "hip.r",
+    "LeftLeg": "knee.l", "RightLeg": "knee.r",
+    "LeftFoot": "ankle.l", "RightFoot": "ankle.r",
+    "LeftToeBase": "foot.l", "RightToeBase": "foot.r",
+    # Legacy FlatRig/KayKit names for transitional already-reduced assets.
+    "hips": "core", "spine": "spine.1", "chest": "spine.3",
+    "upperarm.l": "shoulder.l", "upperarm.r": "shoulder.r",
+    "lowerarm.l": "elbow.l", "lowerarm.r": "elbow.r",
+    "wrist.l": "wrist.l", "wrist.r": "wrist.r",
+    "hand.l": "wrist.l", "hand.r": "wrist.r",
+    "upperleg.l": "hip.l", "upperleg.r": "hip.r",
+    "lowerleg.l": "knee.l", "lowerleg.r": "knee.r",
+    "foot.l": "ankle.l", "foot.r": "ankle.r",
+    "toes.l": "foot.l", "toes.r": "foot.r",
+    # Common auto-rig aliases.
+    "upper_chest": "spine.3",
+    "left_upper_leg": "hip.l", "right_upper_leg": "hip.r",
+    "left_lower_leg": "knee.l", "right_lower_leg": "knee.r",
+    "left_arm": "shoulder.l", "right_arm": "shoulder.r",
+    "left_forearm": "elbow.l", "right_forearm": "elbow.r",
+    "left_hand": "wrist.l", "right_hand": "wrist.r",
 }
-_CANON_HUMANOID_CORE = {"hips", "head", "upperarm.l", "upperarm.r", "upperleg.l", "upperleg.r"}
+_CANONICAL_ALIAS_KEYS = {}
+for _alias_name, _canon_name in _CANONICAL_ALIASES.items():
+    _key = re.sub(r"[^a-z0-9]+", "_", _strip_mixamo_prefix(_alias_name).lower()).strip("_")
+    _CANONICAL_ALIAS_KEYS[_key] = _canon_name
+    _CANONICAL_ALIAS_KEYS[_key.replace("_", "")] = _canon_name
+_CANON_HUMANOID_CORE = {"core", "head", "shoulder.l", "shoulder.r", "hip.l", "hip.r"}
+
+
+def _canonical_target_for_bone_name(name: str):
+    leaf = _strip_mixamo_prefix(name)
+    if leaf in _CANONICAL_ALIASES:
+        return _CANONICAL_ALIASES[leaf]
+    key = re.sub(r"[^a-z0-9]+", "_", str(leaf).lower()).strip("_")
+    return _CANONICAL_ALIAS_KEYS.get(key) or _CANONICAL_ALIAS_KEYS.get(key.replace("_", ""))
 
 
 def is_humanoid_biped(bone_names) -> bool:
     """Only biped humanoids may be reduced; quadruped/winged/limbless are left as
     is (their names resolve almost nothing under the map)."""
-    resolved = {_UE_TO_KAYKIT.get(n) for n in bone_names}
+    resolved = {_canonical_target_for_bone_name(n) for n in bone_names}
     resolved.discard(None)
-    return _CANON_HUMANOID_CORE.issubset(resolved) and ("spine" in resolved or "chest" in resolved)
+    return _CANON_HUMANOID_CORE.issubset(resolved) and (
+        "spine.1" in resolved or "spine.2" in resolved or "spine.3" in resolved
+    )
 
 
 def _reduce_armature_to_canonical(armature_obj, meshes):
     data = armature_obj.data
-    canon = {b.name: _UE_TO_KAYKIT.get(b.name) for b in data.bones}
+    canon = {b.name: _canonical_target_for_bone_name(b.name) for b in data.bones}
     kept_original_by_canon = {c: name for name, c in canon.items() if c}
 
     survivor = {}
@@ -1847,7 +1901,13 @@ def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
     meshes = [o for o in bpy.data.objects if o.type == "MESH" and _mesh_uses_armature(o, armature_obj)]
     bone_names = [b.name for b in armature_obj.data.bones]
     before = len(armature_obj.data.bones)
-    report = {"ok": True, "source": source_path, "reduced": False, "bones_before": before}
+    report = {
+        "ok": True,
+        "source": source_path,
+        "canonical_format": "flatrig_hml22",
+        "reduced": False,
+        "bones_before": before,
+    }
     if is_humanoid_biped(bone_names):
         report.update(_reduce_armature_to_canonical(armature_obj, meshes))
         report["reduced"] = True

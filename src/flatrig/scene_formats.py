@@ -674,7 +674,7 @@ def reduce_rig_to_canonical(
     *,
     flat_output: str,
 ) -> SceneCommandResult:
-    """Reduce a biped-humanoid rig to the canonical KayKit skeleton in place on the
+    """Reduce a biped-humanoid rig to the FlatRig HML22 canonical skeleton in place on the
     mesh and export it to ``flat_output``. Non-humanoid rigs export unchanged
     (``reduced=False`` in the report)."""
     extra_args = ["--flat-output", str(Path(flat_output).expanduser().resolve())]
