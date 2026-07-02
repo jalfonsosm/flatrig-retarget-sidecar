@@ -259,6 +259,13 @@ def _extract_current_action_bone_animation(
         name = bone_info["name"]
         bone_timelines[name] = {"rotate": [], "translate": [], "scale": []}
 
+    # Bones whose rest axis is nearly parallel to the camera in THIS view (e.g. the
+    # clavicle in a side view) project to almost no length, so their extracted 2D
+    # rotation is noise and flips ~90deg frame to frame, dragging their children
+    # with them. Decide the set once per clip and hold those bones at their setup
+    # rotation in the pose computation (view-aware and stable — no per-frame toggle).
+    frozen_bone_names = _camera_parallel_bone_names(armature, bones_setup)
+
     sample_points = []
     substeps = max(1, sample_substeps)
     for frame in range(frame_start, frame_end):
@@ -310,6 +317,7 @@ def _extract_current_action_bone_animation(
                 projection_inverse=projection_inverse,
                 pose_mode="rotation_only",
                 rotation_flatten=rotation_flatten,
+                frozen_bone_names=frozen_bone_names,
             )
             raw_full_poses = _compute_frame_local_bone_poses_2d(
                 armature,
@@ -319,6 +327,7 @@ def _extract_current_action_bone_animation(
                 projection_inverse=projection_inverse,
                 pose_mode="full",
                 rotation_flatten=rotation_flatten,
+                frozen_bone_names=frozen_bone_names,
             )
             stable_full_poses = _stabilize_frame_local_poses_2d(
                 raw_full_poses,
@@ -342,6 +351,7 @@ def _extract_current_action_bone_animation(
                 pose_mode=pose_mode,
                 rotation_flatten=rotation_flatten,
                 local_rotation_reference=local_rotation_reference,
+                frozen_bone_names=frozen_bone_names,
             )
             if _is_rotation_pose_mode(pose_mode):
                 frame_poses = raw_frame_poses
@@ -509,6 +519,40 @@ def _extract_current_action_bone_animation(
     }
 
 
+def _camera_parallel_bone_names(armature, bones_setup, fraction=0.3):
+    """Names of bones whose rest axis is nearly parallel to the camera in this view.
+
+    Compares each bone's setup 2D (projected) length to its true 3D bone length:
+    a bone pointing at the camera foreshortens to almost nothing, so its projected
+    direction — and the rotation extracted from it — is unreliable for the whole
+    clip. The skeleton's MEDIAN foreshortening is used as the reference so the test
+    is invariant to any global 2D scale; a bone far below that median is flagged.
+    Returns an empty set when there isn't enough data to judge (leaves behaviour
+    unchanged for degenerate/empty rigs).
+    """
+    if armature is None or getattr(armature, "data", None) is None:
+        return set()
+    ratios = {}
+    for bone_info in bones_setup:
+        name = bone_info.get("name")
+        if not name:
+            continue
+        bone = armature.data.bones.get(name)
+        length_3d = float(getattr(bone, "length", 0.0) or 0.0)
+        if length_3d <= BONE_SCALE_EPSILON:
+            continue
+        length_2d = float(bone_info.get("length", 0.0) or 0.0)
+        ratios[name] = length_2d / length_3d
+    if len(ratios) < 3:
+        return set()
+    ordered = sorted(ratios.values())
+    median = ordered[len(ordered) // 2]
+    if median <= BONE_SCALE_EPSILON:
+        return set()
+    threshold = fraction * median
+    return {name for name, ratio in ratios.items() if ratio < threshold}
+
+
 def _compute_frame_local_bone_poses_2d(
     armature,
     bones_setup,
@@ -519,6 +563,7 @@ def _compute_frame_local_bone_poses_2d(
     rotation_flatten=None,
     local_rotation_reference=None,
     decouple_scale=False,
+    frozen_bone_names=None,
 ):
     """Compute current local 2D transforms by inverting the parent 2D basis.
 
@@ -570,7 +615,23 @@ def _compute_frame_local_bone_poses_2d(
 
         if bone_info["parent"]:
             parent_state = world_cache[bone_info["parent"]]
-            if _is_rotation_pose_mode(pose_mode):
+            if bone_name in (frozen_bone_names or ()):
+                # This bone points nearly along the camera axis for the WHOLE clip
+                # (e.g. the clavicle in a side view): its projected direction is
+                # essentially noise, so its extracted 2D rotation flips ~90deg
+                # frame to frame and drags its children with it. Hold its SETUP
+                # local rotation so it — and everything hanging off it — stays put.
+                # The set is decided once per clip (never per frame), so there is
+                # no static/compute toggling that would jump between keys.
+                local_x = float(bone_info.get("x", 0.0))
+                local_y = float(bone_info.get("y", 0.0))
+                local_rotation = float(bone_info.get("rotation", 0.0))
+                local_scale_x = 1.0
+                world_matrix = parent_state["rigid_matrix"] @ _build_2d_basis(local_rotation, 1.0)
+                world_head = parent_state["head"] + (
+                    parent_state["matrix"] @ np.array((local_x, local_y), dtype=np.float64)
+                )
+            elif _is_rotation_pose_mode(pose_mode):
                 local_x = float(bone_info.get("x", 0.0))
                 local_y = float(bone_info.get("y", 0.0))
                 if pose_mode == "local_rotation":
