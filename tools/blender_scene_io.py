@@ -5209,6 +5209,7 @@ def _extract_transferred_animation(
         _prepare_problem_frame_filter,
         _build_leaf_ik_chains,
         _build_local_rotation_reference,
+        _camera_parallel_bone_names,
         _refine_frame_local_poses_with_leaf_ik,
         _is_rotation_pose_mode,
     )
@@ -5284,6 +5285,7 @@ def _extract_transferred_animation(
             bones_setup,
             view_cfg,
         )
+    frozen_bone_names = _camera_parallel_bone_names(target_arm, bones_setup)
     setup_poses = _compute_frame_local_bone_poses_2d(
         target_arm,
         bones_setup,
@@ -5293,6 +5295,7 @@ def _extract_transferred_animation(
         rotation_flatten=rotation_flatten_config,
         local_rotation_reference=local_rotation_reference,
         decouple_scale=decouple_scale,
+        frozen_bone_names=frozen_bone_names,
     )
 
     # Build stretch guard config
@@ -5354,6 +5357,7 @@ def _extract_transferred_animation(
             rotation_flatten=rotation_flatten_config,
             local_rotation_reference=local_rotation_reference,
             decouple_scale=decouple_scale,
+            frozen_bone_names=frozen_bone_names,
         )
 
         # Stabilize frame poses (prevents short-bone flipping)
