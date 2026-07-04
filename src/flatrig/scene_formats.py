@@ -517,6 +517,38 @@ def extract_scene(
     return _run_blender_command_with_args("extract-scene", source, output, extra_args)
 
 
+def cleanup_mesh(
+    source: str,
+    output: str,
+    *,
+    glb_output: str,
+    target_triangles: int = 10000,
+    voxel_remesh: bool = True,
+    remove_loose: bool = True,
+) -> SceneCommandResult:
+    """Clean a raw generated mesh (image-to-3D output) for auto-rigging.
+
+    Joins mesh objects, drops floating debris, optionally voxel-remeshes
+    (closes holes; discards UVs) and decimates to ``target_triangles``, then
+    writes ``glb_output``. The report JSON goes to ``output``.
+    """
+    extra_args = [
+        "--glb-output",
+        str(Path(glb_output).expanduser().resolve()),
+        "--target-triangles",
+        str(int(target_triangles)),
+    ]
+    if not voxel_remesh:
+        extra_args.append("--no-voxel-remesh")
+    if not remove_loose:
+        extra_args.append("--no-remove-loose")
+
+    probe = probe_scene_backend_impl()
+    if probe.mode == "bpy_module" and probe.available:
+        return _run_bpy_command_with_args("cleanup-mesh", source, output, extra_args)
+    return _run_blender_command_with_args("cleanup-mesh", source, output, extra_args)
+
+
 def extract_animations(
     source: str,
     output: str,

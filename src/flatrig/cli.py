@@ -13,6 +13,7 @@ from pathlib import Path
 from flatrig import __version__
 from flatrig.scene_formats import (
     bake_rig_animation,
+    cleanup_mesh,
     convert_3d_source,
     dump_rig_animation,
     export_3d_animation_bvh,
@@ -249,6 +250,21 @@ def main() -> None:
     export_anim_bvh_parser.add_argument("--frame-start", type=int, default=None)
     export_anim_bvh_parser.add_argument("--frame-end", type=int, default=None)
 
+    cleanup_mesh_parser = subparsers.add_parser(
+        "cleanup-mesh",
+        help="clean a raw generated mesh (join, drop debris, remesh, decimate) to GLB",
+    )
+    cleanup_mesh_parser.add_argument("source")
+    cleanup_mesh_parser.add_argument("--output", required=True)
+    cleanup_mesh_parser.add_argument("--glb-output", required=True)
+    cleanup_mesh_parser.add_argument("--target-triangles", type=int, default=10000)
+    cleanup_mesh_parser.add_argument(
+        "--no-voxel-remesh", dest="voxel_remesh", action="store_false", default=True
+    )
+    cleanup_mesh_parser.add_argument(
+        "--no-remove-loose", dest="remove_loose", action="store_false", default=True
+    )
+
     export_rest_bvh_parser = subparsers.add_parser(
         "export-3d-rest-bvh",
         help="export the rest/bind pose to BVH via the public Blender sidecar",
@@ -394,6 +410,20 @@ def main() -> None:
             args.source,
             args.output,
             flat_output=args.flat_output,
+        )
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
+
+    if args.command == "cleanup-mesh":
+        result = cleanup_mesh(
+            args.source,
+            args.output,
+            glb_output=args.glb_output,
+            target_triangles=args.target_triangles,
+            voxel_remesh=args.voxel_remesh,
+            remove_loose=args.remove_loose,
         )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:

@@ -1359,6 +1359,7 @@ def parse_args() -> argparse.Namespace:
             "dump-rig-animation",
             "bake-rig-animation",
             "reduce-rig-to-canonical",
+            "cleanup-mesh",
         ),
     )
     parser.add_argument("source")
@@ -1522,6 +1523,32 @@ def parse_args() -> argparse.Namespace:
         "--flat-output",
         default=None,
         help="Animation file (.fbx/.glb) written by bake-rig-animation",
+    )
+    # cleanup-mesh parameters
+    parser.add_argument(
+        "--glb-output",
+        default=None,
+        help="Cleaned mesh GLB written by cleanup-mesh",
+    )
+    parser.add_argument(
+        "--target-triangles",
+        type=int,
+        default=10000,
+        help="Triangle budget for cleanup-mesh decimation (0 disables)",
+    )
+    parser.add_argument(
+        "--no-voxel-remesh",
+        dest="voxel_remesh",
+        action="store_false",
+        default=True,
+        help="Skip the voxel remesh pass (keeps UVs; leaves holes as-is)",
+    )
+    parser.add_argument(
+        "--no-remove-loose",
+        dest="remove_loose",
+        action="store_false",
+        default=True,
+        help="Keep floating debris islands",
     )
     return parser.parse_args(script_args)
 
@@ -2762,6 +2789,141 @@ def convert_source(source_path: str, output_path: str) -> dict[str, object]:
         "output": str(export_path),
         "target_format": "glb",
         "inspection": inspected,
+    }
+
+
+def _mesh_triangle_count(mesh_obj) -> int:
+    return sum(max(0, len(polygon.vertices) - 2) for polygon in mesh_obj.data.polygons)
+
+
+def _drop_debris_islands(mesh_obj, min_dimension_fraction: float = 0.1):
+    """Split loose parts and delete floating debris islands.
+
+    Keeps every island whose world-space bounding size is at least
+    ``min_dimension_fraction`` of the largest island, then rejoins the
+    keepers. Returns ``(joined_mesh_obj, dropped_count)``.
+    """
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.delete_loose()
+    bpy.ops.mesh.separate(type="LOOSE")
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    parts = [obj for obj in bpy.context.selected_objects if obj.type == "MESH"]
+    if not parts:
+        return mesh_obj, 0
+    sizes = {part.name: max(part.dimensions) for part in parts}
+    largest_size = max(sizes.values()) if sizes else 0.0
+    keepers = [
+        part
+        for part in parts
+        if largest_size <= 0.0 or sizes[part.name] >= min_dimension_fraction * largest_size
+    ]
+    dropped = [part for part in parts if part not in keepers]
+    for part in dropped:
+        mesh_data = part.data
+        bpy.data.objects.remove(part, do_unlink=True)
+        if mesh_data.users == 0:
+            bpy.data.meshes.remove(mesh_data)
+
+    bpy.ops.object.select_all(action="DESELECT")
+    primary = max(keepers, key=lambda part: sizes[part.name])
+    for part in keepers:
+        part.select_set(True)
+    bpy.context.view_layer.objects.active = primary
+    if len(keepers) > 1:
+        bpy.ops.object.join()
+    return bpy.context.view_layer.objects.active, len(dropped)
+
+
+def cleanup_generated_mesh(
+    source_path: str,
+    *,
+    glb_output: str,
+    target_triangles: int = 10000,
+    voxel_remesh: bool = True,
+    remove_loose: bool = True,
+) -> dict[str, object]:
+    """Prepare a raw image-to-3D mesh for auto-rigging.
+
+    Import -> join mesh objects -> drop floating debris -> optional voxel
+    remesh (closes holes; single manifold skin; note it discards UVs, so it
+    should stay off for textured generators) -> decimate to the triangle
+    budget -> GLB export. Armatures are neither expected nor preserved.
+    """
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+    import_model(source_path)
+
+    mesh_objects = [obj for obj in bpy.context.scene.objects if obj.type == "MESH"]
+    if not mesh_objects:
+        return {"ok": False, "detail": "Source has no mesh objects.", "source": source_path}
+
+    bpy.ops.object.select_all(action="DESELECT")
+    for obj in mesh_objects:
+        obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_objects[0]
+    if len(mesh_objects) > 1:
+        bpy.ops.object.join()
+    mesh_obj = bpy.context.view_layer.objects.active
+    bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+    triangles_before = _mesh_triangle_count(mesh_obj)
+
+    dropped_islands = 0
+    if remove_loose:
+        mesh_obj, dropped_islands = _drop_debris_islands(mesh_obj)
+
+    voxel_remesh_applied = False
+    if voxel_remesh:
+        diagonal = float(mesh_obj.dimensions.length)
+        if diagonal > 1e-6:
+            mesh_obj.data.remesh_voxel_size = max(diagonal / 120.0, 1e-4)
+            bpy.context.view_layer.objects.active = mesh_obj
+            bpy.ops.object.voxel_remesh()
+            voxel_remesh_applied = True
+
+    triangles_current = _mesh_triangle_count(mesh_obj)
+    decimated = False
+    if target_triangles > 0 and triangles_current > target_triangles:
+        modifier = mesh_obj.modifiers.new(name="flatrig_cleanup_decimate", type="DECIMATE")
+        modifier.ratio = max(0.01, float(target_triangles) / float(triangles_current))
+        modifier.use_collapse_triangulate = True
+        bpy.context.view_layer.objects.active = mesh_obj
+        bpy.ops.object.modifier_apply(modifier=modifier.name)
+        decimated = True
+
+    export_path = Path(glb_output).expanduser().resolve()
+    if export_path.suffix.lower() != ".glb":
+        export_path = export_path.with_suffix(".glb")
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    bpy.context.view_layer.objects.active = mesh_obj
+    bpy.ops.export_scene.gltf(
+        filepath=str(export_path),
+        export_format="GLB",
+        export_yup=True,
+        export_animations=False,
+        export_skins=False,
+        export_texcoords=True,
+        export_normals=True,
+        export_materials="EXPORT",
+        use_selection=True,
+    )
+
+    return {
+        "ok": True,
+        "detail": "cleaned",
+        "source": source_path,
+        "output": str(export_path),
+        "triangles_before": int(triangles_before),
+        "triangles_after": int(_mesh_triangle_count(mesh_obj)),
+        "islands_dropped": int(dropped_islands),
+        "voxel_remesh_applied": bool(voxel_remesh_applied),
+        "decimated": bool(decimated),
     }
 
 
@@ -6151,6 +6313,16 @@ def main() -> None:
             source_path,
             str(output_path),
             args.flat_output,
+        )
+    elif args.command == "cleanup-mesh":
+        if not args.glb_output:
+            raise ValueError("--glb-output is required for cleanup-mesh")
+        payload = cleanup_generated_mesh(
+            source_path,
+            glb_output=args.glb_output,
+            target_triangles=args.target_triangles,
+            voxel_remesh=args.voxel_remesh,
+            remove_loose=args.remove_loose,
         )
     elif args.command == "extract-mesh-targets":
         view_dir = None
