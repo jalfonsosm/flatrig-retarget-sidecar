@@ -2963,6 +2963,19 @@ def cleanup_generated_mesh(
 
     triangles_before = _mesh_triangle_count(mesh_obj)
 
+    # Weld position-duplicate vertices before any island/decimate step.
+    # Generators that bake a UV atlas (TripoSR via xatlas) ship the GLB with
+    # vertices split along every UV seam, and the glTF importer keeps them
+    # split -- so by edge connectivity each UV chart is its own "loose part".
+    # Without this weld, separate(type="LOOSE") sees a closed body as
+    # hundreds of floating charts and the debris filter tears real holes in
+    # the surface (and the decimate modifier tears along seams the same way).
+    # UVs live on face loops, so merging coincident vertices preserves seams.
+    bpy.ops.object.mode_set(mode="EDIT")
+    bpy.ops.mesh.select_all(action="SELECT")
+    bpy.ops.mesh.remove_doubles(threshold=1e-6)
+    bpy.ops.object.mode_set(mode="OBJECT")
+
     dropped_islands = 0
     if remove_loose:
         mesh_obj, dropped_islands = _drop_debris_islands(mesh_obj)
