@@ -525,12 +525,17 @@ def cleanup_mesh(
     target_triangles: int = 10000,
     voxel_remesh: bool = True,
     remove_loose: bool = True,
+    fbx_output: str | None = None,
+    orientation_fix: str = "none",
 ) -> SceneCommandResult:
     """Clean a raw generated mesh (image-to-3D output) for auto-rigging.
 
     Joins mesh objects, drops floating debris, optionally voxel-remeshes
     (closes holes; discards UVs) and decimates to ``target_triangles``, then
-    writes ``glb_output``. The report JSON goes to ``output``.
+    writes ``glb_output``. When ``fbx_output`` is set, also writes the same
+    cleaned mesh as FBX (used by the no-rig image-to-3D path). The report
+    JSON goes to ``output``. ``orientation_fix`` bakes an up-axis correction
+    into the mesh (``"y_up_to_z_up"`` for Y-up generators like TripoSR).
     """
     extra_args = [
         "--glb-output",
@@ -538,6 +543,10 @@ def cleanup_mesh(
         "--target-triangles",
         str(int(target_triangles)),
     ]
+    if fbx_output:
+        extra_args.extend(["--fbx-output", str(Path(fbx_output).expanduser().resolve())])
+    if orientation_fix and orientation_fix != "none":
+        extra_args.extend(["--orientation-fix", str(orientation_fix)])
     if not voxel_remesh:
         extra_args.append("--no-voxel-remesh")
     if not remove_loose:

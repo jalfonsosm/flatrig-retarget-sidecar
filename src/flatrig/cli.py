@@ -258,6 +258,17 @@ def main() -> None:
     cleanup_mesh_parser.add_argument("source")
     cleanup_mesh_parser.add_argument("--output", required=True)
     cleanup_mesh_parser.add_argument("--glb-output", required=True)
+    cleanup_mesh_parser.add_argument(
+        "--fbx-output",
+        default=None,
+        help="Also export the cleaned mesh as FBX (the no-rig path's final asset)",
+    )
+    cleanup_mesh_parser.add_argument(
+        "--orientation-fix",
+        default="none",
+        choices=("none", "y_up_to_z_up"),
+        help="Bake an up-axis correction into the cleaned mesh (TripoSR is Y-up)",
+    )
     cleanup_mesh_parser.add_argument("--target-triangles", type=int, default=10000)
     cleanup_mesh_parser.add_argument(
         "--no-voxel-remesh", dest="voxel_remesh", action="store_false", default=True
@@ -436,6 +447,8 @@ def main() -> None:
             target_triangles=args.target_triangles,
             voxel_remesh=args.voxel_remesh,
             remove_loose=args.remove_loose,
+            fbx_output=args.fbx_output,
+            orientation_fix=args.orientation_fix,
         )
         print(json.dumps(result.payload, indent=2))
         if not result.ok:

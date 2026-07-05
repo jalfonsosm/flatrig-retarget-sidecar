@@ -1551,11 +1551,17 @@ def parse_args() -> argparse.Namespace:
         default=True,
         help="Keep floating debris islands",
     )
-    # bake-predicted-rig parameters
+    # bake-predicted-rig / cleanup-mesh FBX output
     parser.add_argument(
         "--fbx-output",
         default=None,
-        help="Rigged FBX written by bake-predicted-rig (source is an .npz prediction, not a 3D file)",
+        help="Rigged FBX (bake-predicted-rig) or cleaned FBX (cleanup-mesh no-rig path)",
+    )
+    parser.add_argument(
+        "--orientation-fix",
+        default="none",
+        choices=("none", "y_up_to_z_up"),
+        help="Bake an up-axis correction into the cleaned mesh (TripoSR is Y-up)",
     )
     return parser.parse_args(script_args)
 
@@ -2846,6 +2852,53 @@ def _drop_debris_islands(mesh_obj, min_dimension_fraction: float = 0.1):
     return bpy.context.view_layer.objects.active, len(dropped)
 
 
+def _prepare_materials_for_fbx_export(mesh_obj, out_dir, stem: str) -> list[str]:
+    """Make GLB-imported textures survive an FBX ``embed_textures`` export.
+
+    Two Blender/glTF quirks otherwise silently drop the texture:
+
+    1. The glTF importer wires the base-colour image through a *MIX* node
+       (image x baseColorFactor), but the FBX exporter only recognises a
+       texture wired *directly* to the Principled BSDF's Base Color -- so we
+       relink the image node straight to Base Color.
+    2. A GLB-imported image is packed in memory with no on-disk path, and
+       ``embed_textures`` only embeds images that have a filepath -- so we
+       save each to a PNG beside the FBX (which doubles as a sidecar texture)
+       and repoint the image at it.
+
+    Returns the written PNG paths.
+    """
+    written: list[str] = []
+    seen = set()
+    for material in (m for m in mesh_obj.data.materials if m):
+        if not material.use_nodes:
+            continue
+        node_tree = material.node_tree
+        bsdf = next((n for n in node_tree.nodes if n.type == "BSDF_PRINCIPLED"), None)
+        tex = next(
+            (n for n in node_tree.nodes if n.type == "TEX_IMAGE" and n.image is not None), None
+        )
+        if bsdf is not None and tex is not None:
+            base_color = bsdf.inputs["Base Color"]
+            for link in list(base_color.links):
+                node_tree.links.remove(link)
+            node_tree.links.new(tex.outputs["Color"], base_color)
+        for node in node_tree.nodes:
+            if node.type != "TEX_IMAGE" or node.image is None:
+                continue
+            image = node.image
+            if image.name in seen or not image.has_data:
+                continue
+            seen.add(image.name)
+            suffix = f"_{len(written)}" if written else ""
+            png_path = Path(out_dir) / f"{stem}_texture{suffix}.png"
+            image.filepath_raw = str(png_path)
+            image.file_format = "PNG"
+            image.save()
+            written.append(str(png_path))
+    return written
+
+
 def cleanup_generated_mesh(
     source_path: str,
     *,
@@ -2853,13 +2906,30 @@ def cleanup_generated_mesh(
     target_triangles: int = 10000,
     voxel_remesh: bool = True,
     remove_loose: bool = True,
+    fbx_output: str | None = None,
+    orientation_fix: str = "none",
 ) -> dict[str, object]:
     """Prepare a raw image-to-3D mesh for auto-rigging.
 
-    Import -> join mesh objects -> drop floating debris -> optional voxel
-    remesh (closes holes; single manifold skin; note it discards UVs, so it
-    should stay off for textured generators) -> decimate to the triangle
-    budget -> GLB export. Armatures are neither expected nor preserved.
+    Import -> join mesh objects -> optional up-axis fix -> drop floating
+    debris -> optional voxel remesh (closes holes; single manifold skin;
+    note it discards UVs, so it should stay off for textured generators) ->
+    decimate to the triangle budget -> GLB export. Armatures are neither
+    expected nor preserved.
+
+    ``glb_output`` is always written (the auto-riggers read it back as their
+    mesh input). ``fbx_output`` is optional and, when set, exports the same
+    cleaned mesh as FBX too -- used by the image-to-3D pipeline's *no-rig*
+    path so the final saved asset is FBX like every rigged path, without a
+    second Blender launch (the mesh is already prepared here).
+
+    ``orientation_fix`` bakes an up-axis correction into the saved asset so
+    it stands upright when opened directly (e.g. in Blender's Z-up world),
+    not just inside FlatRig (whose extract-scene normalizes orientation on
+    its own). ``"y_up_to_z_up"`` rotates +90 deg about X -- TripoSR emits
+    Y-up meshes that otherwise import lying on their back. ``"none"`` leaves
+    orientation untouched (generators that already match, or where the
+    convention isn't confirmed).
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
     import_model(source_path)
@@ -2876,6 +2946,18 @@ def cleanup_generated_mesh(
         bpy.ops.object.join()
     mesh_obj = bpy.context.view_layer.objects.active
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+    if orientation_fix == "y_up_to_z_up":
+        # Stand a Y-up mesh (imported lying on its back in Blender's Z-up
+        # world) upright: +90 deg about X maps +Y -> +Z. NB the glTF importer
+        # leaves objects in QUATERNION rotation mode, so assigning
+        # rotation_euler is silently ignored -- force XYZ first.
+        bpy.ops.object.select_all(action="DESELECT")
+        mesh_obj.select_set(True)
+        bpy.context.view_layer.objects.active = mesh_obj
+        mesh_obj.rotation_mode = "XYZ"
+        mesh_obj.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
     triangles_before = _mesh_triangle_count(mesh_obj)
 
@@ -2921,11 +3003,34 @@ def cleanup_generated_mesh(
         use_selection=True,
     )
 
+    fbx_export_path = None
+    if fbx_output:
+        fbx_export_path = Path(fbx_output).expanduser().resolve()
+        if fbx_export_path.suffix.lower() != ".fbx":
+            fbx_export_path = fbx_export_path.with_suffix(".fbx")
+        fbx_export_path.parent.mkdir(parents=True, exist_ok=True)
+        # Relink base colour + write packed textures to disk so the FBX
+        # export actually carries the texture (see helper for the two glTF/
+        # FBX quirks that otherwise drop it).
+        _prepare_materials_for_fbx_export(mesh_obj, fbx_export_path.parent, fbx_export_path.stem)
+        bpy.ops.object.select_all(action="DESELECT")
+        mesh_obj.select_set(True)
+        bpy.context.view_layer.objects.active = mesh_obj
+        bpy.ops.export_scene.fbx(
+            filepath=str(fbx_export_path),
+            use_selection=True,
+            add_leaf_bones=False,
+            bake_anim=False,
+            path_mode="COPY",
+            embed_textures=True,
+        )
+
     return {
         "ok": True,
         "detail": "cleaned",
         "source": source_path,
         "output": str(export_path),
+        "fbx_output": str(fbx_export_path) if fbx_export_path else None,
         "triangles_before": int(triangles_before),
         "triangles_after": int(_mesh_triangle_count(mesh_obj)),
         "islands_dropped": int(dropped_islands),
@@ -6432,6 +6537,8 @@ def main() -> None:
             target_triangles=args.target_triangles,
             voxel_remesh=args.voxel_remesh,
             remove_loose=args.remove_loose,
+            fbx_output=args.fbx_output,
+            orientation_fix=args.orientation_fix,
         )
     elif args.command == "bake-predicted-rig":
         if not args.fbx_output:
