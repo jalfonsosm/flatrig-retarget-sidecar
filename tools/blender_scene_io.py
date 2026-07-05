@@ -2948,15 +2948,17 @@ def cleanup_generated_mesh(
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
     if orientation_fix == "y_up_to_z_up":
-        # Stand a Y-up mesh (imported lying on its back in Blender's Z-up
-        # world) upright: +90 deg about X maps +Y -> +Z. NB the glTF importer
-        # leaves objects in QUATERNION rotation mode, so assigning
-        # rotation_euler is silently ignored -- force XYZ first.
+        # Stand a TripoSR mesh (imported lying down in Blender's Z-up world)
+        # upright. -90 deg about X is the empirically-correct sense: +90 puts
+        # the figure head-down (verified by rendering a character at 0/+90/-90;
+        # -90 is the only upright one). NB the glTF importer leaves objects in
+        # QUATERNION rotation mode, so assigning rotation_euler is silently
+        # ignored -- force XYZ first.
         bpy.ops.object.select_all(action="DESELECT")
         mesh_obj.select_set(True)
         bpy.context.view_layer.objects.active = mesh_obj
         mesh_obj.rotation_mode = "XYZ"
-        mesh_obj.rotation_euler = (math.radians(90.0), 0.0, 0.0)
+        mesh_obj.rotation_euler = (math.radians(-90.0), 0.0, 0.0)
         bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
     triangles_before = _mesh_triangle_count(mesh_obj)
