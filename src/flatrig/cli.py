@@ -12,6 +12,7 @@ from pathlib import Path
 
 from flatrig import __version__
 from flatrig.scene_formats import (
+    bake_predicted_rig,
     bake_rig_animation,
     cleanup_mesh,
     convert_3d_source,
@@ -265,6 +266,17 @@ def main() -> None:
         "--no-remove-loose", dest="remove_loose", action="store_false", default=True
     )
 
+    bake_predicted_rig_parser = subparsers.add_parser(
+        "bake-predicted-rig",
+        help=(
+            "build a from-scratch armature (no template file) for an "
+            "externally predicted mesh/bones/weights .npz and export FBX"
+        ),
+    )
+    bake_predicted_rig_parser.add_argument("source", help="Path to the prediction .npz")
+    bake_predicted_rig_parser.add_argument("--output", required=True)
+    bake_predicted_rig_parser.add_argument("--fbx-output", required=True)
+
     export_rest_bvh_parser = subparsers.add_parser(
         "export-3d-rest-bvh",
         help="export the rest/bind pose to BVH via the public Blender sidecar",
@@ -430,6 +442,13 @@ def main() -> None:
             raise SystemExit(1)
         return
 
+
+    if args.command == "bake-predicted-rig":
+        result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output)
+        print(json.dumps(result.payload, indent=2))
+        if not result.ok:
+            raise SystemExit(1)
+        return
 
     if args.command == "extract-mesh-targets":
         result = extract_mesh_targets(

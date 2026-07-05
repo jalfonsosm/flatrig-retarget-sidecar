@@ -1360,6 +1360,7 @@ def parse_args() -> argparse.Namespace:
             "bake-rig-animation",
             "reduce-rig-to-canonical",
             "cleanup-mesh",
+            "bake-predicted-rig",
         ),
     )
     parser.add_argument("source")
@@ -1549,6 +1550,12 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         default=True,
         help="Keep floating debris islands",
+    )
+    # bake-predicted-rig parameters
+    parser.add_argument(
+        "--fbx-output",
+        default=None,
+        help="Rigged FBX written by bake-predicted-rig (source is an .npz prediction, not a 3D file)",
     )
     return parser.parse_args(script_args)
 
@@ -2924,6 +2931,108 @@ def cleanup_generated_mesh(
         "islands_dropped": int(dropped_islands),
         "voxel_remesh_applied": bool(voxel_remesh_applied),
         "decimated": bool(decimated),
+    }
+
+
+def bake_predicted_rig(npz_path: str, *, fbx_output: str) -> dict[str, object]:
+    """Build a from-scratch armature for an externally predicted rig and export FBX.
+
+    ``npz_path`` is not a 3D source file: it's a numpy ``.npz`` written by an
+    external prediction step (currently the Make-It-Animatable rigger runner
+    in ``flatrig_private``, which has no bpy dependency of its own) carrying:
+
+    - ``vertices`` (V, 3) float32, ``triangles`` (M, 3) uint32 -- the exact
+      mesh the weights below were predicted against (built directly via
+      ``from_pydata`` rather than re-importing a GLB, so vertex order can
+      never drift from what the predictor used).
+    - ``bone_names`` (B,) str, ``parent_indices`` (B,) int32 (-1 = root),
+      ``heads``/``tails`` (B, 3) float32 -- a skeleton with no template file
+      behind it (no bpy import at prediction time either -- see
+      ``mia_runner.py``'s module docstring for why: the upstream project's
+      own hierarchy derivation needs a real Mixamo-derived ``bones.fbx``
+      pulled from a gated HF dataset whose terms don't cover commercial
+      redistribution).
+    - ``joints_top4`` (V, 4) uint8, ``weights_top4`` (V, 4) float32 -- the
+      predicted skin weights, already normalized to the 4 dominant bones per
+      vertex (the standard glTF/FBX skinning convention).
+    """
+    data = np.load(npz_path, allow_pickle=True)
+    vertices = np.asarray(data["vertices"], dtype=np.float64)
+    triangles = np.asarray(data["triangles"], dtype=np.int64)
+    bone_names = [str(name) for name in data["bone_names"]]
+    parent_indices = np.asarray(data["parent_indices"], dtype=np.int64)
+    heads = np.asarray(data["heads"], dtype=np.float64)
+    tails = np.asarray(data["tails"], dtype=np.float64)
+    joints_top4 = np.asarray(data["joints_top4"], dtype=np.int64)
+    weights_top4 = np.asarray(data["weights_top4"], dtype=np.float64)
+
+    bpy.ops.wm.read_factory_settings(use_empty=True)
+
+    mesh_data = bpy.data.meshes.new("mia_mesh")
+    mesh_data.from_pydata(vertices.tolist(), [], triangles.tolist())
+    mesh_data.update()
+    mesh_obj = bpy.data.objects.new("mia_mesh", mesh_data)
+    bpy.context.collection.objects.link(mesh_obj)
+
+    armature_data = bpy.data.armatures.new("mia_armature")
+    armature_obj = bpy.data.objects.new("mia_armature", armature_data)
+    bpy.context.collection.objects.link(armature_obj)
+
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.object.mode_set(mode="EDIT")
+    edit_bones = armature_data.edit_bones
+    created = []
+    min_length = 1e-3
+    for index, name in enumerate(bone_names):
+        edit_bone = edit_bones.new(name)
+        head = mathutils.Vector(heads[index].tolist())
+        tail = mathutils.Vector(tails[index].tolist())
+        if (tail - head).length < min_length:
+            tail = head + mathutils.Vector((0.0, min_length, 0.0))
+        edit_bone.head = head
+        edit_bone.tail = tail
+        created.append(edit_bone)
+    for index, parent_index in enumerate(parent_indices.tolist()):
+        if parent_index >= 0:
+            created[index].parent = created[parent_index]
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    mesh_obj.parent = armature_obj
+    for name in bone_names:
+        mesh_obj.vertex_groups.new(name=name)
+    vertex_count = vertices.shape[0]
+    for vertex_index in range(vertex_count):
+        for slot in range(joints_top4.shape[1]):
+            weight = float(weights_top4[vertex_index, slot])
+            if weight <= 1e-4:
+                continue
+            bone_index = int(joints_top4[vertex_index, slot])
+            mesh_obj.vertex_groups[bone_index].add([vertex_index], weight, "REPLACE")
+    modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
+    modifier.object = armature_obj
+
+    export_path = Path(fbx_output).expanduser().resolve()
+    if export_path.suffix.lower() != ".fbx":
+        export_path = export_path.with_suffix(".fbx")
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    bpy.ops.object.select_all(action="SELECT")
+    bpy.context.view_layer.objects.active = armature_obj
+    bpy.ops.export_scene.fbx(
+        filepath=str(export_path),
+        use_selection=True,
+        add_leaf_bones=False,
+        bake_anim=False,
+        path_mode="COPY",
+        embed_textures=False,
+    )
+
+    return {
+        "ok": True,
+        "detail": "Predicted rig baked and exported.",
+        "source": npz_path,
+        "output": str(export_path),
+        "bone_count": len(bone_names),
+        "vertex_count": int(vertex_count),
     }
 
 
@@ -6324,6 +6433,10 @@ def main() -> None:
             voxel_remesh=args.voxel_remesh,
             remove_loose=args.remove_loose,
         )
+    elif args.command == "bake-predicted-rig":
+        if not args.fbx_output:
+            raise ValueError("--fbx-output is required for bake-predicted-rig")
+        payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output)
     elif args.command == "extract-mesh-targets":
         view_dir = None
         view_up = None
