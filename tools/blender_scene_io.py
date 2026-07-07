@@ -1424,9 +1424,26 @@ def parse_args() -> argparse.Namespace:
         "--rotation-flatten", type=float, default=0.0, help="Rotation flatten amount"
     )
     parser.add_argument("--rotation-flatten-scope", default="all", help="Rotation flatten scope")
+    parser.add_argument("--rotation-flatten-bones", default="", help="Rotation flatten custom bones")
+    parser.add_argument(
+        "--connected-translation-scope",
+        default="none",
+        choices=("none", "terminal", "limbs", "all", "custom"),
+        help="Connected-bone translation emission scope",
+    )
+    parser.add_argument(
+        "--connected-translation-bones",
+        default="",
+        help="Custom bones for connected translation emission",
+    )
     parser.add_argument("--stretch-guard-enabled", action="store_true", default=False)
     parser.add_argument("--stretch-guard-max-scale", type=float, default=1.75)
     parser.add_argument("--stretch-guard-strength", type=float, default=0.65)
+    parser.add_argument(
+        "--stretch-guard-bones",
+        default="all",
+        choices=("all", "terminal", "nonterminal"),
+    )
     parser.add_argument("--ik-leaf-refine-enabled", action="store_true", default=False)
     parser.add_argument("--ik-leaf-strength", type=float, default=0.35)
     parser.add_argument("--ik-leaf-iterations", type=int, default=6)
@@ -5118,9 +5135,13 @@ def extract_animations_cli(
     pose_blend: float = 1.0,
     rotation_flatten: float = 0.0,
     rotation_flatten_scope: str = "all",
+    rotation_flatten_bones: str = "",
+    connected_translation_scope: str = "none",
+    connected_translation_bones: str = "",
     stretch_guard_enabled: bool = False,
     stretch_guard_max_scale: float = 1.75,
     stretch_guard_strength: float = 0.65,
+    stretch_guard_bones: str = "all",
     ik_leaf_refine_enabled: bool = False,
     ik_leaf_strength: float = 0.35,
     ik_leaf_iterations: int = 6,
@@ -5236,9 +5257,13 @@ def extract_animations_cli(
                 pose_blend=pose_blend,
                 rotation_flatten=rotation_flatten,
                 rotation_flatten_scope=rotation_flatten_scope,
+                rotation_flatten_bones=rotation_flatten_bones,
+                connected_translation_scope=connected_translation_scope,
+                connected_translation_bones=connected_translation_bones,
                 stretch_guard_enabled=stretch_guard_enabled,
                 stretch_guard_max_scale=stretch_guard_max_scale,
                 stretch_guard_strength=stretch_guard_strength,
+                stretch_guard_bones=stretch_guard_bones,
                 ik_leaf_refine_enabled=ik_leaf_refine_enabled,
                 ik_leaf_strength=ik_leaf_strength,
                 ik_leaf_iterations=ik_leaf_iterations,
@@ -5264,14 +5289,24 @@ def extract_animations_cli(
                 projection_space=projection_space,
                 pose_mode=pose_mode,
                 pose_blend=pose_blend,
-                rotation_flatten={"amount": rotation_flatten, "scope": rotation_flatten_scope}
+                rotation_flatten={
+                    "amount": rotation_flatten,
+                    "scope": rotation_flatten_scope,
+                    "bones": rotation_flatten_bones,
+                }
                 if rotation_flatten > 0
+                else None,
+                connected_translation={
+                    "scope": connected_translation_scope,
+                    "bones": connected_translation_bones,
+                }
+                if connected_translation_scope != "none"
                 else None,
                 stretch_guard={
                     "enabled": True,
                     "max_scale": stretch_guard_max_scale,
                     "strength": stretch_guard_strength,
-                    "bones": "all",
+                    "bones": stretch_guard_bones,
                 }
                 if stretch_guard_enabled
                 else None,
@@ -5564,9 +5599,13 @@ def _extract_transferred_animation(
     pose_blend=1.0,
     rotation_flatten=None,
     rotation_flatten_scope=None,
+    rotation_flatten_bones="",
+    connected_translation_scope="none",
+    connected_translation_bones="",
     stretch_guard_enabled=False,
     stretch_guard_max_scale=1.75,
     stretch_guard_strength=0.65,
+    stretch_guard_bones="all",
     ik_leaf_refine_enabled=False,
     ik_leaf_strength=0.35,
     ik_leaf_iterations=6,
@@ -5641,6 +5680,7 @@ def _extract_transferred_animation(
         {
             "amount": rotation_flatten or 0.0,
             "scope": rotation_flatten_scope or "all",
+            "bones": rotation_flatten_bones or "",
         }
     )
     leaf_ik_refine = _prepare_leaf_ik_refine(
@@ -5695,6 +5735,7 @@ def _extract_transferred_animation(
             "enabled": stretch_guard_enabled,
             "max_scale": stretch_guard_max_scale,
             "strength": stretch_guard_strength,
+            "bones": stretch_guard_bones,
         }
         if stretch_guard_enabled
         else None
@@ -6464,9 +6505,13 @@ def main() -> None:
             pose_blend=args.pose_blend,
             rotation_flatten=args.rotation_flatten,
             rotation_flatten_scope=args.rotation_flatten_scope,
+            rotation_flatten_bones=args.rotation_flatten_bones,
+            connected_translation_scope=args.connected_translation_scope,
+            connected_translation_bones=args.connected_translation_bones,
             stretch_guard_enabled=args.stretch_guard_enabled,
             stretch_guard_max_scale=args.stretch_guard_max_scale,
             stretch_guard_strength=args.stretch_guard_strength,
+            stretch_guard_bones=args.stretch_guard_bones,
             ik_leaf_refine_enabled=args.ik_leaf_refine_enabled,
             ik_leaf_strength=args.ik_leaf_strength,
             ik_leaf_iterations=args.ik_leaf_iterations,

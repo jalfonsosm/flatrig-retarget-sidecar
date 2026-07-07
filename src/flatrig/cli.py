@@ -138,11 +138,23 @@ def main() -> None:
     extract_animations_parser.add_argument("--pose-blend", type=float, default=1.0)
     extract_animations_parser.add_argument("--rotation-flatten", type=float, default=0.0)
     extract_animations_parser.add_argument("--rotation-flatten-scope", default="all")
+    extract_animations_parser.add_argument("--rotation-flatten-bones", default="")
+    extract_animations_parser.add_argument(
+        "--connected-translation-scope",
+        default="none",
+        choices=("none", "terminal", "limbs", "all", "custom"),
+    )
+    extract_animations_parser.add_argument("--connected-translation-bones", default="")
     extract_animations_parser.add_argument(
         "--stretch-guard-enabled", action="store_true", default=False
     )
     extract_animations_parser.add_argument("--stretch-guard-max-scale", type=float, default=1.75)
     extract_animations_parser.add_argument("--stretch-guard-strength", type=float, default=0.65)
+    extract_animations_parser.add_argument(
+        "--stretch-guard-bones",
+        default="all",
+        choices=("all", "terminal", "nonterminal"),
+    )
     extract_animations_parser.add_argument(
         "--ik-leaf-refine-enabled", action="store_true", default=False
     )
@@ -373,9 +385,13 @@ def main() -> None:
             pose_blend=args.pose_blend,
             rotation_flatten=args.rotation_flatten,
             rotation_flatten_scope=args.rotation_flatten_scope,
+            rotation_flatten_bones=args.rotation_flatten_bones,
+            connected_translation_scope=args.connected_translation_scope,
+            connected_translation_bones=args.connected_translation_bones,
             stretch_guard_enabled=args.stretch_guard_enabled,
             stretch_guard_max_scale=args.stretch_guard_max_scale,
             stretch_guard_strength=args.stretch_guard_strength,
+            stretch_guard_bones=args.stretch_guard_bones,
             ik_leaf_refine_enabled=args.ik_leaf_refine_enabled,
             ik_leaf_strength=args.ik_leaf_strength,
             ik_leaf_iterations=args.ik_leaf_iterations,

@@ -593,9 +593,13 @@ def extract_animations(
     pose_blend: float = 1.0,
     rotation_flatten: float = 0.0,
     rotation_flatten_scope: str = "all",
+    rotation_flatten_bones: str = "",
+    connected_translation_scope: str = "none",
+    connected_translation_bones: str = "",
     stretch_guard_enabled: bool = False,
     stretch_guard_max_scale: float = 1.75,
     stretch_guard_strength: float = 0.65,
+    stretch_guard_bones: str = "all",
     ik_leaf_refine_enabled: bool = False,
     ik_leaf_strength: float = 0.35,
     ik_leaf_iterations: int = 6,
@@ -627,6 +631,12 @@ def extract_animations(
         "--rotation-flatten-scope",
         rotation_flatten_scope,
     ]
+    if rotation_flatten_bones:
+        extra_args.extend(["--rotation-flatten-bones", rotation_flatten_bones])
+    if connected_translation_scope and connected_translation_scope != "none":
+        extra_args.extend(["--connected-translation-scope", connected_translation_scope])
+        if connected_translation_bones:
+            extra_args.extend(["--connected-translation-bones", connected_translation_bones])
     if view_dir:
         extra_args.extend(["--view-dir", view_dir])
     if view_up:
@@ -650,6 +660,7 @@ def extract_animations(
         extra_args.append("--stretch-guard-enabled")
         extra_args.extend(["--stretch-guard-max-scale", str(stretch_guard_max_scale)])
         extra_args.extend(["--stretch-guard-strength", str(stretch_guard_strength)])
+        extra_args.extend(["--stretch-guard-bones", str(stretch_guard_bones)])
     if ik_leaf_refine_enabled:
         extra_args.append("--ik-leaf-refine-enabled")
         extra_args.extend(["--ik-leaf-strength", str(ik_leaf_strength)])
