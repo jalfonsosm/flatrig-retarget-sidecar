@@ -56,6 +56,12 @@ def _add_weight_aware_decimation_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _emit_result(result, payload: dict | None = None) -> None:
+    print(json.dumps(result.payload if payload is None else payload, indent=2))
+    if not result.ok:
+        raise SystemExit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Public Blender worker sidecar.")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -325,17 +331,13 @@ def main() -> None:
 
     if args.command == "inspect-3d-source":
         result = inspect_3d_source(args.source, args.output)
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
     if args.command == "convert-3d-source":
         result = convert_3d_source(args.source, args.output)
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
@@ -358,9 +360,7 @@ def main() -> None:
                 args, "base_color_texture_output", None
             ),
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
@@ -404,9 +404,7 @@ def main() -> None:
             animation_source=getattr(args, "animation_source", None),
             decouple_scale=getattr(args, "decouple_scale", False),
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
@@ -426,9 +424,7 @@ def main() -> None:
             if key not in {"frames", "bones", "armature_matrix_world"}
         }
         summary.setdefault("output", args.output)
-        print(json.dumps(summary, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result, summary)
         return
 
 
@@ -439,9 +435,7 @@ def main() -> None:
             bake_spec=args.bake_spec,
             flat_output=args.flat_output,
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
     if args.command == "reduce-rig-to-canonical":
@@ -450,9 +444,7 @@ def main() -> None:
             args.output,
             flat_output=args.flat_output,
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
     if args.command == "cleanup-mesh":
@@ -466,17 +458,13 @@ def main() -> None:
             fbx_output=args.fbx_output,
             orientation_fix=args.orientation_fix,
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
     if args.command == "bake-predicted-rig":
         result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output)
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
     if args.command == "extract-mesh-targets":
@@ -496,9 +484,7 @@ def main() -> None:
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
@@ -522,9 +508,7 @@ def main() -> None:
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
 
@@ -538,9 +522,7 @@ def main() -> None:
             frame_start=args.frame_start,
             frame_end=args.frame_end,
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
     if args.command == "export-3d-rest-bvh":
@@ -559,9 +541,7 @@ def main() -> None:
             frame_count=args.frame_count,
             bind_from_animation=args.bind_from_animation,
         )
-        print(json.dumps(result.payload, indent=2))
-        if not result.ok:
-            raise SystemExit(1)
+        _emit_result(result)
         return
 
     raise AssertionError(f"Unhandled command: {args.command}")
