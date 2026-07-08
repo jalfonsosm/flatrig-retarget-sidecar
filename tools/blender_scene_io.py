@@ -1337,6 +1337,17 @@ def extract_2d_mesh(
         _restore_scene_armature_pose_positions(rest_pose_state)
 
 
+def _parse_vec3_arg(raw: str) -> tuple[float, float, float]:
+    parts = [part.strip() for part in raw.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("expected three comma-separated values: x,y,z")
+    try:
+        x, y, z = (float(part) for part in parts)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("expected numeric comma-separated values: x,y,z") from exc
+    return (x, y, z)
+
+
 def parse_args() -> argparse.Namespace:
     try:
         separator_index = sys.argv.index("--")
@@ -1371,8 +1382,18 @@ def parse_args() -> argparse.Namespace:
         choices=list(VIEW_PRESETS.keys()),
         help="View preset for projection (front, back, side, side_r, top, bottom)",
     )
-    parser.add_argument("--view-dir", default=None, help="Custom view direction as 'x,y,z' tuple")
-    parser.add_argument("--view-up", default=None, help="Custom view up hint as 'x,y,z' tuple")
+    parser.add_argument(
+        "--view-dir",
+        type=_parse_vec3_arg,
+        default=None,
+        help="Custom view direction as 'x,y,z' tuple",
+    )
+    parser.add_argument(
+        "--view-up",
+        type=_parse_vec3_arg,
+        default=None,
+        help="Custom view up hint as 'x,y,z' tuple",
+    )
     parser.add_argument("--view-roll", type=float, default=0.0, help="View roll in degrees")
     parser.add_argument(
         "--source-frame", type=int, default=None, help="Source frame for pose evaluation"
@@ -6454,19 +6475,12 @@ def main() -> None:
     elif args.command == "convert":
         payload = convert_source(source_path, str(output_path))
     elif args.command == "extract-scene":
-        view_dir = None
-        view_up = None
-        if args.view_dir:
-            view_dir = tuple(float(x) for x in args.view_dir.split(","))
-        if args.view_up:
-            view_up = tuple(float(x) for x in args.view_up.split(","))
-
         payload = extract_scene_cli(
             source_path,
             str(output_path),
             view_preset=args.view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             use_rest_pose=args.use_rest_pose,
@@ -6478,19 +6492,12 @@ def main() -> None:
             base_color_texture_output=getattr(args, "base_color_texture_output", None),
         )
     elif args.command == "extract-animations":
-        view_dir = None
-        view_up = None
-        if args.view_dir:
-            view_dir = tuple(float(x) for x in args.view_dir.split(","))
-        if args.view_up:
-            view_up = tuple(float(x) for x in args.view_up.split(","))
-
         payload = extract_animations_cli(
             source_path,
             str(output_path),
             view_preset=args.view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             projection_space=args.projection_space,
@@ -6539,20 +6546,13 @@ def main() -> None:
     elif args.command == "export-3d-rest-bvh":
         if not args.bvh_output:
             raise ValueError("--bvh-output is required for export-3d-rest-bvh")
-        view_dir = None
-        view_up = None
-        if args.view_dir:
-            view_dir = tuple(float(x) for x in args.view_dir.split(","))
-        if args.view_up:
-            view_up = tuple(float(x) for x in args.view_up.split(","))
-
         payload = export_3d_rest_bvh_cli(
             source_path,
             str(output_path),
             bvh_output=args.bvh_output,
             view_preset=args.view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             use_rest_pose=args.use_rest_pose,
@@ -6605,19 +6605,12 @@ def main() -> None:
             raise ValueError("--fbx-output is required for bake-predicted-rig")
         payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output)
     elif args.command == "extract-mesh-targets":
-        view_dir = None
-        view_up = None
-        if args.view_dir:
-            view_dir = tuple(float(x) for x in args.view_dir.split(","))
-        if args.view_up:
-            view_up = tuple(float(x) for x in args.view_up.split(","))
-
         payload = extract_mesh_targets_cli(
             source_path,
             str(output_path),
             view_preset=args.view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             use_rest_pose=args.use_rest_pose,
@@ -6629,19 +6622,12 @@ def main() -> None:
             bind_from_animation=getattr(args, "bind_from_animation", None),
         )
     elif args.command == "render-sprites":
-        view_dir = None
-        view_up = None
-        if args.view_dir:
-            view_dir = tuple(float(x) for x in args.view_dir.split(","))
-        if args.view_up:
-            view_up = tuple(float(x) for x in args.view_up.split(","))
-
         payload = render_sprites_cli(
             source_path,
             str(output_path),
             view_preset=args.view_preset,
-            view_dir=view_dir,
-            view_up=view_up,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
             view_roll=args.view_roll,
             source_frame=args.source_frame,
             use_rest_pose=args.use_rest_pose,
