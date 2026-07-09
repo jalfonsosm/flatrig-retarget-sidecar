@@ -270,6 +270,6 @@ def parse_worker_args(
         "--orientation-fix",
         default="none",
         choices=("none", "y_up_to_z_up"),
-        help="Bake an up-axis correction into the cleaned mesh (TripoSR is Y-up)",
+        help="Bake an up-axis correction into the cleaned mesh (for Y-up generators)",
     )
     return parser.parse_args(_worker_script_args(argv))

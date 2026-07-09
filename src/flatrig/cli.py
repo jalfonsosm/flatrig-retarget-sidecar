@@ -285,7 +285,7 @@ def main() -> None:
         "--orientation-fix",
         default="none",
         choices=("none", "y_up_to_z_up"),
-        help="Bake an up-axis correction into the cleaned mesh (TripoSR is Y-up)",
+        help="Bake an up-axis correction into the cleaned mesh (for Y-up generators)",
     )
     cleanup_mesh_parser.add_argument("--target-triangles", type=int, default=10000)
     cleanup_mesh_parser.add_argument(

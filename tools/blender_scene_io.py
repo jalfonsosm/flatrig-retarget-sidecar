@@ -56,6 +56,16 @@ from blender_orientation import (  # noqa: E402
     rig_forward_world as _orientation_rig_forward_world,
     structural_root_bone as _orientation_structural_root_bone,
 )
+from blender_json_io import (  # noqa: E402
+    matrix3_from_json as _matrix3_from_json,
+    matrix3_to_json as _matrix3_to_json,
+    matrix4_to_json as _matrix4_to_json,
+    quat_to_stable_json as _quat_to_stable_json,
+    vector_from_json as _vector_from_json,
+    vector_to_json as _vector_to_json,
+    view_config_to_json as _view_config_to_json,
+    weights_to_json as _weights_to_json,
+)
 
 # ============================================================================
 # Constants
@@ -106,14 +116,6 @@ def _rest_local_quat(data_bone):
     else:
         matrix = data_bone.matrix_local
     return matrix.to_quaternion()
-
-
-def _quat_to_stable_json(quat):
-    quat = quat.copy()
-    quat.normalize()
-    if quat.w < 0.0:
-        quat.negate()
-    return [float(quat.w), float(quat.x), float(quat.y), float(quat.z)]
 
 
 def _quat_angle_degrees(a, b) -> float:
@@ -765,10 +767,6 @@ def _armature_uniform_scale(armature_obj) -> float:
     return sum(values) / len(values)
 
 
-def _matrix3_to_json(matrix):
-    return [[float(matrix[row][col]) for col in range(3)] for row in range(3)]
-
-
 def _world_rotation_3x3(matrix4):
     """Pure-rotation 3x3 from a world matrix, stripping object scale.
 
@@ -780,18 +778,6 @@ def _world_rotation_3x3(matrix4):
     the rotation via the quaternion, which normalizes the scale away.
     """
     return matrix4.to_quaternion().to_matrix()
-
-
-def _matrix3_from_json(values):
-    if values is None:
-        return mathutils.Matrix.Identity(3)
-    return mathutils.Matrix(
-        (
-            (float(values[0][0]), float(values[0][1]), float(values[0][2])),
-            (float(values[1][0]), float(values[1][1]), float(values[1][2])),
-            (float(values[2][0]), float(values[2][1]), float(values[2][2])),
-        )
-    )
 
 
 def _armature_world_rotation(armature_obj):
@@ -1897,10 +1883,6 @@ def convert_source(source_path: str, output_path: str) -> dict[str, object]:
     }
 
 
-def _mesh_triangle_count(mesh_obj) -> int:
-    return sum(max(0, len(polygon.vertices) - 2) for polygon in mesh_obj.data.polygons)
-
-
 def _drop_debris_islands(mesh_obj, min_dimension_fraction: float = 0.1):
     """Split loose parts and delete floating debris islands.
 
@@ -2018,8 +2000,8 @@ def cleanup_generated_mesh(
     ``orientation_fix`` bakes an up-axis correction into the saved asset so
     it stands upright when opened directly (e.g. in Blender's Z-up world),
     not just inside FlatRig (whose extract-scene normalizes orientation on
-    its own). ``"y_up_to_z_up"`` rotates +90 deg about X -- TripoSR emits
-    Y-up meshes that otherwise import lying on their back. ``"none"`` leaves
+    its own). ``"y_up_to_z_up"`` rotates +90 deg about X -- Y-up
+    generators emit meshes that otherwise import lying on their back. ``"none"`` leaves
     orientation untouched (generators that already match, or where the
     convention isn't confirmed).
     """
@@ -2040,7 +2022,7 @@ def cleanup_generated_mesh(
     bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
     if orientation_fix == "y_up_to_z_up":
-        # Stand a TripoSR mesh (imported lying down in Blender's Z-up world)
+        # Stand a Y-up mesh (imported lying down in Blender's Z-up world)
         # upright. -90 deg about X is the empirically-correct sense: +90 puts
         # the figure head-down (verified by rendering a character at 0/+90/-90;
         # -90 is the only upright one). NB the glTF importer leaves objects in
@@ -2056,7 +2038,7 @@ def cleanup_generated_mesh(
     triangles_before = _mesh_triangle_count(mesh_obj)
 
     # Weld position-duplicate vertices before any island/decimate step.
-    # Generators that bake a UV atlas (TripoSR via xatlas) ship the GLB with
+    # Generators that bake a UV atlas (e.g. via xatlas) ship the GLB with
     # vertices split along every UV seam, and the glTF importer keeps them
     # split -- so by edge connectivity each UV chart is its own "loose part".
     # Without this weld, separate(type="LOOSE") sees a closed body as
@@ -2816,27 +2798,6 @@ def _bvh_export_name(matching_name, index):
     return f"{matching_name}__{int(index):03d}"
 
 
-def _vector_to_json(vector):
-    return [float(vector[0]), float(vector[1]), float(vector[2])]
-
-
-def _view_config_to_json(view_cfg):
-    return {
-        "name": str(view_cfg.get("name") or ""),
-        "preset": view_cfg.get("preset"),
-        "mode": view_cfg.get("mode"),
-        "view_dir": _vector_to_json(view_cfg["view_dir"]),
-        "right_axis": _vector_to_json(view_cfg["right_axis"]),
-        "up_axis": _vector_to_json(view_cfg["up_axis"]),
-        "depth_axis": _vector_to_json(view_cfg["depth_axis"]),
-        "basis_2d": np.asarray(view_cfg["basis_2d"], dtype=np.float64).tolist(),
-        "basis_3d": np.asarray(view_cfg["basis_3d"], dtype=np.float64).tolist(),
-        "roll_degrees": float(view_cfg.get("roll_degrees", 0.0)),
-        "auto_lateral_flip": bool(view_cfg.get("auto_lateral_flip", False)),
-        "lateral_sign": view_cfg.get("lateral_sign"),
-    }
-
-
 def _build_3d_bvh_layout(armature_obj, source_frame=None, use_rest_pose=True):
     """Return portable BVH joints for a Blender armature."""
     scene = bpy.context.scene
@@ -3033,11 +2994,6 @@ def _matrix_xyz_euler_degrees(matrix):
         math.degrees(float(euler.y)),
         math.degrees(float(euler.z)),
     ]
-
-
-def _vector_from_json(values, fallback=(0.0, 0.0, 0.0)):
-    values = values or fallback
-    return mathutils.Vector((float(values[0]), float(values[1]), float(values[2])))
 
 
 def _rotation_between_vectors(source, target):
@@ -3785,17 +3741,6 @@ def extract_setup_bone_hierarchy(
     )
 
 
-def _weights_to_json(weights):
-    """Convert weight dicts to JSON-serializable format."""
-    serialized = []
-    for weight_dict in weights:
-        pairs = []
-        for bone_index, weight_value in sorted((weight_dict or {}).items()):
-            pairs.append([int(bone_index), float(weight_value)])
-        serialized.append(pairs)
-    return serialized
-
-
 def extract_bone_hierarchy_3d(armature, source_frame=None, use_rest_pose=False):
     """Extract 3D bone heads/tails + world rotations for skinning/preview.
 
@@ -4428,10 +4373,6 @@ def extract_animations_cli(
         "animations": serialized_animations,
         "preview_3d_animations": preview_3d_animations,
     }
-
-
-def _matrix4_to_json(matrix):
-    return [[float(matrix[row][col]) for col in range(4)] for row in range(4)]
 
 
 def dump_rig_animation_cli(

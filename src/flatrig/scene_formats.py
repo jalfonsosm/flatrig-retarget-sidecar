@@ -233,6 +233,60 @@ def _run_bpy_command(command: str, source: str, output: str) -> SceneCommandResu
     )
 
 
+def _run_subprocess_worker(
+    argv: list[str],
+    output_path: Path,
+    *,
+    failure_detail: str = "Worker command failed.",
+    missing_output_detail: str = "The worker did not create the expected output JSON.",
+) -> SceneCommandResult:
+    """Shared subprocess runner for bpy/Blender worker commands.
+
+    Handles: subprocess execution, output JSON parsing, returncode handling,
+    and stderr/stdout capture. All three subprocess-based runners delegate
+    here to avoid duplicating the same ~40 lines of boilerplate.
+    """
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    payload: dict[str, Any]
+    if output_path.exists():
+        try:
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = {"ok": False, "detail": "Could not read output JSON."}
+    else:
+        payload = {
+            "ok": False,
+            "detail": missing_output_detail,
+        }
+
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        stdout = (completed.stdout or "").strip()
+        detail = payload.get("detail") or stderr or stdout or failure_detail
+        payload = {
+            **payload,
+            "ok": False,
+            "detail": detail,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+        return SceneCommandResult(ok=False, detail=detail, payload=payload, command=argv)
+
+    detail = str(payload.get("detail") or "ok")
+    return SceneCommandResult(
+        ok=bool(payload.get("ok", False)),
+        detail=detail,
+        payload=payload,
+        command=argv,
+    )
+
+
 def _run_bpy_command_with_args(
     command: str,
     source: str,
@@ -263,44 +317,11 @@ def _run_bpy_command_with_args(
     if extra_args:
         argv.extend(extra_args)
 
-    completed = subprocess.run(
+    return _run_subprocess_worker(
         argv,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    payload: dict[str, Any]
-    if output_path.exists():
-        try:
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {"ok": False, "detail": "Could not read output JSON."}
-    else:
-        payload = {
-            "ok": False,
-            "detail": "The bpy worker did not create the expected output JSON.",
-        }
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        detail = payload.get("detail") or stderr or stdout or "bpy worker command failed."
-        payload = {
-            **payload,
-            "ok": False,
-            "detail": detail,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
-        return SceneCommandResult(ok=False, detail=detail, payload=payload, command=argv)
-
-    detail = str(payload.get("detail") or "ok")
-    return SceneCommandResult(
-        ok=bool(payload.get("ok", False)),
-        detail=detail,
-        payload=payload,
-        command=argv,
+        output_path,
+        failure_detail="bpy worker command failed.",
+        missing_output_detail="The bpy worker did not create the expected output JSON.",
     )
 
 
@@ -329,41 +350,11 @@ def _run_blender_command(command: str, source: str, output: str) -> SceneCommand
         str(output_path),
     ]
 
-    completed = subprocess.run(
+    return _run_subprocess_worker(
         argv,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    payload: dict[str, Any]
-    if output_path.exists():
-        try:
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {"ok": False, "detail": "Blender wrote an unreadable JSON payload."}
-    else:
-        payload = {
-            "ok": False,
-            "detail": "The Blender bridge did not create the expected output JSON.",
-        }
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        detail = payload.get("detail") or stderr or stdout or "Blender command failed."
-        payload = {
-            **payload,
-            "ok": False,
-            "detail": detail,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
-        return SceneCommandResult(ok=False, detail=detail, payload=payload, command=argv)
-
-    detail = str(payload.get("detail") or "ok")
-    return SceneCommandResult(
-        ok=bool(payload.get("ok", False)), detail=detail, payload=payload, command=argv
+        output_path,
+        failure_detail="Blender command failed.",
+        missing_output_detail="The Blender bridge did not create the expected output JSON.",
     )
 
 
@@ -414,44 +405,11 @@ def _run_blender_command_with_args(
     if extra_args:
         argv.extend(extra_args)
 
-    completed = subprocess.run(
+    return _run_subprocess_worker(
         argv,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    payload: dict[str, Any]
-    if output_path.exists():
-        try:
-            payload = json.loads(output_path.read_text(encoding="utf-8"))
-        except Exception:
-            payload = {"ok": False, "detail": "Could not read output JSON."}
-    else:
-        payload = {
-            "ok": False,
-            "detail": "The Blender command did not create the expected output JSON.",
-        }
-
-    if completed.returncode != 0:
-        stderr = (completed.stderr or "").strip()
-        stdout = (completed.stdout or "").strip()
-        detail = payload.get("detail") or stderr or stdout or "Blender command failed."
-        payload = {
-            **payload,
-            "ok": False,
-            "detail": detail,
-            "stdout": stdout,
-            "stderr": stderr,
-        }
-        return SceneCommandResult(ok=False, detail=detail, payload=payload, command=argv)
-
-    detail = str(payload.get("detail") or "ok")
-    return SceneCommandResult(
-        ok=bool(payload.get("ok", False)),
-        detail=detail,
-        payload=payload,
-        command=argv,
+        output_path,
+        failure_detail="Blender command failed.",
+        missing_output_detail="The Blender command did not create the expected output JSON.",
     )
 
 
@@ -535,7 +493,7 @@ def cleanup_mesh(
     writes ``glb_output``. When ``fbx_output`` is set, also writes the same
     cleaned mesh as FBX (used by the no-rig image-to-3D path). The report
     JSON goes to ``output``. ``orientation_fix`` bakes an up-axis correction
-    into the mesh (``"y_up_to_z_up"`` for Y-up generators like TripoSR).
+    into the mesh (``"y_up_to_z_up"`` for Y-up generators).
     """
     extra_args = [
         "--glb-output",
