@@ -19,12 +19,18 @@ try:
 except ImportError:
     bpy = None
     mathutils = None
+
     bmesh = None
+
 import numpy as np
 
 TOOLS_DIR = Path(__file__).resolve().parent
 if str(TOOLS_DIR) not in sys.path:
     sys.path.insert(0, str(TOOLS_DIR))
+
+from blender_io.math_utils import *
+from blender_io.bone_utils import *
+from blender_io.pose_transfer import *
 
 from blender_worker_args import parse_worker_args  # noqa: E402
 from blender_view import (  # noqa: E402
@@ -77,7 +83,6 @@ TERMINAL_CHAIN_MAX_LENGTH_RATIO = 0.8
 TERMINAL_CHAIN_PARENT_RATIO = 1.5
 TERMINAL_CHAIN_MAX_SPAN = 6
 VECTOR_EPSILON = 1e-8
-BVH_SUFFIX_RE = re.compile(r"__[^\\s]{3}$")
 
 
 def _set_scene_armatures_rest_pose(scene):
@@ -109,24 +114,8 @@ def _apply_auto_setup_pose(
     return {"mode": "rest_pose" if use_rest_pose else "frame", "posed_bone_count": 0}
 
 
-def _rest_local_quat(data_bone):
-    """Rest orientation of a (data) bone relative to its parent, as a quaternion."""
-    if data_bone.parent is not None:
-        matrix = data_bone.parent.matrix_local.inverted() @ data_bone.matrix_local
-    else:
-        matrix = data_bone.matrix_local
-    return matrix.to_quaternion()
 
 
-def _quat_angle_degrees(a, b) -> float:
-    dot = abs(
-        float(a.w) * float(b.w)
-        + float(a.x) * float(b.x)
-        + float(a.y) * float(b.y)
-        + float(a.z) * float(b.z)
-    )
-    dot = max(-1.0, min(1.0, dot))
-    return math.degrees(2.0 * math.acos(dot))
 
 
 def _local_bind_pose_signature(armature_obj, bone_names=None) -> dict[str, dict[str, object]]:
@@ -147,438 +136,30 @@ def _local_bind_pose_signature(armature_obj, bone_names=None) -> dict[str, dict[
     return result
 
 
-def _pose_bone_stem(name):
-    colon = name.find(":")
-    return name[colon + 1 :] if colon >= 0 else name
 
 
-def _pose_bone_tokens(name):
-    stem = _pose_bone_stem(str(name or ""))
-    stem = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", stem)
-    stem = re.sub(r"[^A-Za-z0-9]+", "_", stem)
-    return [token for token in stem.lower().split("_") if token]
 
 
-def _pose_bone_side(tokens):
-    joined = "".join(tokens)
-    if "left" in tokens or "l" in tokens or joined.startswith("left"):
-        return "l"
-    if "right" in tokens or "r" in tokens or joined.startswith("right"):
-        return "r"
-    return None
 
 
-def _pose_bone_role(name):
-    """Infer a coarse humanoid role for cross-format pose transfer.
-
-    Exact name matching remains the primary path. This role fallback is only for
-    common humanoid rigs whose names differ by convention (Mixamo, UE-style,
-    KayKit, VRoid). The pose copy still writes rotations onto the target's own
-    bones, preserving target joint positions and lengths.
-    """
-    tokens = _pose_bone_tokens(name)
-    if not tokens:
-        return None
-    joined = "".join(tokens)
-    side = _pose_bone_side(tokens)
-
-    if "end" in tokens or "leaf" in tokens or "top" in tokens:
-        return None
-    if any(token in tokens for token in ("hips", "pelvis", "waist")):
-        return "hips"
-    if "head" in tokens:
-        return "head"
-    if "neck" in tokens:
-        return "neck"
-
-    if "spine" in tokens or joined.startswith("spine"):
-        compact_suffix = None
-        if len(tokens) == 1 and joined.startswith("spine") and joined != "spine":
-            compact_suffix = joined[len("spine") :]
-        if (
-            "03" in tokens
-            or "3" in tokens
-            or compact_suffix in {"2", "02", "3", "03"}
-        ):
-            return "spine2"
-        if "02" in tokens or "2" in tokens or compact_suffix in {"1", "01"}:
-            return "spine1"
-        if "01" in tokens or "1" in tokens:
-            return "spine0"
-        return "spine0"
-    if "upperchest" in joined or ("upper" in tokens and "chest" in tokens):
-        return "spine2"
-    if "chest" in tokens or "torso" in tokens:
-        return "spine2"
-
-    if side is None:
-        return None
-    prefix = f"{side}_"
-
-    if "clavicle" in tokens or "shoulder" in tokens:
-        return prefix + "shoulder"
-    if (
-        "forearm" in joined
-        or "lowerarm" in joined
-        or ("fore" in tokens and "arm" in tokens)
-        or ("lower" in tokens and "arm" in tokens)
-    ):
-        return prefix + "lower_arm"
-    if "upperarm" in joined or ("upper" in tokens and "arm" in tokens):
-        return prefix + "upper_arm"
-    if "arm" in tokens or joined.endswith("arm"):
-        return prefix + "upper_arm"
-    if "hand" in tokens or "wrist" in tokens:
-        return prefix + "hand"
-
-    if "upleg" in joined or ("up" in tokens and "leg" in tokens) or "thigh" in tokens:
-        return prefix + "thigh"
-    if (
-        ("lower" in tokens and "leg" in tokens)
-        or "calf" in tokens
-        or "shin" in tokens
-        or (joined.endswith("leg") and "up" not in tokens)
-    ):
-        return prefix + "calf"
-    if "foot" in tokens:
-        return prefix + "foot"
-    if "toe" in tokens or "toes" in tokens or "toebase" in joined:
-        return prefix + "toe"
-
-    return None
 
 
-def _role_fallbacks(role):
-    if role == "spine1":
-        return ("spine1", "spine2", "spine0")
-    if role == "spine2":
-        return ("spine2", "spine1", "spine0")
-    return (role,)
 
 
-def _stem_pose_bone_map(source_arm, target_arm):
-    """Map source pose-bone names to target pose-bone names.
-
-    Exact namespace-stripped stem matching is preferred. If that misses, fall
-    back to a coarse humanoid role map so a Mixamo donor can pose common
-    non-Mixamo humanoid rigs without copying donor translations or bone lengths.
-    Shared so the bind borrow and per-frame transfer never disagree.
-    """
-    bone_map = {}
-    target_by_stem = {}
-    for tgt_bone in target_arm.pose.bones:
-        stem = _pose_bone_stem(tgt_bone.name).lower()
-        if stem and stem not in target_by_stem:
-            target_by_stem[stem] = tgt_bone.name
-    for src_bone in source_arm.pose.bones:
-        stem = _pose_bone_stem(src_bone.name).lower()
-        tgt_name = target_by_stem.get(stem)
-        if tgt_name is not None:
-            bone_map[src_bone.name] = tgt_name
-
-    used_targets = set(bone_map.values())
-    target_by_role = {}
-    for tgt_bone in target_arm.pose.bones:
-        if tgt_bone.name in used_targets:
-            continue
-        role = _pose_bone_role(tgt_bone.name)
-        if role and role not in target_by_role:
-            target_by_role[role] = tgt_bone.name
-
-    semantic_matches = 0
-    for src_bone in source_arm.pose.bones:
-        if src_bone.name in bone_map:
-            continue
-        role = _pose_bone_role(src_bone.name)
-        if not role:
-            continue
-        for candidate_role in _role_fallbacks(role):
-            tgt_name = target_by_role.get(candidate_role)
-            if tgt_name is None or tgt_name in used_targets:
-                continue
-            bone_map[src_bone.name] = tgt_name
-            used_targets.add(tgt_name)
-            semantic_matches += 1
-            break
-
-    if semantic_matches:
-        print(
-            "[blender_scene_io] added "
-            f"{semantic_matches} semantic humanoid pose-map match(es) "
-            f"({len(bone_map)} total)."
-        )
-    return bone_map
 
 
-def _matrix3_to_np(matrix) -> np.ndarray:
-    """mathutils 3x3 (or the 3x3 block of a 4x4) -> numpy 3x3."""
-    return np.array(
-        [[float(matrix[row][col]) for col in range(3)] for row in range(3)],
-        dtype=np.float64,
-    )
 
 
-def build_target_fk_cache(target_arm) -> dict:
-    """Parent-first pose-bone order + each bone's rest rotation relative to its
-    parent (numpy 3x3). Constant for a given armature, so the per-frame pose
-    copy can reuse it instead of rederiving the topology every frame."""
-    order = []
-    seen = set()
-
-    def visit(bone):
-        if bone.name in seen:
-            return
-        if bone.parent is not None:
-            visit(bone.parent)
-        seen.add(bone.name)
-        order.append(bone)
-
-    for bone in target_arm.pose.bones:
-        visit(bone)
-
-    rest_local = {}
-    for bone in order:
-        if bone.parent is not None:
-            rl = bone.parent.bone.matrix_local.inverted() @ bone.bone.matrix_local
-        else:
-            rl = bone.bone.matrix_local
-        rest_local[bone.name] = _matrix3_to_np(rl.to_3x3())
-    # Static rest world rotation per bone (parent chain under an identity root).
-    # `order` is parent-first, so each parent is resolved before its children.
-    # Used by the twist transfer to re-anchor the donor's roll on the target's
-    # own rest mounting (independent of the posed parent -> no double-count).
-    rest_world = {}
-    for bone in order:
-        parent_rw = rest_world.get(bone.parent.name) if bone.parent is not None else None
-        if parent_rw is None:
-            parent_rw = np.eye(3, dtype=np.float64)
-        rest_world[bone.name] = parent_rw @ rest_local[bone.name]
-    return {"order": order, "rest_local": rest_local, "rest_world": rest_world}
 
 
-def _can_use_same_rig_local_pose_transfer(source_arm, target_arm, bone_map) -> bool:
-    """Return true only when local pose channels are safe to copy verbatim.
-
-    Same-rig animation should not pass through the direction-only retargeter:
-    Blender already has the correct local channels, including any real
-    translate/scale keys. The guard is structural: every source and target pose
-    bone must map exactly once, parent links must agree under that mapping, and
-    the mapped bones must share the same local rest orientation. Equal names are
-    not enough: local animation channels are expressed in each bone's parent
-    frame, so copying them is only mathematically valid when those frames match.
-    """
-    if source_arm is None or target_arm is None or not bone_map:
-        return False
-    source_bones = source_arm.pose.bones
-    target_bones = target_arm.pose.bones
-    mapped = [
-        (src_name, tgt_name)
-        for src_name, tgt_name in bone_map.items()
-        if source_bones.get(src_name) is not None and target_bones.get(tgt_name) is not None
-    ]
-    if len(mapped) != len(source_bones) or len(mapped) != len(target_bones):
-        return False
-
-    for src_name, tgt_name in mapped:
-        src_bone = source_bones.get(src_name)
-        tgt_bone = target_bones.get(tgt_name)
-        if src_bone is None or tgt_bone is None:
-            return False
-
-        src_parent = src_bone.parent.name if src_bone.parent is not None else None
-        tgt_parent = tgt_bone.parent.name if tgt_bone.parent is not None else None
-        mapped_src_parent = bone_map.get(src_parent) if src_parent is not None else None
-        if src_parent is None or tgt_parent is None:
-            if src_parent != tgt_parent:
-                return False
-        elif mapped_src_parent != tgt_parent:
-            return False
-        src_rest = _rest_local_quat(src_bone.bone)
-        tgt_rest = _rest_local_quat(tgt_bone.bone)
-        if _quat_angle_degrees(src_rest, tgt_rest) > 2.0:
-            return False
-    return True
 
 
-def _copy_source_local_pose_to_target(source_arm, target_arm, bone_map) -> int:
-    """Copy evaluated local pose channels from source to target.
-
-    This is only valid for the guarded same-rig path. It preserves real source
-    action location/rotation/scale keys while keeping the target armature's own
-    rest head/tail positions and bone lengths.
-    """
-    for tgt_bone in target_arm.pose.bones:
-        tgt_bone.location = (0.0, 0.0, 0.0)
-        tgt_bone.rotation_mode = "QUATERNION"
-        tgt_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
-        tgt_bone.scale = (1.0, 1.0, 1.0)
-
-    posed = 0
-    for src_name, tgt_name in bone_map.items():
-        src_bone = source_arm.pose.bones.get(src_name)
-        tgt_bone = target_arm.pose.bones.get(tgt_name)
-        if src_bone is None or tgt_bone is None:
-            continue
-        tgt_bone.matrix_basis = src_bone.matrix_basis.copy()
-        posed += 1
-    return posed
 
 
-def _rotation_between_np(source, target) -> np.ndarray:
-    """Minimal 3x3 rotation taking unit-ish vector `source` onto `target`.
-
-    No twist beyond what is needed to align the two directions — so a bone's
-    roll (and therefore how its mesh is mounted) is preserved.
-    """
-    a = np.asarray(source, dtype=np.float64)
-    b = np.asarray(target, dtype=np.float64)
-    na = float(np.linalg.norm(a))
-    nb = float(np.linalg.norm(b))
-    if na < 1e-9 or nb < 1e-9:
-        return np.eye(3, dtype=np.float64)
-    a = a / na
-    b = b / nb
-    v = np.cross(a, b)
-    c = float(np.dot(a, b))
-    if c > 1.0 - 1e-9:
-        return np.eye(3, dtype=np.float64)
-    if c < -1.0 + 1e-9:
-        # Opposite directions: rotate 180° about any axis perpendicular to a.
-        helper = np.array((1.0, 0.0, 0.0)) if abs(a[0]) < 0.9 else np.array((0.0, 1.0, 0.0))
-        axis = np.cross(a, helper)
-        axis /= max(float(np.linalg.norm(axis)), 1e-9)
-        x, y, z = axis
-        return 2.0 * np.array(((x * x, x * y, x * z),
-                               (x * y, y * y, y * z),
-                               (x * z, y * z, z * z))) - np.eye(3)
-    skew = np.array(((0.0, -v[2], v[1]),
-                     (v[2], 0.0, -v[0]),
-                     (-v[1], v[0], 0.0)), dtype=np.float64)
-    return np.eye(3) + skew + skew @ skew * (1.0 / (1.0 + c))
 
 
-def _twist_about_y_np(rot3) -> np.ndarray:
-    """Twist component of a 3x3 rotation about the bone axis (+Y), as 3x3.
-
-    Swing-twist decomposition keeping only the rotation about +Y and discarding
-    any swing that tilts Y. Used to graft the donor's roll *motion* onto a
-    direction-matched target bone without disturbing its aimed direction — the
-    direction-only copy preserves the target's rest roll and therefore drops the
-    donor's wrist/finger twist (12-60deg on this fixture). At the donor's rest
-    frame this is identity (no twist), so a static roll mismatch never spins the
-    target's mesh (the auto-rig "face backwards" regression stays fixed).
-    """
-    if mathutils is None:
-        return np.eye(3, dtype=np.float64)
-    q = mathutils.Matrix(np.asarray(rot3, dtype=np.float64).tolist()).to_quaternion()
-    n = math.hypot(q.w, q.y)
-    if n < 1e-9:
-        return np.eye(3, dtype=np.float64)
-    twist = mathutils.Quaternion((q.w / n, 0.0, q.y / n, 0.0))
-    return _matrix3_to_np(twist.to_matrix())
 
 
-def _copy_source_pose_to_target(
-    source_arm, target_arm, bone_map, *, copy_root_location=False, fk_cache=None,
-    transfer_twist=True,
-) -> int:
-    """Reproduce the source pose on the target by matching each mapped bone's
-    world DIRECTION (plus the donor's twist motion about that direction) while
-    keeping the target rig's own rest roll, solved top-down.
-
-    Both rigs are facing-normalized at import, so pointing each target bone
-    along its source bone's world direction follows the donor's motion. The
-    target bone's REST ROLL is preserved (only the minimal rotation that aligns
-    the directions is applied) — this is what makes it work on rigs whose bone
-    axes differ from the donor's:
-
-    * A raw local-channel copy applies the donor's swing about the target's
-      differently-rolled local axis → a forward/back walk swung the auto-rigged
-      piggy's legs sideways (plane rotated 90°).
-    * Copying the donor's FULL ABSOLUTE world rotation forces the donor's static
-      roll onto the target; since the piggy's auto-rig mounts its mesh against
-      different local axes, that spun the head/face around (animated correctly
-      but faced backwards).
-    * Matching only the world DIRECTION fixes the swing AND preserves how the
-      target mounts its mesh, but it DISCARDS the donor's twist about the bone
-      axis. On a renamed-but-not-reoriented rig (e.g. a Mixamo target whose rest
-      rolls differ 90-180° from a Mannequin donor) that lost twist reaches
-      12-60° on upper arms / hands / fingers and visibly deforms hands.
-
-    `transfer_twist` adds back only the donor's twist MOTION about the aimed
-    axis (swing-twist split, `_twist_about_y_np`). It is rest-relative: the twist
-    is the difference between the direction-only frame and the donor's
-    rest-compensated rotation re-anchored on the target's own static rest, so at
-    the donor's rest frame it is identity (no static roll is forced → the piggy
-    face-spin stays fixed) and it degenerates to an exact copy when the rolls
-    already agree (Mixamo Walk.fbx / Ch36 stay correct).
-
-    The bind borrow and `_extract_transferred_animation` both call this so the
-    bind/setup pose stays consistent with the transferred clip at the setup
-    frame (the exported rig composes world = setup ∘ delta).
-    """
-    cache = fk_cache or build_target_fk_cache(target_arm)
-    order = cache["order"]
-    rest_local = cache["rest_local"]
-    rest_world_static = cache.get("rest_world", {})
-
-    inverse_map = {}
-    for src_name, tgt_name in bone_map.items():
-        inverse_map.setdefault(tgt_name, src_name)
-
-    aw_src = _matrix3_to_np(source_arm.matrix_world.to_3x3())
-    aw_tgt_inv = np.linalg.inv(_matrix3_to_np(target_arm.matrix_world.to_3x3()))
-    bone_y = np.array((0.0, 1.0, 0.0), dtype=np.float64)
-
-    posed = 0
-    target_world = {}  # bone name -> resolved world rotation in target armature space
-    for tgt_bone in order:
-        parent = tgt_bone.parent
-        parent_world = (
-            target_world.get(parent.name) if parent is not None else None
-        )
-        if parent_world is None:
-            parent_world = np.eye(3, dtype=np.float64)
-        rest = rest_local[tgt_bone.name]
-        rest_world = parent_world @ rest  # target bone's rest orientation under posed parent
-
-        src_name = inverse_map.get(tgt_bone.name)
-        src_bone = source_arm.pose.bones.get(src_name) if src_name else None
-        if src_bone is not None:
-            # Source bone full rotation and direction (+Y) in target armature space.
-            src_pose_w = aw_tgt_inv @ (aw_src @ _matrix3_to_np(src_bone.matrix.to_3x3()))
-            src_dir = src_pose_w @ bone_y
-            rest_dir = rest_world @ bone_y
-            align = _rotation_between_np(rest_dir, src_dir)
-            desired_world = align @ rest_world  # reorient direction, keep target roll
-            tgt_rest_static = rest_world_static.get(tgt_bone.name)
-            if transfer_twist and tgt_rest_static is not None:
-                # Graft the donor's twist about the aimed axis. rc_world is the
-                # donor's rotation-from-rest re-anchored on the target's static
-                # rest; keep only the twist of (direction-only)^-1 @ rc_world so
-                # the aimed direction is untouched.
-                src_rest_w = aw_tgt_inv @ (
-                    aw_src @ _matrix3_to_np(src_bone.bone.matrix_local.to_3x3())
-                )
-                rc_world = (src_pose_w @ np.linalg.inv(src_rest_w)) @ tgt_rest_static
-                twist = _twist_about_y_np(np.linalg.inv(desired_world) @ rc_world)
-                desired_world = desired_world @ twist
-            posed += 1
-        else:
-            # Unmapped target bone: leave it at its rest orientation.
-            desired_world = rest_world
-
-        basis = np.linalg.inv(rest_world) @ desired_world
-        tgt_bone.rotation_mode = "QUATERNION"
-        tgt_bone.rotation_quaternion = mathutils.Matrix(basis.tolist()).to_quaternion()
-        if copy_root_location and tgt_bone.parent is None and src_bone is not None:
-            tgt_bone.location = src_bone.location.copy()
-        else:
-            tgt_bone.location = (0.0, 0.0, 0.0)
-        tgt_bone.scale = (1.0, 1.0, 1.0)
-        target_world[tgt_bone.name] = desired_world
-
-    return posed
 
 
 def _maybe_borrow_bind_from_animation(
@@ -756,34 +337,10 @@ def _purge_imported_objects(names_before: set) -> None:
             continue
 
 
-def _armature_uniform_scale(armature_obj) -> float:
-    if armature_obj is None:
-        return 1.0
-    scale = armature_obj.matrix_world.to_scale()
-    values = [abs(float(scale.x)), abs(float(scale.y)), abs(float(scale.z))]
-    values = [value for value in values if value > VECTOR_EPSILON]
-    if not values:
-        return 1.0
-    return sum(values) / len(values)
 
 
-def _world_rotation_3x3(matrix4):
-    """Pure-rotation 3x3 from a world matrix, stripping object scale.
-
-    Bone world matrices built from ``armature.matrix_world @ bone.matrix``
-    inherit the armature object's scale (Mixamo imports carry a uniform
-    0.01 cm->m factor). Native LBS treats this 3x3 as an orthonormal bind/
-    frame rotation, so any embedded scale collapses every skinned vertex
-    toward the bone head and corrupts the depth-based draw order. Extract
-    the rotation via the quaternion, which normalizes the scale away.
-    """
-    return matrix4.to_quaternion().to_matrix()
 
 
-def _armature_world_rotation(armature_obj):
-    if armature_obj is None:
-        return mathutils.Matrix.Identity(3)
-    return armature_obj.matrix_world.to_quaternion().to_matrix()
 
 
 def extract_2d_mesh(
@@ -1088,14 +645,6 @@ def _strip_object_transform_animation(objects) -> int:
     return removed
 
 
-_MIXAMO_PREFIX_RE = re.compile(r"^mixamorig\d*[:_]?", re.IGNORECASE)
-
-
-def _strip_mixamo_prefix(name: str) -> str:
-    stem = str(name or "")
-    if ":" in stem:
-        stem = stem.rsplit(":", 1)[-1]
-    return _MIXAMO_PREFIX_RE.sub("", stem)
 
 
 # --- FlatRig HML22 rig reduction (input-side) -------------------------------
@@ -1104,99 +653,10 @@ def _strip_mixamo_prefix(name: str) -> str:
 # names are owned by FlatRig: core, spine.1/2/3, collar/shoulder/elbow/wrist,
 # hip/knee/ankle/foot, neck, head. Unknown/non-humanoid rigs are exported
 # untouched so the caller can use the generic/GMR path.
-_CANONICAL_ALIASES = {
-    # UE mannequin / Quaternius / Mesh2Motion deform names.
-    "root": "core", "pelvis": "core",
-    "spine_01": "spine.1", "spine_02": "spine.2", "spine_03": "spine.3",
-    "neck_01": "neck", "head": "head",
-    "clavicle_l": "collar.l", "clavicle_r": "collar.r",
-    "upperarm_l": "shoulder.l", "upperarm_r": "shoulder.r",
-    "lowerarm_l": "elbow.l", "lowerarm_r": "elbow.r",
-    "hand_l": "wrist.l", "hand_r": "wrist.r",
-    "thigh_l": "hip.l", "thigh_r": "hip.r",
-    "calf_l": "knee.l", "calf_r": "knee.r",
-    "foot_l": "ankle.l", "foot_r": "ankle.r",
-    "ball_l": "foot.l", "ball_r": "foot.r",
-    # HumanML3D / SMPL-style names.
-    "left_hip": "hip.l", "right_hip": "hip.r",
-    "spine1": "spine.1", "spine2": "spine.2", "spine3": "spine.3",
-    "left_knee": "knee.l", "right_knee": "knee.r",
-    "left_ankle": "ankle.l", "right_ankle": "ankle.r",
-    "left_foot": "foot.l", "right_foot": "foot.r",
-    "left_collar": "collar.l", "right_collar": "collar.r",
-    "left_shoulder": "shoulder.l", "right_shoulder": "shoulder.r",
-    "left_elbow": "elbow.l", "right_elbow": "elbow.r",
-    "left_wrist": "wrist.l", "right_wrist": "wrist.r",
-    # Mixamo names for callers that bypass import-time mannequin normalization.
-    "Hips": "core", "Spine": "spine.1", "Spine1": "spine.2", "Spine2": "spine.3",
-    "Neck": "neck", "Head": "head",
-    "LeftShoulder": "collar.l", "RightShoulder": "collar.r",
-    "LeftArm": "shoulder.l", "RightArm": "shoulder.r",
-    "LeftForeArm": "elbow.l", "RightForeArm": "elbow.r",
-    "LeftHand": "wrist.l", "RightHand": "wrist.r",
-    "LeftUpLeg": "hip.l", "RightUpLeg": "hip.r",
-    "LeftLeg": "knee.l", "RightLeg": "knee.r",
-    "LeftFoot": "ankle.l", "RightFoot": "ankle.r",
-    "LeftToeBase": "foot.l", "RightToeBase": "foot.r",
-    # Legacy FlatRig/KayKit names for transitional already-reduced assets.
-    "hips": "core", "spine": "spine.1", "chest": "spine.3",
-    "upperarm.l": "shoulder.l", "upperarm.r": "shoulder.r",
-    "lowerarm.l": "elbow.l", "lowerarm.r": "elbow.r",
-    "wrist.l": "wrist.l", "wrist.r": "wrist.r",
-    "hand.l": "wrist.l", "hand.r": "wrist.r",
-    "upperleg.l": "hip.l", "upperleg.r": "hip.r",
-    "lowerleg.l": "knee.l", "lowerleg.r": "knee.r",
-    "foot.l": "ankle.l", "foot.r": "ankle.r",
-    "toes.l": "foot.l", "toes.r": "foot.r",
-    # Common auto-rig aliases.
-    "upper_chest": "spine.3",
-    "left_upper_leg": "hip.l", "right_upper_leg": "hip.r",
-    "left_lower_leg": "knee.l", "right_lower_leg": "knee.r",
-    "left_arm": "shoulder.l", "right_arm": "shoulder.r",
-    "left_forearm": "elbow.l", "right_forearm": "elbow.r",
-    "left_hand": "wrist.l", "right_hand": "wrist.r",
-    # VRoid aliases.
-    "jbipchest": "spine.2",
-    "jbipupperchest": "spine.3",
-    "jbiplupperarm": "shoulder.l",
-    "jbiprupperarm": "shoulder.r",
-    "jbipllowerarm": "elbow.l",
-    "jbiprlowerarm": "elbow.r",
-    "jbiplhand": "wrist.l",
-    "jbiprhand": "wrist.r",
-    "jbiplupperleg": "hip.l",
-    "jbiprupperleg": "hip.r",
-    "jbipllowerleg": "knee.l",
-    "jbiprlowerleg": "knee.r",
-    "jbiplfoot": "ankle.l",
-    "jbiprfoot": "ankle.r",
-    "jbipltoes": "foot.l",
-    "jbiprtoes": "foot.r",
-}
-_CANONICAL_ALIAS_KEYS = {}
-for _alias_name, _canon_name in _CANONICAL_ALIASES.items():
-    _key = re.sub(r"[^a-z0-9]+", "_", _strip_mixamo_prefix(_alias_name).lower()).strip("_")
-    _CANONICAL_ALIAS_KEYS[_key] = _canon_name
-    _CANONICAL_ALIAS_KEYS[_key.replace("_", "")] = _canon_name
-_CANON_HUMANOID_CORE = {"core", "head", "shoulder.l", "shoulder.r", "hip.l", "hip.r"}
 
 
-def _canonical_target_for_bone_name(name: str):
-    leaf = _strip_mixamo_prefix(name)
-    if leaf in _CANONICAL_ALIASES:
-        return _CANONICAL_ALIASES[leaf]
-    key = re.sub(r"[^a-z0-9]+", "_", str(leaf).lower()).strip("_")
-    return _CANONICAL_ALIAS_KEYS.get(key) or _CANONICAL_ALIAS_KEYS.get(key.replace("_", ""))
 
 
-def is_humanoid_biped(bone_names) -> bool:
-    """Only biped humanoids may be reduced; quadruped/winged/limbless are left as
-    is (their names resolve almost nothing under the map)."""
-    resolved = {_canonical_target_for_bone_name(n) for n in bone_names}
-    resolved.discard(None)
-    return _CANON_HUMANOID_CORE.issubset(resolved) and (
-        "spine.1" in resolved or "spine.2" in resolved or "spine.3" in resolved
-    )
 
 
 def _reduce_armature_to_canonical(armature_obj, meshes):
@@ -1336,16 +796,10 @@ def import_model(filepath: str) -> None:
     sanitize_imported_armature_terminal_geometry(imported)
 
 
-def _structural_root_bone(armature_obj):
-    return _orientation_structural_root_bone(armature_obj, _deform_bone_names)
 
 
-def _rig_forward_world(armature_obj):
-    return _orientation_rig_forward_world(armature_obj, _deform_bone_names)
 
 
-def _posed_rig_forward_world(armature_obj):
-    return _orientation_posed_rig_forward_world(armature_obj, _deform_bone_names)
 
 
 def normalize_model_orientation(objects=None, target_forward=NORMALIZE_TARGET_FORWARD) -> float:
@@ -1382,103 +836,12 @@ def _mesh_world_bounds(mesh_objects):
     return minimum, maximum
 
 
-def _weighted_bone_names(mesh_objects):
-    weighted_names = set()
-    for mesh_obj in mesh_objects:
-        group_names = {group.index: group.name for group in mesh_obj.vertex_groups}
-        for vertex in mesh_obj.data.vertices:
-            for assignment in vertex.groups:
-                if float(assignment.weight) <= 1e-6:
-                    continue
-                name = group_names.get(assignment.group)
-                if name:
-                    weighted_names.add(name)
-    return weighted_names
-
-
-def _meshes_using_armature(armature_obj):
-    """Meshes skinned by ``armature_obj`` (parented or via an armature modifier)."""
-    meshes = []
-    for obj in bpy.data.objects:
-        if obj.type != "MESH" or not getattr(obj.data, "vertices", None):
-            continue
-        if len(obj.data.vertices) == 0:
-            continue
-        if obj.parent is armature_obj or any(
-            modifier.type == "ARMATURE" and modifier.object is armature_obj
-            for modifier in obj.modifiers
-        ):
-            meshes.append(obj)
-    return meshes
 
 
 # Per-process cache: the deform-bone classification scans every skin weight, so
 # we compute it once per armature (each CLI call is its own process / one rig).
-_DEFORM_BONE_NAME_CACHE: dict = {}
 
 
-def _deform_bone_names(armature_obj, mesh_objects=None):
-    """Name-agnostic deform skeleton: bones that skin the mesh, plus their
-    structural ancestors (pass-through connectors up to the root) and their
-    descendant tips (unweighted leaf/``*_leaf`` bones that hang off a deform
-    bone).
-
-    This is the rig-format-independent way to separate the deform skeleton from
-    a control rig: control bones (IK/pole/driver) carry no skin weight and live
-    in their own subtree, so they are excluded, while the genuine deform tree —
-    including tips that different authoring tools weight inconsistently — is kept
-    whole. Two rigs that share a skeleton (e.g. mesh2motion vs quaternius) then
-    yield the *same* deform set even though one wraps it in a control rig.
-    Returns an empty set when there are no skin weights (BVH / anim-only rigs).
-    """
-    if armature_obj is None:
-        return set()
-    cache_key = getattr(armature_obj, "name", None)
-    if cache_key:
-        cached = _DEFORM_BONE_NAME_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-    if mesh_objects is None:
-        mesh_objects = _meshes_using_armature(armature_obj)
-    weighted = _weighted_bone_names(mesh_objects) if mesh_objects else set()
-
-    bones = list(armature_obj.data.bones)
-    parent_of = {bone.name: (bone.parent.name if bone.parent else None) for bone in bones}
-    children_of: dict = {}
-    for name, parent in parent_of.items():
-        children_of.setdefault(parent, []).append(name)
-
-    deform = set(weighted)
-    # Structural ancestors of every weighted bone (keeps pass-through connectors
-    # such as the root above the pelvis).
-    for name in weighted:
-        cursor = parent_of.get(name)
-        while cursor is not None and cursor not in deform:
-            deform.add(cursor)
-            cursor = parent_of.get(cursor)
-    # Descendant tips of weighted bones (keeps unweighted leaves so tool-specific
-    # leaf weighting differences do not change the deform set).
-    stack = list(weighted)
-    while stack:
-        name = stack.pop()
-        for child in children_of.get(name, []):
-            if child not in deform:
-                deform.add(child)
-                stack.append(child)
-
-    if cache_key:
-        _DEFORM_BONE_NAME_CACHE[cache_key] = deform
-    return deform
-
-
-def _mesh_uses_armature(mesh_obj, armature_obj):
-    if mesh_obj.parent is armature_obj:
-        return True
-    return any(
-        modifier.type == "ARMATURE" and modifier.object is armature_obj
-        for modifier in mesh_obj.modifiers
-    )
 
 
 def _sanitize_armature_terminal_geometry(armature_obj, mesh_objects):
@@ -2634,62 +1997,10 @@ def reduce_mesh_object(
 # ============================================================================
 
 
-def _find_root_bone_name(armature):
-    """Find the root bone name (bone with no parent)."""
-    for bone in armature.data.bones:
-        if bone.parent is None:
-            return bone.name
-    return None
 
 
-def get_projection_reference_inverse(
-    armature,
-    projection_space="world",
-    use_rest_pose=False,
-    root_bone_name=None,
-    reference_root_matrix=None,
-):
-    """Return the inverse transform for the requested projection space."""
-    if projection_space != "root" or armature is None:
-        return None
-
-    if root_bone_name is None:
-        root_bone_name = _find_root_bone_name(armature)
-    if root_bone_name is None:
-        return None
-
-    if use_rest_pose:
-        root_bone = armature.data.bones[root_bone_name]
-        current_matrix = armature.matrix_world @ root_bone.matrix_local
-    else:
-        root_bone = armature.pose.bones[root_bone_name]
-        current_matrix = armature.matrix_world @ root_bone.matrix
-
-    current_matrix = np.array(current_matrix, dtype=np.float64)
-
-    if reference_root_matrix is None:
-        reference_root_matrix = current_matrix
-    else:
-        reference_root_matrix = np.asarray(reference_root_matrix, dtype=np.float64)
-
-    current_rotation = orthonormalize_3x3(current_matrix[:3, :3])
-    reference_rotation = orthonormalize_3x3(reference_root_matrix[:3, :3])
-    projection_matrix = np.eye(4, dtype=np.float64)
-    projection_matrix[:3, :3] = current_rotation @ reference_rotation.T
-    projection_matrix[:3, 3] = current_matrix[:3, 3]
-
-    return np.linalg.inv(projection_matrix)
 
 
-def orthonormalize_3x3(matrix):
-    """Extract the closest rigid rotation from a 3x3 transform using SVD."""
-    matrix = np.asarray(matrix, dtype=np.float64)
-    u, _, vh = np.linalg.svd(matrix)
-    rotation = u @ vh
-    if np.linalg.det(rotation) < 0.0:
-        u[:, -1] *= -1.0
-        rotation = u @ vh
-    return rotation
 
 
 # ============================================================================
@@ -2697,105 +2008,20 @@ def orthonormalize_3x3(matrix):
 # ============================================================================
 
 
-def safe_inverse_2x2(matrix, epsilon=None):
-    """Invert a 2x2 matrix, falling back to the identity for degenerate cases."""
-    if epsilon is None:
-        epsilon = SEGMENT_EPSILON
-    det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
-    if abs(det) <= epsilon:
-        return np.eye(2, dtype=np.float64)
-    return np.linalg.inv(matrix)
 
 
-def orthonormalize_2x2(matrix, epsilon=None):
-    """Orthonormalize a 2x2 matrix preserving handedness."""
-    if epsilon is None:
-        epsilon = SEGMENT_EPSILON
-    det = float(matrix[0, 0] * matrix[1, 1] - matrix[0, 1] * matrix[1, 0])
-    x_axis = np.array((matrix[0, 0], matrix[1, 0]), dtype=np.float64)
-    x_norm = float(np.linalg.norm(x_axis))
-    if x_norm <= epsilon:
-        x_axis = np.array((1.0, 0.0), dtype=np.float64)
-    else:
-        x_axis = x_axis / x_norm
-    y_axis = np.array((-x_axis[1], x_axis[0]), dtype=np.float64)
-    if det < 0.0:
-        y_axis = -y_axis
-    return np.array(
-        [[x_axis[0], y_axis[0]], [x_axis[1], y_axis[1]]],
-        dtype=np.float64,
-    )
 
 
-def _build_2d_basis(rotation_deg, scale_x=1.0, scale_y=1.0):
-    """Build the 2x2 matrix for a local bone transform."""
-    rotation_rad = math.radians(rotation_deg)
-    cos_r = math.cos(rotation_rad)
-    sin_r = math.sin(rotation_rad)
-    return np.array(
-        [[cos_r * scale_x, -sin_r * scale_y], [sin_r * scale_x, cos_r * scale_y]],
-        dtype=np.float64,
-    )
 
 
-def _normalize_angle(angle):
-    """Normalize an angle to the [-180, 180] range."""
-    while angle > 180:
-        angle -= 360
-    while angle < -180:
-        angle += 360
-    return angle
 
 
-def _bone_is_connected(rest_bone, epsilon=1e-4):
-    """Return True when a child bone is effectively attached to its parent's tail."""
-    if rest_bone.parent is None:
-        return False
-    if getattr(rest_bone, "use_connect", False):
-        return True
-    return (rest_bone.head_local - rest_bone.parent.tail_local).length <= epsilon
 
 
-def _topological_sort(armature):
-    """Sort bone names so parents always come before children."""
-    sorted_bones = []
-    visited = set()
-
-    def visit(bone):
-        if bone.name in visited:
-            return
-        if bone.parent:
-            visit(bone.parent)
-        visited.add(bone.name)
-        sorted_bones.append(bone.name)
-
-    for bone in armature.data.bones:
-        visit(bone)
-
-    return sorted_bones
 
 
-def _sanitize_bvh_name(name, used_names):
-    """Build a stable external matcher matching name from a Blender bone name."""
-    base = BVH_SUFFIX_RE.sub("", str(name or "")).strip()
-    base = re.sub(r"[^A-Za-z0-9_]+", "_", base)
-    base = re.sub(r"_+", "_", base).strip("_")
-    if not base:
-        base = "joint"
-    if base[0].isdigit():
-        base = f"joint_{base}"
-
-    candidate = base
-    suffix = 2
-    while candidate in used_names:
-        candidate = f"{base}_{suffix}"
-        suffix += 1
-    used_names.add(candidate)
-    return candidate
 
 
-def _bvh_export_name(matching_name, index):
-    return f"{matching_name}__{int(index):03d}"
 
 
 def _build_3d_bvh_layout(armature_obj, source_frame=None, use_rest_pose=True):
@@ -2987,32 +2213,8 @@ def _write_3d_bvh(output_path, joints, positions, rotations, fps):
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _matrix_xyz_euler_degrees(matrix):
-    euler = matrix.to_euler("XYZ")
-    return [
-        math.degrees(float(euler.x)),
-        math.degrees(float(euler.y)),
-        math.degrees(float(euler.z)),
-    ]
 
 
-def _rotation_between_vectors(source, target):
-    source_vec = mathutils.Vector(source)
-    target_vec = mathutils.Vector(target)
-    if source_vec.length <= VECTOR_EPSILON or target_vec.length <= VECTOR_EPSILON:
-        return mathutils.Matrix.Identity(3)
-    source_vec.normalize()
-    target_vec.normalize()
-    dot = max(-1.0, min(1.0, float(source_vec.dot(target_vec))))
-    if dot > 1.0 - 1e-8:
-        return mathutils.Matrix.Identity(3)
-    if dot < -1.0 + 1e-8:
-        axis = source_vec.cross(mathutils.Vector((1.0, 0.0, 0.0)))
-        if axis.length <= VECTOR_EPSILON:
-            axis = source_vec.cross(mathutils.Vector((0.0, 1.0, 0.0)))
-        axis.normalize()
-        return mathutils.Matrix.Rotation(math.pi, 3, axis)
-    return source_vec.rotation_difference(target_vec).to_matrix()
 
 
 def _pose_bone_world_head_tail(armature_obj, pose_bone):
