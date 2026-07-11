@@ -209,19 +209,100 @@ def _soft_cut_support_available():
     return True
 
 
+def _filter_alpha(alpha, image_filter):
+    """Apply a Pillow filter to a normalized alpha matte."""
+    from PIL import Image
+
+    pixels = np.rint(np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+    filtered = Image.fromarray(pixels, mode="L").filter(image_filter)
+    return np.asarray(filtered, dtype=np.float32) / 255.0
+
+
+def _build_soft_ring_alpha(
+    core_alpha,
+    coverage_alpha,
+    *,
+    feather_radius=None,
+    underlay_radius=None,
+):
+    """Build a seam-safe alpha matte for a core plus borrowed triangle ring.
+
+    ``core_alpha`` is the canonical ownership matte and ``coverage_alpha`` is
+    the render of the core plus its borrowed ring.  The core must remain an
+    opaque underlay: cross-fading two independently rendered ownership mattes
+    would otherwise turn two 0.5 edge samples into only 0.75 source-over
+    coverage.  A small, coverage-clipped dilation protects that raster edge,
+    while only the remainder of the borrowed ring is feathered.
+
+    Clipping both layers to ``coverage_alpha`` is important.  It preserves the
+    original outer silhouette and cannot bridge a design/geometry hole where
+    the expanded part itself rendered no coverage.
+    """
+    from PIL import ImageFilter
+
+    core = np.asarray(core_alpha, dtype=np.float32)
+    coverage = np.asarray(coverage_alpha, dtype=np.float32)
+    if core.ndim != 2 or coverage.ndim != 2:
+        raise ValueError("soft-ring alpha mattes must be two-dimensional")
+    if core.shape != coverage.shape:
+        raise ValueError("core and coverage alpha mattes must have the same shape")
+    if not core.size:
+        return np.empty_like(core)
+
+    core = np.clip(core, 0.0, 1.0)
+    coverage = np.clip(coverage, 0.0, 1.0)
+    image_extent = max(core.shape)
+    if feather_radius is None:
+        feather_radius = max(2.0, image_extent * 0.008)
+    else:
+        feather_radius = max(0.0, float(feather_radius))
+    if underlay_radius is None:
+        # At least one texel is required to cover the two complementary
+        # antialias samples at a shared triangle edge.  Scaling the guard with
+        # the image keeps it effective when neighbouring sprites use pages at
+        # different pixel densities.
+        underlay_radius = max(2, int(np.ceil(image_extent * 0.0015)))
+    else:
+        underlay_radius = max(0, int(np.ceil(float(underlay_radius))))
+
+    def blur(values):
+        if feather_radius <= 0.0:
+            return values
+        return _filter_alpha(values, ImageFilter.GaussianBlur(feather_radius))
+
+    blurred_coverage = blur(coverage)
+    ratio = blur(core) / np.maximum(blurred_coverage, 1e-4)
+    ratio = np.clip(ratio, 0.0, 1.0)
+    ramp = np.clip((ratio - 0.25) / 0.5, 0.0, 1.0)
+    soft_mask = ramp * ramp * (3.0 - 2.0 * ramp)
+    feathered_ring = coverage * soft_mask
+
+    if underlay_radius > 0:
+        filter_size = underlay_radius * 2 + 1
+        expanded_core = _filter_alpha(core, ImageFilter.MaxFilter(filter_size))
+    else:
+        expanded_core = core
+    opaque_underlay = np.minimum(expanded_core, coverage)
+    result = np.maximum(opaque_underlay, feathered_ring)
+
+    # A region with no borrowed coverage is part of the true silhouette (or a
+    # true hole), rather than an internal cut.  Preserve it byte-for-byte.
+    no_ring = coverage <= core + (1.0 / 255.0)
+    result[no_ring] = coverage[no_ring]
+    return np.clip(result, 0.0, coverage)
+
+
 def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024):
-    """Fade the shared one-ring dilation out with a smooth image-space mask.
+    """Keep the core opaque and fade its borrowed ring in image space.
 
     The part mesh was rendered with one extra ring of triangles borrowed from
     its neighbours. A second render of the core-only object provides a
-    coverage mask through its alpha channel (material-independent); blurring
-    that ownership mask and remapping it with a smoothstep turns the
-    triangle-edge cut into a smooth anti-aliased alpha edge that stays inside
-    the dilated geometry. The adjacent part computes the complementary mask
-    over the same corridor, so the two sprites cross-fade and the seam stays
-    closed.
+    coverage mask through its alpha channel (material-independent). The core
+    remains the deterministic opaque underlay on its side of the cut; only the
+    extra ring feathers over the adjacent part. This avoids the alpha loss of
+    compositing two complementary translucent mattes with source-over.
     """
-    from PIL import Image, ImageFilter
+    from PIL import Image
 
     mask_path = str(output_path).rsplit(".", 1)[0] + "_ring_mask.png"
 
@@ -242,35 +323,14 @@ def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024
         color_image = Image.open(output_path).convert("RGBA")
         mask_image = Image.open(mask_path).convert("RGBA")
         if mask_image.size != color_image.size:
-            mask_image = mask_image.resize(color_image.size)
+            mask_image = mask_image.resize(color_image.size, Image.Resampling.BILINEAR)
         color = np.asarray(color_image, dtype=np.float32) / 255.0
         core_alpha = np.asarray(mask_image, dtype=np.float32)[..., 3] / 255.0
         coverage = color[..., 3]
-
-        # Normalized matte: the blurred core coverage divided by the blurred
-        # part coverage measures the local core fraction. Deep inside the core
-        # (and along its outer silhouette) the ratio stays 1, inside the ring
-        # it drops to 0, and across the seam it ramps smoothly — so the cut
-        # fades without eroding outer silhouettes or ghosting ring edges.
-        # Sized to straighten label-boundary sawtooth (measured up to ~±19 px
-        # at 2048 regardless of tessellation); the two-triangle ring corridor
-        # gives the level set room to deviate from the jagged mesh boundary.
-        blur_radius = max(2.0, resolution * 0.008)
-
-        def blur(values):
-            image = Image.fromarray((values * 255.0).astype(np.uint8))
-            image = image.filter(ImageFilter.GaussianBlur(blur_radius))
-            return np.asarray(image, dtype=np.float32) / 255.0
-
-        ratio = blur(core_alpha) / np.maximum(blur(coverage), 1e-4)
-        ratio = np.clip(ratio, 0.0, 1.0)
-        ramp = np.clip((ratio - 0.25) / 0.5, 0.0, 1.0)
-        soft_mask = ramp * ramp * (3.0 - 2.0 * ramp)
+        output_alpha = _build_soft_ring_alpha(core_alpha, coverage)
         pixels = color * 255.0
-        pixels[..., 3] *= soft_mask
-        Image.fromarray(
-            np.clip(pixels, 0.0, 255.0).astype(np.uint8)
-        ).save(output_path)
+        pixels[..., 3] = output_alpha * 255.0
+        Image.fromarray(np.rint(np.clip(pixels, 0.0, 255.0)).astype(np.uint8)).save(output_path)
         return True
     finally:
         try:

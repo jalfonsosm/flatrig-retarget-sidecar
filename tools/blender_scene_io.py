@@ -4172,6 +4172,44 @@ def _extract_transferred_animation(
     }
 
 
+def _split_sprite_render_manifest(entries):
+    """Separate the optional full-scene reference from legacy part entries.
+
+    Part entries intentionally need no ``kind`` field so manifests produced by
+    older FlatRig builds remain valid. A reference is returned separately and
+    must never contribute to the ``renders`` list: native callers use that
+    list's length as the part-count compatibility contract.
+    """
+    if not isinstance(entries, list):
+        raise ValueError("Sprite render manifest must be a JSON array")
+
+    parts = []
+    reference = None
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Sprite render manifest entry {index} must be an object")
+        kind = str(entry.get("kind") or "part")
+        if kind == "reference":
+            if reference is not None:
+                raise ValueError("Sprite render manifest may contain only one reference entry")
+            if not entry.get("output_path"):
+                raise ValueError("Sprite reference entry requires output_path")
+            frame = entry.get("projection_frame")
+            if not isinstance(frame, dict):
+                raise ValueError("Sprite reference entry requires projection_frame")
+            missing = [key for key in ("center_x", "center_y", "span") if key not in frame]
+            if missing:
+                raise ValueError(
+                    "Sprite reference projection_frame is missing: " + ", ".join(missing)
+                )
+            reference = entry
+            continue
+        if kind != "part":
+            raise ValueError(f"Unknown sprite render manifest kind: {kind}")
+        parts.append(entry)
+    return parts, reference
+
+
 def render_sprites_cli(
     source_path: str,
     output_path: str,
@@ -4238,7 +4276,8 @@ def render_sprites_cli(
     if not parts_path.exists():
         return {"ok": False, "detail": f"parts-json not found: {parts_path}"}
 
-    parts = json_module.loads(parts_path.read_text(encoding="utf-8"))
+    manifest = json_module.loads(parts_path.read_text(encoding="utf-8"))
+    parts, reference_request = _split_sprite_render_manifest(manifest)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if bind_frame > 0:
@@ -4289,7 +4328,7 @@ def render_sprites_cli(
     # Get render_part_sprite function if available
     try:
         from flatrig.projection import get_projection_reference_matrix
-        from flatrig.texture import render_part_sprite
+        from flatrig.texture import render_part_sprite, render_preview_sprite
 
         projection_matrix = (
             get_projection_reference_matrix(
@@ -4301,6 +4340,44 @@ def render_sprites_cli(
             if armature_obj
             else None
         )
+
+        reference_result = None
+        if reference_request is not None:
+            requested_path = Path(str(reference_request["output_path"])).expanduser()
+            reference_output = (
+                requested_path.resolve()
+                if requested_path.is_absolute()
+                else (output_dir / requested_path).resolve()
+            )
+            reference_output.parent.mkdir(parents=True, exist_ok=True)
+            rest_pose_state = []
+            try:
+                if use_rest_pose:
+                    rest_pose_state = _set_scene_armatures_rest_pose(bpy.context.scene)
+                reference_ok = render_preview_sprite(
+                    mesh_obj,
+                    view_cfg,
+                    dict(reference_request.get("projection_frame") or {}),
+                    str(reference_output),
+                    resolution=resolution,
+                    depth_center=float(reference_request.get("depth_center", 0.0) or 0.0),
+                    bind_frame=render_frame,
+                    projection_matrix=projection_matrix,
+                )
+            finally:
+                if rest_pose_state:
+                    _restore_scene_armature_pose_positions(rest_pose_state)
+            reference_result = {
+                "name": str(
+                    reference_request.get("name") or "__flatrig_sprite_reference__"
+                ),
+                "kind": "reference",
+                "ok": bool(reference_ok),
+                "detail": "rendered" if reference_ok else "render failed",
+                "output_path": str(reference_output),
+                "width": resolution,
+                "height": resolution,
+            }
 
         renders = []
         for part in parts:
@@ -4344,7 +4421,7 @@ def render_sprites_cli(
                 }
             )
 
-        return {
+        payload = {
             "ok": True,
             "detail": "rendered",
             "source": source_path,
@@ -4355,6 +4432,9 @@ def render_sprites_cli(
             "mesh_reduction": mesh_reduction_report,
             "renders": renders,
         }
+        if reference_result is not None:
+            payload["reference"] = reference_result
+        return payload
     except ImportError as e:
         return {"ok": False, "detail": f"Sprite rendering not available: {e}"}
 
