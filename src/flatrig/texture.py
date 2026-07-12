@@ -234,9 +234,12 @@ def _build_soft_ring_alpha(
     coverage.  A small, coverage-clipped dilation protects that raster edge,
     while only the remainder of the borrowed ring is feathered.
 
-    Clipping both layers to ``coverage_alpha`` is important.  It preserves the
-    original outer silhouette and cannot bridge a design/geometry hole where
-    the expanded part itself rendered no coverage.
+    The borrowed geometry is an *underlay*, not a second complementary
+    cross-fade.  Inside the seam band, any real source coverage therefore
+    becomes opaque even when Blender rasterized that sample at alpha 0.5.  The
+    outer boundary of ``coverage_alpha`` is detected separately and copied
+    byte-for-byte, so hardening the internal seam cannot grow the character's
+    silhouette or bridge a source hole.
     """
     from PIL import ImageFilter
 
@@ -280,16 +283,41 @@ def _build_soft_ring_alpha(
     if underlay_radius > 0:
         filter_size = underlay_radius * 2 + 1
         expanded_core = _filter_alpha(core, ImageFilter.MaxFilter(filter_size))
+        borrowed = (coverage > core + (1.0 / 255.0)).astype(np.float32)
+        near_borrowed = _filter_alpha(borrowed, ImageFilter.MaxFilter(filter_size))
     else:
         expanded_core = core
-    opaque_underlay = np.minimum(expanded_core, coverage)
-    result = np.maximum(opaque_underlay, feathered_ring)
+        near_borrowed = (coverage > core + (1.0 / 255.0)).astype(np.float32)
 
-    # A region with no borrowed coverage is part of the true silhouette (or a
-    # true hole), rather than an internal cut.  Preserve it byte-for-byte.
-    no_ring = coverage <= core + (1.0 / 255.0)
-    result[no_ring] = coverage[no_ring]
-    return np.clip(result, 0.0, coverage)
+    coverage_support = coverage > (1.0 / 255.0)
+    # A one-pixel erosion distinguishes an internal cut from the external
+    # silhouette (and from the boundary of a genuine coverage hole).  Pillow's
+    # MinFilter keeps this dependency-free in the Blender sidecar runtime.
+    coverage_interior = _filter_alpha(
+        coverage_support.astype(np.float32), ImageFilter.MinFilter(3)
+    ) > 0.5
+    seam_underlay = (
+        coverage_support
+        & coverage_interior
+        & (expanded_core > (1.0 / 255.0))
+        & (near_borrowed > 0.5)
+    )
+
+    result = np.maximum(core, feathered_ring)
+    result[seam_underlay] = 1.0
+
+    # A boundary sample shared by core and expanded renders is the true outer
+    # silhouette (or the antialiased edge of a real source hole).  By contrast,
+    # the outer edge of the *borrowed* geometry must remain free to feather;
+    # copying that edge at alpha 1 would merely move the hard seam outward.
+    local_borrowed = coverage > core + (1.0 / 255.0)
+    true_source_boundary = ~coverage_interior & ~local_borrowed
+    # Samples with no nearby borrowed geometry are unrelated to a segmentation
+    # seam and also remain byte-exact.
+    preserve_source = true_source_boundary | (near_borrowed <= 0.5)
+    result[preserve_source] = coverage[preserve_source]
+    result[~coverage_support] = coverage[~coverage_support]
+    return np.clip(result, 0.0, 1.0)
 
 
 def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024):
@@ -339,6 +367,106 @@ def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024
             pass
 
 
+def _build_triangle_filtered_render_object(source_obj, triangle_keys, depsgraph):
+    """Copy one evaluated mesh while retaining only explicitly exported faces."""
+    eval_obj = source_obj.evaluated_get(depsgraph)
+    render_mesh = bpy.data.meshes.new_from_object(
+        eval_obj,
+        preserve_all_data_layers=True,
+        depsgraph=depsgraph,
+    )
+    bm = bmesh.new()
+    has_faces = False
+    try:
+        bm.from_mesh(render_mesh)
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        wanted = {tuple(sorted(int(value) for value in key)) for key in triangle_keys}
+        delete_faces = [
+            face
+            for face in bm.faces
+            if tuple(sorted(vert.index for vert in face.verts)) not in wanted
+        ]
+        if delete_faces:
+            bmesh.ops.delete(bm, geom=delete_faces, context="FACES")
+        has_faces = bool(bm.faces)
+        if has_faces:
+            bm.to_mesh(render_mesh)
+    finally:
+        bm.free()
+    if not has_faces:
+        bpy.data.meshes.remove(render_mesh, do_unlink=True)
+        return None
+
+    render_obj = bpy.data.objects.new(f"{source_obj.name}_sidecar_reference", render_mesh)
+    render_obj.matrix_world = source_obj.matrix_world.copy()
+    bpy.context.scene.collection.objects.link(render_obj)
+    return render_obj
+
+
+def _render_filtered_preview_sprite(
+    view_cfg,
+    projection_frame,
+    output_path,
+    triangle_groups,
+    *,
+    resolution,
+    depth_center,
+    bind_frame,
+    projection_matrix,
+):
+    """Render only the exported core-triangle union, preserving scene depth."""
+    scene = bpy.context.scene
+    if bind_frame is not None:
+        scene.frame_set(bind_frame)
+        bpy.context.view_layer.update()
+
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    render_objects = []
+    camera = None
+    hidden_objects = []
+    restore_info = []
+    created_materials = []
+    try:
+        for group in triangle_groups:
+            render_obj = _build_triangle_filtered_render_object(
+                group["object"],
+                group["triangle_keys"],
+                depsgraph,
+            )
+            if render_obj is not None:
+                render_objects.append(render_obj)
+        if not render_objects:
+            return False
+
+        camera = setup_orthographic_camera(
+            view_cfg,
+            projection_frame,
+            depth_center=depth_center,
+            camera_name="Sidecar_PreviewCamera",
+            projection_matrix=projection_matrix,
+        )
+        render_set = set(render_objects)
+        for scene_obj in scene.objects:
+            if scene_obj in render_set or scene_obj == camera:
+                continue
+            hidden_objects.append((scene_obj, scene_obj.hide_render))
+            scene_obj.hide_render = True
+
+        restore_info, created_materials = _apply_unlit_materials(render_objects)
+        return render_projected_sprite(scene, output_path, resolution=resolution)
+    finally:
+        if restore_info or created_materials:
+            _restore_materials(restore_info, created_materials)
+        for render_obj in render_objects:
+            render_mesh = render_obj.data
+            bpy.data.objects.remove(render_obj, do_unlink=True)
+            bpy.data.meshes.remove(render_mesh, do_unlink=True)
+        if camera is not None:
+            bpy.data.objects.remove(camera, do_unlink=True)
+        for scene_obj, previous_state in hidden_objects:
+            scene_obj.hide_render = previous_state
+
+
 def render_preview_sprite(
     obj,
     view_cfg,
@@ -348,8 +476,26 @@ def render_preview_sprite(
     depth_center=0.0,
     bind_frame=None,
     projection_matrix=None,
+    triangle_groups=None,
 ):
-    """Render a full-body preview that matches the exported projection."""
+    """Render an assembled preview that matches the exported projection.
+
+    ``triangle_groups=None`` preserves the legacy full-scene behaviour. New
+    manifests pass filtered source objects and core keys; their temporary mesh
+    copies share one camera/render so Blender's depth buffer resolves overlap.
+    """
+    if triangle_groups is not None:
+        return _render_filtered_preview_sprite(
+            view_cfg,
+            projection_frame,
+            output_path,
+            triangle_groups,
+            resolution=resolution,
+            depth_center=depth_center,
+            bind_frame=bind_frame,
+            projection_matrix=projection_matrix,
+        )
+
     scene = bpy.context.scene
     if bind_frame is not None:
         scene.frame_set(bind_frame)

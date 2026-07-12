@@ -4210,6 +4210,72 @@ def _split_sprite_render_manifest(entries):
     return parts, reference
 
 
+def _resolve_reference_triangle_groups(reference, mesh_by_name, primary_mesh):
+    """Resolve the optional exported-core filter without legacy regressions.
+
+    A reference entry with neither filter field is the historical full-scene
+    request and returns ``None``. New entries name the exact source-object /
+    source-triangle union to render. Missing named objects are an error instead
+    of falling back to the primary mesh, which could expose unrelated geometry.
+    """
+    filter_name = reference.get("triangle_filter")
+    raw_groups = reference.get("triangle_groups")
+    if filter_name is None and raw_groups is None:
+        return None
+    if filter_name != "exported_core_union":
+        raise ValueError(f"Unsupported sprite reference triangle_filter: {filter_name!r}")
+    if not isinstance(raw_groups, list):
+        raise ValueError("Filtered sprite reference requires triangle_groups array")
+
+    keys_by_name = {}
+    for index, group in enumerate(raw_groups):
+        if not isinstance(group, dict):
+            raise ValueError(f"Sprite reference triangle group {index} must be an object")
+        object_name = str(group.get("object_name") or "")
+        raw_keys = group.get("triangle_keys")
+        if not isinstance(raw_keys, list):
+            raise ValueError(
+                f"Sprite reference triangle group {index} requires triangle_keys array"
+            )
+        keys = keys_by_name.setdefault(object_name, set())
+        for key_index, raw_key in enumerate(raw_keys):
+            if (
+                not isinstance(raw_key, (list, tuple))
+                or len(raw_key) != 3
+                or any(isinstance(value, bool) or not isinstance(value, int) for value in raw_key)
+            ):
+                raise ValueError(
+                    f"Sprite reference triangle group {index} key {key_index} "
+                    "must contain three integer vertex indices"
+                )
+            keys.add(tuple(sorted(int(value) for value in raw_key)))
+
+    resolved = []
+    for object_name in sorted(keys_by_name):
+        triangle_keys = sorted(keys_by_name[object_name])
+        if not triangle_keys:
+            continue
+        source_obj = mesh_by_name.get(object_name) if object_name else primary_mesh
+        if source_obj is None:
+            label = object_name or "<primary mesh>"
+            raise ValueError(f"Sprite reference object not found: {label}")
+        resolved.append(
+            {
+                "object_name": object_name,
+                "object": source_obj,
+                "triangle_keys": triangle_keys,
+            }
+        )
+    return resolved
+
+
+def _applied_reference_triangle_filter(reference, triangle_groups):
+    """Return the filter ACK only after resolution selected the filtered path."""
+    if triangle_groups is None:
+        return None
+    return str(reference.get("triangle_filter"))
+
+
 def render_sprites_cli(
     source_path: str,
     output_path: str,
@@ -4350,6 +4416,11 @@ def render_sprites_cli(
                 else (output_dir / requested_path).resolve()
             )
             reference_output.parent.mkdir(parents=True, exist_ok=True)
+            reference_triangle_groups = _resolve_reference_triangle_groups(
+                reference_request,
+                mesh_by_name,
+                mesh_obj,
+            )
             rest_pose_state = []
             try:
                 if use_rest_pose:
@@ -4363,6 +4434,7 @@ def render_sprites_cli(
                     depth_center=float(reference_request.get("depth_center", 0.0) or 0.0),
                     bind_frame=render_frame,
                     projection_matrix=projection_matrix,
+                    triangle_groups=reference_triangle_groups,
                 )
             finally:
                 if rest_pose_state:
@@ -4377,6 +4449,14 @@ def render_sprites_cli(
                 "output_path": str(reference_output),
                 "width": resolution,
                 "height": resolution,
+                # This is deliberately an applied-filter acknowledgement, not
+                # an echo of the request.  Native callers use it to reject an
+                # older sidecar that silently renders the historical full
+                # scene while receiving a newer filtered manifest.
+                "applied_triangle_filter": _applied_reference_triangle_filter(
+                    reference_request,
+                    reference_triangle_groups,
+                ),
             }
 
         renders = []

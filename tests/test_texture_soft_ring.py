@@ -10,7 +10,7 @@ def _source_over_alpha(top, bottom):
     return top + bottom * (1.0 - top)
 
 
-def _two_part_matte(width, *, left):
+def _two_part_matte(width, *, left, seam_coverage=1.0):
     height = max(16, width // 2)
     seam = width // 2
     outer_min = width // 8
@@ -27,6 +27,7 @@ def _two_part_matte(width, *, left):
         core[2:-2, seam] = 0.5
         core[2:-2, seam + 1 : outer_max] = 1.0
         coverage[2:-2, seam - ring_width : outer_max] = 1.0
+    coverage[2:-2, seam] = seam_coverage
     return core, coverage
 
 
@@ -47,13 +48,36 @@ def test_two_soft_ring_mattes_do_not_double_fade_at_shared_seam():
     right = _build_soft_ring_alpha(right_core, right_coverage)
     composite = _source_over_alpha(right, left)
 
-    # The canonical core on either side is the opaque underlay.  The borrowed
-    # ring can still feather, but source-over never exposes the background.
+    # The canonical core on either side is the opaque underlay.  The farther
+    # borrowed ring is not hardened, but source-over never exposes background.
     assert np.min(composite[10, 8:56]) == pytest.approx(1.0)
-    assert 0.0 < left[10, 34] < 1.0
-    assert 0.0 < right[10, 30] < 1.0
+    assert left[10, 35] < 1.0
+    assert right[10, 29] < 1.0
     assert np.all(left <= left_coverage)
     assert np.all(right <= right_coverage)
+
+
+def test_antialiased_borrowed_coverage_becomes_an_opaque_seam_underlay():
+    left_core, left_coverage = _two_part_matte(64, left=True, seam_coverage=0.5)
+    right_core, right_coverage = _two_part_matte(64, left=False, seam_coverage=0.5)
+
+    left = _build_soft_ring_alpha(left_core, left_coverage)
+    right = _build_soft_ring_alpha(right_core, right_coverage)
+    composite = _source_over_alpha(right, left)
+    seam = left.shape[1] // 2
+
+    # Clipping an independently antialiased sample to source coverage leaves
+    # two 0.5 layers at only 0.75.  Borrowed geometry is instead an opaque
+    # underlay inside the cut band, even when that local coverage sample is 0.5.
+    assert left[10, seam] >= 0.99
+    assert right[10, seam] >= 0.99
+    assert composite[10, seam] >= 0.9999
+    assert left[10, seam] > left_coverage[10, seam]
+    assert right[10, seam] > right_coverage[10, seam]
+
+    # Hardening alpha never invents support where the source render had none.
+    assert np.count_nonzero(left[left_coverage == 0.0]) == 0
+    assert np.count_nonzero(right[right_coverage == 0.0]) == 0
 
 
 def test_soft_ring_preserves_outer_silhouette_and_true_holes():
@@ -75,10 +99,13 @@ def test_soft_ring_preserves_outer_silhouette_and_true_holes():
 
     result = _build_soft_ring_alpha(core, coverage)
 
-    no_borrowed_ring = coverage <= core + (1.0 / 255.0)
-    assert np.array_equal(result[no_borrowed_ring], coverage[no_borrowed_ring])
+    # Both antialiased exterior rows are adjacent to the borrowed ring in image
+    # space, so this proves the boundary classification -- rather than mere
+    # distance from the ring -- preserves them exactly.
+    assert np.array_equal(result[4, 5:20], coverage[4, 5:20])
+    assert np.array_equal(result[23, 5:20], coverage[23, 5:20])
     assert np.count_nonzero(result[12:15, 16:19]) == 0
-    assert np.all(result <= coverage)
+    assert np.array_equal(result[coverage == 0.0], coverage[coverage == 0.0])
 
 
 @pytest.mark.parametrize(
