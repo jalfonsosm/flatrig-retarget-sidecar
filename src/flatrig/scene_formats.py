@@ -516,7 +516,7 @@ def cleanup_mesh(
     return _run_blender_command_with_args("cleanup-mesh", source, output, extra_args)
 
 
-def bake_predicted_rig(source: str, output: str, *, fbx_output: str) -> SceneCommandResult:
+def bake_predicted_rig(source: str, output: str, *, fbx_output: str, mesh_path: str | None = None) -> SceneCommandResult:
     """Build a from-scratch armature for an externally predicted rig, export FBX.
 
     ``source`` is a numpy ``.npz`` (mesh vertices/triangles + bone names/
@@ -525,6 +525,8 @@ def bake_predicted_rig(source: str, output: str, *, fbx_output: str) -> SceneCom
     the exact array layout and why no template rig file is involved.
     """
     extra_args = ["--fbx-output", str(Path(fbx_output).expanduser().resolve())]
+    if mesh_path:
+        extra_args.extend(["--mesh-path", str(Path(mesh_path).expanduser().resolve())])
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:
         return _run_bpy_command_with_args("bake-predicted-rig", source, output, extra_args)

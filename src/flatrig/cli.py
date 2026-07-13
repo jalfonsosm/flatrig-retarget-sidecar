@@ -305,6 +305,7 @@ def main() -> None:
     bake_predicted_rig_parser.add_argument("source", help="Path to the prediction .npz")
     bake_predicted_rig_parser.add_argument("--output", required=True)
     bake_predicted_rig_parser.add_argument("--fbx-output", required=True)
+    bake_predicted_rig_parser.add_argument("--mesh-path", default=None, help="Original mesh path to keep textures and materials")
 
     export_rest_bvh_parser = subparsers.add_parser(
         "export-3d-rest-bvh",
@@ -463,7 +464,7 @@ def main() -> None:
 
 
     if args.command == "bake-predicted-rig":
-        result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output)
+        result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
         _emit_result(result)
         return
 
