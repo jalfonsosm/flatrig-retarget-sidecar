@@ -263,8 +263,11 @@ def parse_worker_args(
     )
     parser.add_argument(
         "--fbx-output",
-        default=None,
         help="Rigged FBX (bake-predicted-rig) or cleaned FBX (cleanup-mesh no-rig path)",
+    )
+    parser.add_argument(
+        "--mesh-path",
+        help="Original mesh path to keep textures and materials",
     )
     parser.add_argument(
         "--orientation-fix",

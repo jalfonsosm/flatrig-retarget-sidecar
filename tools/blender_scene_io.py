@@ -1491,7 +1491,7 @@ def cleanup_generated_mesh(
     }
 
 
-def bake_predicted_rig(npz_path: str, *, fbx_output: str) -> dict[str, object]:
+def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None = None) -> dict[str, object]:
     """Build a from-scratch armature for an externally predicted rig and export FBX.
 
     ``npz_path`` is not a 3D source file: it's a numpy ``.npz`` written by an
@@ -1567,6 +1567,42 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str) -> dict[str, object]:
             mesh_obj.vertex_groups[bone_index].add([vertex_index], weight, "REPLACE")
     modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
     modifier.object = armature_obj
+
+    if mesh_path and Path(mesh_path).is_file():
+        import_model(mesh_path)
+        orig_meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH' and obj != mesh_obj]
+        if orig_meshes:
+            orig_mesh = orig_meshes[0]
+            mesh_obj.rotation_euler = (math.radians(90), 0, 0)
+            armature_obj.rotation_euler = (math.radians(90), 0, 0)
+            bpy.context.view_layer.update()
+
+            # Transfer UVs
+            dt_modifier = mesh_obj.modifiers.new(name="DataTransfer", type="DATA_TRANSFER")
+            dt_modifier.object = orig_mesh
+            dt_modifier.use_loop_data = True
+            dt_modifier.data_types_loops = {'UV'}
+            dt_modifier.loop_mapping = 'NEAREST_POLYNOR'
+            bpy.context.view_layer.objects.active = mesh_obj
+            bpy.ops.object.modifier_apply(modifier="DataTransfer")
+
+            # Copy Materials
+            for mat in orig_mesh.data.materials:
+                mesh_obj.data.materials.append(mat)
+            
+            # Delete orig objects
+            for obj in list(bpy.context.scene.objects):
+                if obj not in (mesh_obj, armature_obj):
+                    bpy.data.objects.remove(obj, do_unlink=True)
+        else:
+            mesh_obj.rotation_euler = (math.radians(90), 0, 0)
+            armature_obj.rotation_euler = (math.radians(90), 0, 0)
+    else:
+        # Just fix orientation
+        mesh_obj.rotation_euler = (math.radians(90), 0, 0)
+        armature_obj.rotation_euler = (math.radians(90), 0, 0)
+        
+    bpy.context.view_layer.update()
 
     export_path = Path(fbx_output).expanduser().resolve()
     if export_path.suffix.lower() != ".fbx":
@@ -4960,7 +4996,7 @@ def main() -> None:
     elif args.command == "bake-predicted-rig":
         if not args.fbx_output:
             raise ValueError("--fbx-output is required for bake-predicted-rig")
-        payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output)
+        payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
     elif args.command == "extract-mesh-targets":
         payload = extract_mesh_targets_cli(
             source_path,
