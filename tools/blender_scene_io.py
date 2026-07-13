@@ -1573,8 +1573,8 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
         orig_meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH' and obj != mesh_obj]
         if orig_meshes:
             orig_mesh = orig_meshes[0]
-            mesh_obj.rotation_euler = (math.radians(90), 0, 0)
-            armature_obj.rotation_euler = (math.radians(90), 0, 0)
+            # Clear any importer-applied rotation so it matches MIA's raw Y-up vertices
+            orig_mesh.rotation_euler = (0, 0, 0)
             bpy.context.view_layer.update()
 
             # Transfer UVs
@@ -1594,14 +1594,7 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
             for obj in list(bpy.context.scene.objects):
                 if obj not in (mesh_obj, armature_obj):
                     bpy.data.objects.remove(obj, do_unlink=True)
-        else:
-            mesh_obj.rotation_euler = (math.radians(90), 0, 0)
-            armature_obj.rotation_euler = (math.radians(90), 0, 0)
-    else:
-        # Just fix orientation
-        mesh_obj.rotation_euler = (math.radians(90), 0, 0)
-        armature_obj.rotation_euler = (math.radians(90), 0, 0)
-        
+                    
     bpy.context.view_layer.update()
 
     export_path = Path(fbx_output).expanduser().resolve()
