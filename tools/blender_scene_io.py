@@ -1609,7 +1609,7 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
         add_leaf_bones=False,
         bake_anim=False,
         path_mode="COPY",
-        embed_textures=False,
+        embed_textures=True,
     )
 
     return {
