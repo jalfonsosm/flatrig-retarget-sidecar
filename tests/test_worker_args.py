@@ -55,3 +55,26 @@ def test_parse_worker_args_reads_arguments_after_blender_separator() -> None:
     assert args.output == "scene.json"
     assert args.view_preset == "side"
     assert args.view_dir == (1.0, 0.0, 0.0)
+
+
+def test_parse_worker_args_reads_bake_predicted_rig_mesh_path() -> None:
+    args = worker_args.parse_worker_args(
+        ["front", "side"],
+        [
+            "blender",
+            "--background",
+            "--",
+            "bake-predicted-rig",
+            "prediction.npz",
+            "--output",
+            "report.json",
+            "--fbx-output",
+            "rigged.fbx",
+            "--mesh-path",
+            "source mesh.glb",
+        ],
+    )
+
+    assert args.command == "bake-predicted-rig"
+    assert args.fbx_output == "rigged.fbx"
+    assert args.mesh_path == "source mesh.glb"

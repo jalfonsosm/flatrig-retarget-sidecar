@@ -5,6 +5,7 @@ import json
 from flatrig.scene_formats import (
     BlenderProbe,
     SceneCommandResult,
+    bake_predicted_rig,
     extract_scene,
     inspect_3d_source,
     probe_scene_backend,
@@ -98,3 +99,36 @@ def test_extract_scene_forwards_base_color_texture_output(
     extra_args = captured["extra_args"]
     option_index = extra_args.index("--base-color-texture-output")
     assert extra_args[option_index + 1] == str(texture_path)
+
+
+def test_bake_predicted_rig_forwards_original_mesh_path(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "flatrig.scene_formats.probe_scene_backend_impl",
+        lambda: BlenderProbe(
+            available=True,
+            detail="ready",
+            mode="bpy_module",
+            script="worker.py",
+        ),
+    )
+
+    def run_worker(command, source, output, extra_args):
+        captured.update(command=command, source=source, output=output, extra_args=extra_args)
+        return SceneCommandResult(ok=True, detail="ready")
+
+    monkeypatch.setattr("flatrig.scene_formats._run_bpy_command_with_args", run_worker)
+    mesh_path = tmp_path / "source mesh.glb"
+
+    result = bake_predicted_rig(
+        "prediction.npz",
+        str(tmp_path / "report.json"),
+        fbx_output=str(tmp_path / "rigged.fbx"),
+        mesh_path=str(mesh_path),
+    )
+
+    assert result.ok is True
+    assert captured["command"] == "bake-predicted-rig"
+    extra_args = captured["extra_args"]
+    option_index = extra_args.index("--mesh-path")
+    assert extra_args[option_index + 1] == str(mesh_path.resolve())

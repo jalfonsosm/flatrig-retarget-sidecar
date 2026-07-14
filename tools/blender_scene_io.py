@@ -1491,6 +1491,159 @@ def cleanup_generated_mesh(
     }
 
 
+def _mesh_topology_mismatch(target_obj, source_obj) -> str | None:
+    """Describe why two mesh datablocks cannot share loop-domain surface data."""
+    target = target_obj.data
+    source = source_obj.data
+    if len(target.vertices) != len(source.vertices):
+        return (
+            "vertex count differs "
+            f"(prediction={len(target.vertices)}, source={len(source.vertices)})"
+        )
+    if len(target.polygons) != len(source.polygons):
+        return (
+            "polygon count differs "
+            f"(prediction={len(target.polygons)}, source={len(source.polygons)})"
+        )
+    if len(target.loops) != len(source.loops):
+        return (
+            "loop count differs "
+            f"(prediction={len(target.loops)}, source={len(source.loops)})"
+        )
+
+    for index, (target_polygon, source_polygon) in enumerate(
+        zip(target.polygons, source.polygons)
+    ):
+        if int(target_polygon.loop_start) != int(source_polygon.loop_start):
+            return (
+                f"polygon {index} loop start differs "
+                f"(prediction={target_polygon.loop_start}, source={source_polygon.loop_start})"
+            )
+        if int(target_polygon.loop_total) != int(source_polygon.loop_total):
+            return (
+                f"polygon {index} loop count differs "
+                f"(prediction={target_polygon.loop_total}, source={source_polygon.loop_total})"
+            )
+    for index, (target_loop, source_loop) in enumerate(zip(target.loops, source.loops)):
+        if int(target_loop.vertex_index) != int(source_loop.vertex_index):
+            return (
+                f"loop {index} references a different vertex "
+                f"(prediction={target_loop.vertex_index}, source={source_loop.vertex_index})"
+            )
+    return None
+
+
+def _copy_mesh_surface_data_by_topology(target_obj, source_obj) -> dict[str, int]:
+    """Copy loop UVs and material assignments between identical mesh topologies."""
+    mismatch = _mesh_topology_mismatch(target_obj, source_obj)
+    if mismatch is not None:
+        raise ValueError(f"Cannot copy mesh surface data: {mismatch}.")
+
+    target = target_obj.data
+    source = source_obj.data
+    for target_uv in list(target.uv_layers):
+        target.uv_layers.remove(target_uv)
+    for source_uv in source.uv_layers:
+        target_uv = target.uv_layers.new(name=source_uv.name)
+        if len(target_uv.data) != len(source_uv.data):
+            raise ValueError(
+                f"Cannot copy UV layer '{source_uv.name}': loop data length differs "
+                f"(prediction={len(target_uv.data)}, source={len(source_uv.data)})."
+            )
+        for target_value, source_value in zip(target_uv.data, source_uv.data):
+            target_value.uv = source_value.uv
+        if hasattr(target_uv, "active_render") and hasattr(source_uv, "active_render"):
+            target_uv.active_render = source_uv.active_render
+    if source.uv_layers:
+        target.uv_layers.active_index = source.uv_layers.active_index
+
+    target.materials.clear()
+    for material in source.materials:
+        target.materials.append(material)
+    for target_polygon, source_polygon in zip(target.polygons, source.polygons):
+        target_polygon.material_index = source_polygon.material_index
+
+    return {
+        "uv_layer_count": len(target.uv_layers),
+        "material_count": len(target.materials),
+    }
+
+
+def _fit_orientation_preserving_similarity(
+    source_points, target_points, *, relative_rms_tolerance=1e-5, relative_max_tolerance=1e-4
+) -> dict[str, object]:
+    """Fit ``target = scale * rotation @ source + translation`` with proper rotation."""
+    source = np.asarray(source_points, dtype=np.float64)
+    target = np.asarray(target_points, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1:] != (3,) or target.shape != source.shape:
+        raise ValueError(
+            "Similarity fit requires equally-shaped (N, 3) source and target point arrays."
+        )
+    if len(source) < 4:
+        raise ValueError("Similarity fit requires at least four corresponding vertices.")
+    if not np.isfinite(source).all() or not np.isfinite(target).all():
+        raise ValueError("Similarity fit received non-finite vertex coordinates.")
+
+    source_center = source.mean(axis=0)
+    target_center = target.mean(axis=0)
+    source_centered = source - source_center
+    target_centered = target - target_center
+    source_variance = float(np.mean(np.sum(source_centered * source_centered, axis=1)))
+    if source_variance <= 1e-16:
+        raise ValueError("Similarity fit source vertices have no usable spatial extent.")
+    if np.linalg.matrix_rank(source_centered) < 3 or np.linalg.matrix_rank(target_centered) < 3:
+        raise ValueError("Similarity fit requires non-degenerate 3D vertex correspondences.")
+
+    covariance = (target_centered.T @ source_centered) / float(len(source))
+    left, singular_values, right_transposed = np.linalg.svd(covariance)
+    correction = np.eye(3, dtype=np.float64)
+    if np.linalg.det(left @ right_transposed) < 0.0:
+        correction[-1, -1] = -1.0
+    rotation = left @ correction @ right_transposed
+    scale = float(np.sum(singular_values * np.diag(correction)) / source_variance)
+    if not np.isfinite(scale) or scale <= 1e-12:
+        raise ValueError(f"Similarity fit produced an invalid uniform scale ({scale!r}).")
+    rotation_determinant = float(np.linalg.det(rotation))
+    if rotation_determinant <= 0.0 or abs(rotation_determinant - 1.0) > 1e-5:
+        raise ValueError(
+            "Similarity fit did not produce an orientation-preserving rotation "
+            f"(determinant={rotation_determinant:.8g})."
+        )
+
+    translation = target_center - scale * (rotation @ source_center)
+    mapped = (scale * (rotation @ source.T)).T + translation
+    errors = np.linalg.norm(mapped - target, axis=1)
+    rms_error = float(np.sqrt(np.mean(errors * errors)))
+    max_error = float(errors.max())
+    target_diagonal = float(np.linalg.norm(target.max(axis=0) - target.min(axis=0)))
+    reference_extent = max(target_diagonal, 1e-12)
+    relative_rms_error = rms_error / reference_extent
+    relative_max_error = max_error / reference_extent
+    if (
+        relative_rms_error > float(relative_rms_tolerance)
+        or relative_max_error > float(relative_max_tolerance)
+    ):
+        raise ValueError(
+            "Prediction/source vertices are not related by one orientation-preserving "
+            "uniform similarity "
+            f"(relative RMS={relative_rms_error:.6g}, "
+            f"relative max={relative_max_error:.6g})."
+        )
+
+    matrix = np.eye(4, dtype=np.float64)
+    matrix[:3, :3] = scale * rotation
+    matrix[:3, 3] = translation
+    return {
+        "matrix": matrix,
+        "scale": scale,
+        "rotation_determinant": rotation_determinant,
+        "rms_error": rms_error,
+        "max_error": max_error,
+        "relative_rms_error": relative_rms_error,
+        "relative_max_error": relative_max_error,
+    }
+
+
 def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None = None) -> dict[str, object]:
     """Build a from-scratch armature for an externally predicted rig and export FBX.
 
@@ -1512,6 +1665,13 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
     - ``joints_top4`` (V, 4) uint8, ``weights_top4`` (V, 4) float32 -- the
       predicted skin weights, already normalized to the 4 dominant bones per
       vertex (the standard glTF/FBX skinning convention).
+
+    When ``mesh_path`` is provided, its imported mesh must retain this exact
+    polygon/loop topology. Its UVs and materials are copied by loop index, and
+    the unique proper uniform similarity from prediction coordinates to the
+    imported mesh's world coordinates is applied to the armature parent. This
+    preserves the source asset's coordinate frame without transforming the
+    parented mesh twice or changing any vertex-to-weight correspondence.
     """
     data = np.load(npz_path, allow_pickle=True)
     vertices = np.asarray(data["vertices"], dtype=np.float64)
@@ -1568,40 +1728,71 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
     modifier = mesh_obj.modifiers.new(name="Armature", type="ARMATURE")
     modifier.object = armature_obj
 
-    if mesh_path and Path(mesh_path).is_file():
-        import_model(mesh_path)
-        orig_meshes = [obj for obj in bpy.context.scene.objects if obj.type == 'MESH' and obj != mesh_obj]
-        if orig_meshes:
-            orig_mesh = orig_meshes[0]
-            # Clear any importer-applied rotation so it matches MIA's raw Y-up vertices
-            orig_mesh.rotation_euler = (0, 0, 0)
-            bpy.context.view_layer.update()
+    surface_transfer = None
+    source_alignment = None
+    if mesh_path:
+        resolved_mesh_path = Path(mesh_path).expanduser().resolve()
+        if not resolved_mesh_path.is_file():
+            raise ValueError(f"Original mesh path does not exist: {resolved_mesh_path}")
+        objects_before = set(bpy.context.scene.objects)
+        import_model(str(resolved_mesh_path))
+        imported_objects = [
+            obj for obj in bpy.context.scene.objects if obj not in objects_before
+        ]
+        imported_meshes = [obj for obj in imported_objects if obj.type == "MESH"]
+        compatible_meshes = [
+            obj
+            for obj in imported_meshes
+            if _mesh_topology_mismatch(mesh_obj, obj) is None
+        ]
+        if not compatible_meshes:
+            mismatch_details = "; ".join(
+                f"{obj.name}: {_mesh_topology_mismatch(mesh_obj, obj)}"
+                for obj in imported_meshes
+            )
+            if not mismatch_details:
+                mismatch_details = "the imported source contains no mesh objects"
+            raise ValueError(
+                "Original mesh cannot provide UV/material data because no imported mesh "
+                f"matches the prediction topology ({mismatch_details})."
+            )
+        if len(compatible_meshes) > 1:
+            names = ", ".join(obj.name for obj in compatible_meshes)
+            raise ValueError(
+                "Original mesh import is ambiguous: multiple objects match the prediction "
+                f"topology ({names})."
+            )
+        original_mesh = compatible_meshes[0]
+        surface_transfer = _copy_mesh_surface_data_by_topology(mesh_obj, original_mesh)
 
-            # Transfer UVs
-            dt_modifier = mesh_obj.modifiers.new(name="DataTransfer", type="DATA_TRANSFER")
-            dt_modifier.object = orig_mesh
-            dt_modifier.use_loop_data = True
-            dt_modifier.data_types_loops = {'UV'}
-            dt_modifier.loop_mapping = 'NEAREST_POLYNOR'
-            bpy.context.view_layer.objects.active = mesh_obj
-            bpy.ops.object.modifier_apply(modifier="DataTransfer")
+        original_world_vertices = np.asarray(
+            [
+                tuple(original_mesh.matrix_world @ vertex.co)
+                for vertex in original_mesh.data.vertices
+            ],
+            dtype=np.float64,
+        )
+        source_alignment = _fit_orientation_preserving_similarity(
+            vertices, original_world_vertices
+        )
+        # The mesh is already parented to the armature. Applying the similarity
+        # only to that parent makes both mesh and bones inherit it exactly once;
+        # transforming both objects would rotate/scale the child twice and break
+        # the bind relationship.
+        armature_obj.matrix_world = mathutils.Matrix(source_alignment["matrix"].tolist())
 
-            # Copy Materials
-            for mat in orig_mesh.data.materials:
-                mesh_obj.data.materials.append(mat)
-            
-            # Delete orig objects
-            for obj in list(bpy.context.scene.objects):
-                if obj not in (mesh_obj, armature_obj):
-                    bpy.data.objects.remove(obj, do_unlink=True)
-                    
+        for obj in imported_objects:
+            bpy.data.objects.remove(obj, do_unlink=True)
+
     bpy.context.view_layer.update()
 
     export_path = Path(fbx_output).expanduser().resolve()
     if export_path.suffix.lower() != ".fbx":
         export_path = export_path.with_suffix(".fbx")
     export_path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.object.select_all(action="SELECT")
+    bpy.ops.object.select_all(action="DESELECT")
+    mesh_obj.select_set(True)
+    armature_obj.select_set(True)
     bpy.context.view_layer.objects.active = armature_obj
     bpy.ops.export_scene.fbx(
         filepath=str(export_path),
@@ -1619,6 +1810,16 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
         "output": str(export_path),
         "bone_count": len(bone_names),
         "vertex_count": int(vertex_count),
+        "surface_transfer": surface_transfer,
+        "source_alignment": (
+            {
+                key: value
+                for key, value in source_alignment.items()
+                if key != "matrix"
+            }
+            if source_alignment is not None
+            else None
+        ),
     }
 
 
