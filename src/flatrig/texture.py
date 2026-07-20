@@ -356,7 +356,24 @@ def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024
         core_alpha = np.asarray(mask_image, dtype=np.float32)[..., 3] / 255.0
         coverage = color[..., 3]
         output_alpha = _build_soft_ring_alpha(core_alpha, coverage)
-        pixels = color * 255.0
+
+        # Blender renders premultiplied alpha (film_transparent=True), so the
+        # RGB in `color` is already premultiplied by `coverage`. The soft-ring
+        # cut replaces `coverage` with `output_alpha`, so the RGB must be
+        # re-premultiplied to stay valid. Leaving the original premultiplied
+        # RGB paired with a different alpha creates invalid pixels (RGB > alpha
+        # where alpha was lowered, or RGB < alpha where it was raised), which
+        # show up as white halos or dark fringes at sprite edges in runtimes
+        # that expect premultiplied textures (PixiJS with alphaMode =
+        # "premultiplied-alpha"). Un-premultiply by the old alpha, then
+        # re-premultiply by the new alpha.
+        safe_coverage = np.maximum(coverage, 1e-4)
+        rgb_straight = color[..., :3] / safe_coverage[..., None]
+        rgb_straight = np.clip(rgb_straight, 0.0, 1.0)
+        rgb_repremultiplied = rgb_straight * output_alpha[..., None]
+
+        pixels = np.empty_like(color)
+        pixels[..., :3] = rgb_repremultiplied * 255.0
         pixels[..., 3] = output_alpha * 255.0
         Image.fromarray(np.rint(np.clip(pixels, 0.0, 255.0)).astype(np.uint8)).save(output_path)
         return True
