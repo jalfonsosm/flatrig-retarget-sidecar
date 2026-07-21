@@ -1324,7 +1324,9 @@ def _prepare_materials_for_fbx_export(mesh_obj, out_dir, stem: str) -> list[str]
             if node.type != "TEX_IMAGE" or node.image is None:
                 continue
             image = node.image
-            if image.name in seen or not image.has_data:
+            if image.name in seen:
+                continue
+            if not image.has_data and image.packed_file is None and not image.filepath:
                 continue
             seen.add(image.name)
             suffix = f"_{len(written)}" if written else ""
@@ -1790,6 +1792,11 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
     if export_path.suffix.lower() != ".fbx":
         export_path = export_path.with_suffix(".fbx")
     export_path.parent.mkdir(parents=True, exist_ok=True)
+    embedded_texture_paths = _prepare_materials_for_fbx_export(
+        mesh_obj,
+        export_path.parent,
+        export_path.stem,
+    )
     bpy.ops.object.select_all(action="DESELECT")
     mesh_obj.select_set(True)
     armature_obj.select_set(True)
@@ -1811,6 +1818,7 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
         "bone_count": len(bone_names),
         "vertex_count": int(vertex_count),
         "surface_transfer": surface_transfer,
+        "embedded_texture_paths": embedded_texture_paths,
         "source_alignment": (
             {
                 key: value
