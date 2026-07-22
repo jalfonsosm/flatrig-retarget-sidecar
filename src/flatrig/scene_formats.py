@@ -447,9 +447,9 @@ def extract_scene(
         projection_space,
     ]
     if view_dir:
-        extra_args.extend(["--view-dir", view_dir])
+        extra_args.append(f"--view-dir={view_dir}")
     if view_up:
-        extra_args.extend(["--view-up", view_up])
+        extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
@@ -598,9 +598,9 @@ def extract_animations(
         if connected_translation_bones:
             extra_args.extend(["--connected-translation-bones", connected_translation_bones])
     if view_dir:
-        extra_args.extend(["--view-dir", view_dir])
+        extra_args.append(f"--view-dir={view_dir}")
     if view_up:
-        extra_args.extend(["--view-up", view_up])
+        extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
@@ -769,9 +769,9 @@ def export_3d_rest_bvh(
         str(fps),
     ]
     if view_dir:
-        extra_args.extend(["--view-dir", view_dir])
+        extra_args.append(f"--view-dir={view_dir}")
     if view_up:
-        extra_args.extend(["--view-up", view_up])
+        extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
@@ -828,9 +828,9 @@ def render_sprites(
         weight_aware_decimation=weight_aware_decimation,
     )
     if view_dir:
-        extra_args.extend(["--view-dir", view_dir])
+        extra_args.append(f"--view-dir={view_dir}")
     if view_up:
-        extra_args.extend(["--view-up", view_up])
+        extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:
@@ -886,9 +886,9 @@ def extract_mesh_targets(
         weight_aware_decimation=weight_aware_decimation,
     )
     if view_dir:
-        extra_args.extend(["--view-dir", view_dir])
+        extra_args.append(f"--view-dir={view_dir}")
     if view_up:
-        extra_args.extend(["--view-up", view_up])
+        extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:
         extra_args.extend(["--view-roll", str(view_roll)])
     if source_frame is not None:

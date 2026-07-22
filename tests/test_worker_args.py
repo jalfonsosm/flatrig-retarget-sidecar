@@ -57,6 +57,30 @@ def test_parse_worker_args_reads_arguments_after_blender_separator() -> None:
     assert args.view_dir == (1.0, 0.0, 0.0)
 
 
+def test_parse_worker_args_reads_negative_view_dir_with_equals() -> None:
+    args = worker_args.parse_worker_args(
+        ["front", "side", "three_quarter"],
+        [
+            "python",
+            "blender_scene_io.py",
+            "--",
+            "extract-scene",
+            "source.fbx",
+            "--output",
+            "scene.json",
+            "--view-preset",
+            "three_quarter",
+            "--view-dir=-0.707107,-0.698325,0.111097",
+            "--view-up=0,0.157115,0.98758",
+        ],
+    )
+
+    assert args.command == "extract-scene"
+    assert args.view_preset == "three_quarter"
+    assert args.view_dir == (-0.707107, -0.698325, 0.111097)
+    assert args.view_up == (0.0, 0.157115, 0.98758)
+
+
 def test_parse_worker_args_reads_bake_predicted_rig_mesh_path() -> None:
     args = worker_args.parse_worker_args(
         ["front", "side"],
