@@ -325,17 +325,6 @@ def build_visibility_map(
     }
 
 
-def get_bind_pose_2d(obj, view_cfg, projection_inverse=None):
-    """Get the bind-pose vertex positions projected to 2D."""
-    scene = bpy.context.scene
-    depsgraph = bpy.context.evaluated_depsgraph_get()
-    scene.frame_set(scene.frame_start)
-    depsgraph.update()
-
-    positions_3d = get_evaluated_vertex_positions(obj, depsgraph)
-    return project_points_ortho(positions_3d, view_cfg, projection_inverse=projection_inverse)
-
-
 def _find_root_bone_name(armature):
     for bone in armature.data.bones:
         if bone.parent is None:
