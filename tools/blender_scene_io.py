@@ -32,6 +32,11 @@ from blender_io.math_utils import *
 from blender_io.bone_utils import *
 from blender_io.pose_transfer import *
 
+# Explicit: math_utils defines __all__ and does NOT list VECTOR_EPSILON, so the
+# star import above does not bring it in. This module used to carry its own
+# identical copy, which looked redundant but was load-bearing.
+from blender_io.math_utils import VECTOR_EPSILON  # noqa: E402
+
 # Mesh welding + weight-aware decimation. Imported explicitly (not star) so the
 # underscore-prefixed helpers stay reachable as blender_scene_io attributes for
 # the callers and tests that already use them by that name.
