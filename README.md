@@ -33,3 +33,10 @@ python -m pytest
 The private FlatRig repository fetches this sidecar during CMake configure. When
 developing both repositories side by side, edit the canonical sibling checkout,
 not the generated copy under the private repository's build directory.
+
+## License
+
+This Blender/`bpy` worker is licensed under GPL-3.0-or-later. See `LICENSE`.
+FlatRig invokes it as a separate command-line process through a JSON/file
+boundary; no sidecar Python module is linked into the private native
+application.

@@ -7,11 +7,12 @@ name = "flatrig-retarget-sidecar"
 version = "0.1.0"
 description = "Public Blender (bpy) worker sidecar for FlatRig: scene/animation/mesh extraction, rendering, and format export."
 readme = "README.md"
+license = { text = "GPL-3.0-or-later" }
 requires-python = ">=3.11,<3.12"
 # Blender-worker only.
 dependencies = [
-  "numpy<2,>=1.23.5",
-  "bpy>=4.0",
+  "numpy<2,>=1.26",
+  "bpy==5.0.1",
 ]
 
 [project.optional-dependencies]
