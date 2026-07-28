@@ -3,7 +3,7 @@ Animation timeline extraction for Spine 2D (Blender worker side).
 
 Extracts bone animation keyframes from the 3D armature and converts them to
 Spine's relative-to-setup-pose format. The pure 2D math (projection
-stabilization, leaf-IK, root motion math, keyframe reduction, exported-pose
+stabilization, root motion math, keyframe reduction, exported-pose
 sampling) lives privately in ``flatrig_private.animation_math`` (Cython
 obfuscated at build time) and is re-exported here so existing
 ``from flatrig.animation import ...`` call sites keep working. This module keeps

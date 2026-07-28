@@ -862,7 +862,7 @@ def _sanitize_armature_terminal_geometry(armature_obj, mesh_objects):
     Some FBX files encode terminal tail offsets before applying their unit
     scale. Blender then imports a one-unit character with leaf segments tens of
     units long. Bone tails do not affect skinning, but those lengths poison the
-    projected hierarchy, retarget scale and optimizer geometry.
+    projected hierarchy and retarget scale.
     """
     bounds = _mesh_world_bounds(mesh_objects)
     if bounds is None:
@@ -1059,8 +1059,7 @@ def purge_model_animations(armature_obj=None) -> int:
     contaminates retargeting: it can drive the armature during the transfer,
     it perturbs Blender's action-name dedup (so the source action gets a
     ``.001`` suffix or, worse, the model's own action leaks into the output as
-    a static junk clip), and it shows up in the optimizer + exported clip
-    list. The rule is simple and robust: wipe ALL model animation before we
+    a static junk clip). The rule is simple and robust: wipe ALL model animation before we
     apply any retargeted source motion. Call this right after importing the
     model and BEFORE importing/borrowing any animation source.
     """
@@ -3151,11 +3150,9 @@ def _extract_transferred_animation(
         )
 
         # World-space 3D bone snapshot for this sample (same fields as
-        # extract_bone_hierarchy_3d). Consumed by the native optimizer's
-        # skinning3d targets and the animation-aware draw order; without it
-        # the direct-extraction path emitted no preview_3d_animations and
-        # both consumers silently fell back (self-consistent targets /
-        # static draw order).
+        # extract_bone_hierarchy_3d). Consumed by animation-aware draw order and
+        # debug/export paths; without it the direct-extraction path emitted no
+        # preview_3d_animations and draw order silently fell back to static.
         armature_world = target_arm.matrix_world
         bones_3d = []
         for bone_info in bones_setup:
@@ -3623,307 +3620,6 @@ def render_sprites_cli(
         return {"ok": False, "detail": f"Sprite rendering not available: {e}"}
 
 
-def extract_mesh_targets_cli(
-    source_path: str,
-    output_path: str,
-    *,
-    view_preset: str = "front",
-    view_dir=None,
-    view_up=None,
-    view_roll: float = 0.0,
-    source_frame: int = None,
-    use_rest_pose: bool = False,
-    projection_space: str = "world",
-    mesh_reduction: bool = True,
-    mesh_target_vertices: int = 5000,
-    weight_aware_decimation: bool = False,
-    target_spec_path: str = None,
-    bind_from_animation: str = None,
-) -> dict[str, object]:
-    """Evaluate the animated mesh per frame and project vertices to 2D.
-
-    Produces Blender-skinned ground-truth targets for the C++ Spine global
-    optimizer. The dedup map (source_vertex_indices) is rebuilt with the same
-    extract_2d_mesh call used during extract-scene so vertex ordering matches.
-
-    The target spec JSON has the form:
-        {
-          "fps": 30.0,
-          "animations": [
-            {"name": "Walk", "sample_times": [0.0, 0.0333, ...]}
-          ]
-        }
-    """
-    import json as json_module
-
-    if not target_spec_path:
-        return {"ok": False, "detail": "target-spec is required"}
-    spec_path = Path(target_spec_path).expanduser().resolve()
-    if not spec_path.exists():
-        return {"ok": False, "detail": f"target-spec not found: {spec_path}"}
-    try:
-        spec = json_module.loads(spec_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        return {"ok": False, "detail": f"target-spec parse failed: {exc}"}
-
-    fps = float(spec.get("fps") or 30.0)
-    if fps <= 0.0:
-        return {"ok": False, "detail": "fps must be > 0"}
-    requested_animations = list(spec.get("animations") or [])
-    if not requested_animations:
-        return {"ok": False, "detail": "target-spec has no animations"}
-
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_model(source_path)
-
-    # Optimizer ground-truth targets are computed for the primary mesh only;
-    # extra rigid accessory objects (e.g. a sword) are not weight-optimized.
-    mesh_obj, armature_obj = find_mesh_and_armature()
-    if mesh_obj is None:
-        return {"ok": False, "detail": "No mesh found in scene"}
-    if armature_obj is None:
-        return {"ok": False, "detail": "No armature found in scene"}
-
-    # Every clip here is an externally-sourced retargeted animation (each spec
-    # entry carries its own source_path that _import_action_from_source loads
-    # below). Wipe the model's own embedded action first so it can't be picked
-    # as a target action, drive the mesh, or perturb action-name dedup — the
-    # per-frame mesh targets must come only from the retargeted source motion.
-    purge_model_animations(armature_obj)
-
-    bind_borrow_info = _maybe_borrow_bind_from_animation(
-        armature_obj,
-        bind_from_animation,
-        source_frame=source_frame,
-        use_rest_pose=use_rest_pose,
-    )
-
-    setup_frame = _resolve_setup_frame(
-        armature_obj,
-        source_frame=source_frame,
-        use_rest_pose=use_rest_pose,
-        neutral_auto_pose=True,
-    )
-    bpy.context.scene.frame_set(setup_frame)
-    # Same constant-root-yaw removal as extract_scene_cli so the per-frame
-    # mesh targets live in the same world frame as the extracted scene (skipped
-    # when a bind pose was borrowed — the donor pose already fixes the facing).
-    if not use_rest_pose:
-        _align_root_unless_bind_borrowed(armature_obj, setup_frame, bind_borrow_info)
-    _apply_auto_setup_pose(
-        armature_obj,
-        source_frame=source_frame,
-        use_rest_pose=use_rest_pose,
-    )
-    reduce_mesh_object(
-        mesh_obj,
-        target_vertices=mesh_target_vertices,
-        enabled=mesh_reduction,
-        weight_aware_decimation=weight_aware_decimation,
-    )
-
-    view_cfg = get_scene_view_config(
-        view_name=view_preset,
-        view_dir=tuple(view_dir) if view_dir is not None else None,
-        up_hint=tuple(view_up) if view_up is not None else None,
-        roll_degrees=view_roll,
-        armature_obj=armature_obj,
-    )
-
-    # Rebuild dedup map using the same call extract-scene uses on the
-    # bind frame so the vertex ordering matches the C++ optimizer's
-    # mesh_data.vertices_2d index space.
-    bind_mesh = extract_2d_mesh(
-        mesh_obj,
-        view_cfg,
-        source_frame=setup_frame,
-        use_rest_pose=use_rest_pose,
-    )
-    source_vertex_indices = [int(i) for i in (bind_mesh.get("source_vertex_indices") or [])]
-    if not source_vertex_indices:
-        return {"ok": False, "detail": "bind dedup map is empty"}
-
-    basis_2d = np.asarray(view_cfg["basis_2d"], dtype=np.float64)
-    # Triangles in the deduped vertex index space + the view direction, used
-    # to compute per-frame front-facing visibility (see below). Without a
-    # visibility mask the C++ optimizer fits BOTH front- and back-facing
-    # vertices of every body part to the same 2D bone — a contradiction that
-    # 2D-LBS cannot satisfy, so the bone oscillates frame to frame (the
-    # whole-body "tremble"). Python's build_visibility_map returns this mask;
-    # the CLI target extractor previously omitted it.
-    visibility_triangles = np.asarray(bind_mesh.get("triangles") or [], dtype=np.int64).reshape(
-        -1, 3
-    )
-    view_dir_np = np.asarray(view_cfg["view_dir"], dtype=np.float64)
-    num_dedup_verts = len(source_vertex_indices)
-
-    def _front_facing_visibility(proj_positions_3d):
-        """Mark deduped vertices on any front-facing triangle visible.
-
-        Mirrors flatrig.projection.compute_front_facing_vertex_visibility_from_
-        triangles: a triangle faces the camera when its projection-space normal
-        points against the view direction (normal . view_dir < 0).
-        """
-        visible = np.zeros(num_dedup_verts, dtype=bool)
-        if visibility_triangles.size == 0:
-            visible[:] = True
-            return visible
-        p0 = proj_positions_3d[visibility_triangles[:, 0]]
-        p1 = proj_positions_3d[visibility_triangles[:, 1]]
-        p2 = proj_positions_3d[visibility_triangles[:, 2]]
-        normals = np.cross(p1 - p0, p2 - p0)
-        normal_lengths = np.linalg.norm(normals, axis=1)
-        eps = 1e-9
-        facing = (normal_lengths > eps) & (np.einsum("ij,j->i", normals, view_dir_np) < -eps)
-        if np.any(facing):
-            visible[np.unique(visibility_triangles[facing].reshape(-1))] = True
-        return visible
-
-    actions = [action for action in bpy.data.actions if is_pose_action(action)]
-    if not actions:
-        return {"ok": False, "detail": "No pose animations in scene"}
-    if armature_obj.animation_data is None:
-        armature_obj.animation_data_create()
-
-    output_animations: list[dict[str, object]] = []
-
-    def _import_action_from_source(source_path: str):
-        """Import an FBX action and bind it to the target armature.
-
-        Returns the imported pose action (or None when import failed / the
-        FBX brought no action). Cleans up the imported armature/mesh and
-        leaves only the action in `bpy.data.actions` so the depsgraph
-        evaluates the model armature against the borrowed motion.
-
-        This is the path that lets `extract-mesh-targets` evaluate the
-        per-frame mesh for a retargeted animation whose action does not
-        live in the model FBX. Without it `_resolve_action_for_export`
-        could only find actions named after whatever the model's own FBX
-        ships with (typically a single default action), which is why the
-        optimizer was getting mesh targets for at most one clip.
-        """
-        if not source_path:
-            return None
-        bind_path = Path(str(source_path)).expanduser()
-        if not bind_path.exists():
-            return None
-        actions_before = {a.name for a in bpy.data.actions}
-        objects_before = {obj.name for obj in bpy.data.objects}
-        try:
-            import_model(str(bind_path))
-        except Exception:
-            return None
-        new_actions = [a for a in bpy.data.actions if a.name not in actions_before]
-        candidates = [a for a in new_actions if is_pose_action(a)]
-        action = candidates[0] if candidates else None
-        if action is not None:
-            action.use_fake_user = True
-        _purge_imported_objects(objects_before)
-        bpy.context.view_layer.update()
-        return action
-
-    for anim_spec in requested_animations:
-        name = str(anim_spec.get("name") or "").strip()
-        sample_times = [float(t) for t in (anim_spec.get("sample_times") or [])]
-        source_path_override = str(anim_spec.get("source_path") or "").strip()
-        if not name or not sample_times:
-            continue
-
-        action = None
-        # When a source path is provided, prefer importing its action — that
-        # is the action that drives the retargeted animation. Falling back
-        # to name lookup against the model's own action list is only
-        # correct for clips that happen to share the model's action name.
-        if source_path_override:
-            action = _import_action_from_source(source_path_override)
-        if action is None:
-            try:
-                action = _resolve_action_for_export(armature_obj, [name])
-            except ValueError as exc:
-                output_animations.append(
-                    {
-                        "name": name,
-                        "sample_times": sample_times,
-                        "target_positions_2d": [],
-                        "ok": False,
-                        "detail": str(exc),
-                    }
-                )
-                continue
-        if action is None:
-            output_animations.append(
-                {
-                    "name": name,
-                    "sample_times": sample_times,
-                    "target_positions_2d": [],
-                    "ok": False,
-                    "detail": "action not found",
-                }
-            )
-            continue
-
-        armature_obj.animation_data.action = action
-        action_start = float(action.frame_range[0])
-
-        frame_positions: list[list[list[float]]] = []
-        frame_visibility: list[list[int]] = []
-        for sample_time in sample_times:
-            frame_float = action_start + sample_time * fps
-            frame_int = int(math.floor(frame_float))
-            subframe = float(frame_float - frame_int)
-            bpy.context.scene.frame_set(frame_int, subframe=subframe)
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            depsgraph.update()
-
-            eval_obj = mesh_obj.evaluated_get(depsgraph)
-            eval_mesh = None
-            try:
-                eval_mesh = eval_obj.to_mesh()
-                world_mat = eval_obj.matrix_world
-                eval_verts = eval_mesh.vertices
-
-                vertex_positions: list[list[float]] = []
-                proj_positions_3d = np.zeros((num_dedup_verts, 3), dtype=np.float64)
-                for dedup_index, source_index in enumerate(source_vertex_indices):
-                    if source_index < 0 or source_index >= len(eval_verts):
-                        vertex_positions.append([0.0, 0.0])
-                        continue
-                    co_world = world_mat @ eval_verts[source_index].co
-                    co_world_np = np.array((co_world.x, co_world.y, co_world.z), dtype=np.float64)
-                    co_projected = _transform_point_to_projection_space(
-                        co_world_np, projection_inverse=None
-                    )
-                    proj_positions_3d[dedup_index] = co_projected
-                    co_2d = basis_2d @ co_projected
-                    vertex_positions.append([float(co_2d[0]), float(co_2d[1])])
-                frame_positions.append(vertex_positions)
-                visible = _front_facing_visibility(proj_positions_3d)
-                frame_visibility.append([int(v) for v in visible])
-            finally:
-                if eval_mesh is not None:
-                    eval_obj.to_mesh_clear()
-
-        output_animations.append(
-            {
-                "name": name,
-                "sample_times": sample_times,
-                "target_positions_2d": frame_positions,
-                "visibility_mask": frame_visibility,
-                "ok": True,
-            }
-        )
-
-    return {
-        "ok": True,
-        "detail": "extracted",
-        "source": source_path,
-        "setup_frame": setup_frame,
-        "vertex_count": len(source_vertex_indices),
-        "fps": fps,
-        "animations": output_animations,
-    }
-
-
 def main() -> None:
     args = parse_args()
     source_path = str(Path(args.source).expanduser().resolve())
@@ -4051,23 +3747,6 @@ def main() -> None:
         if not args.fbx_output:
             raise ValueError("--fbx-output is required for bake-predicted-rig")
         payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
-    elif args.command == "extract-mesh-targets":
-        payload = extract_mesh_targets_cli(
-            source_path,
-            str(output_path),
-            view_preset=args.view_preset,
-            view_dir=args.view_dir,
-            view_up=args.view_up,
-            view_roll=args.view_roll,
-            source_frame=args.source_frame,
-            use_rest_pose=args.use_rest_pose,
-            projection_space=args.projection_space,
-            mesh_reduction=args.mesh_reduction,
-            mesh_target_vertices=args.mesh_target_vertices,
-            weight_aware_decimation=args.weight_aware_decimation,
-            target_spec_path=args.target_spec,
-            bind_from_animation=getattr(args, "bind_from_animation", None),
-        )
     elif args.command == "render-sprites":
         payload = render_sprites_cli(
             source_path,

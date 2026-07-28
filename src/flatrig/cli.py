@@ -20,7 +20,6 @@ from flatrig.scene_formats import (
     export_3d_animation_bvh,
     export_3d_rest_bvh,
     extract_animations,
-    extract_mesh_targets,
     extract_scene,
     inspect_3d_source,
     probe_scene_backend,
@@ -191,26 +190,6 @@ def main() -> None:
     reduce_rig_parser.add_argument("source")
     reduce_rig_parser.add_argument("--output", required=True)
     reduce_rig_parser.add_argument("--flat-output", required=True)
-
-
-    extract_mesh_targets_parser = subparsers.add_parser(
-        "extract-mesh-targets",
-        help="evaluate animated mesh per frame and project vertices to 2D",
-    )
-    extract_mesh_targets_parser.add_argument("source")
-    extract_mesh_targets_parser.add_argument("--output", required=True)
-    _add_projection_args(extract_mesh_targets_parser)
-    extract_mesh_targets_parser.add_argument("--bind-from-animation", default=None)
-    extract_mesh_targets_parser.add_argument("--target-spec", required=True)
-    extract_mesh_targets_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
-    extract_mesh_targets_parser.add_argument(
-        "--no-mesh-reduction",
-        dest="mesh_reduction",
-        action="store_false",
-        default=True,
-    )
-    _add_weight_aware_decimation_args(extract_mesh_targets_parser)
-
 
     render_sprites_parser = subparsers.add_parser(
         "render-sprites",
@@ -427,28 +406,6 @@ def main() -> None:
         result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
         _emit_result(result)
         return
-
-    if args.command == "extract-mesh-targets":
-        result = extract_mesh_targets(
-            args.source,
-            args.output,
-            target_spec=args.target_spec,
-            view_preset=args.view_name,
-            view_dir=args.view_dir,
-            view_up=args.view_up,
-            view_roll=args.view_roll,
-            source_frame=args.source_frame,
-            use_rest_pose=args.use_rest_pose,
-            projection_space=args.projection_space,
-            mesh_reduction=args.mesh_reduction,
-            mesh_target_vertices=args.mesh_target_vertices,
-            weight_aware_decimation=args.weight_aware_decimation,
-            bind_from_animation=getattr(args, "bind_from_animation", None),
-        )
-        _emit_result(result)
-        return
-
-
     if args.command == "render-sprites":
         result = render_sprites(
             args.source,

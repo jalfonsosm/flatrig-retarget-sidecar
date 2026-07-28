@@ -196,8 +196,8 @@ def ensure_polygon_normals(mesh):
 def compute_vertex_visibility(obj, depsgraph, view_cfg, projection_inverse=None):
     """Cheap visibility estimate based on front-facing polygons.
 
-    This is not a true z-buffer test, but it is still useful as a frame mask
-    for the optimizer. Slot splitting handles the larger occlusion problem.
+    This is not a true z-buffer test, but it is still useful as a frame mask.
+    Slot splitting handles the larger occlusion problem.
     """
     eval_obj, mesh = get_evaluated_mesh(obj, depsgraph)
     world_mat = eval_obj.matrix_world

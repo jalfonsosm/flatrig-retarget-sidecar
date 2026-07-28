@@ -14,7 +14,6 @@ WORKER_COMMANDS = (
     "render-sprites",
     "export-3d-animation-bvh",
     "export-3d-rest-bvh",
-    "extract-mesh-targets",
     "dump-rig-animation",
     "bake-rig-animation",
     "reduce-rig-to-canonical",
@@ -158,11 +157,6 @@ def parse_worker_args(
         dest="weight_aware_decimation",
         action="store_false",
         help="Use uniform mesh decimation.",
-    )
-    parser.add_argument(
-        "--target-spec",
-        default=None,
-        help="JSON file describing per-animation sample_times for extract-mesh-targets",
     )
     parser.add_argument(
         "--bind-from-animation",

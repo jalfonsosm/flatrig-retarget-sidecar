@@ -10,7 +10,6 @@ from flatrig.scene_formats import (
     bake_predicted_rig,
     export_3d_rest_bvh,
     extract_animations,
-    extract_mesh_targets,
     extract_scene,
     inspect_3d_source,
     probe_scene_backend,
@@ -148,16 +147,6 @@ def test_extract_scene_forwards_base_color_texture_output(
                 view_up="0,0.157115,0.98758",
             ),
             "render-sprites",
-        ),
-        (
-            lambda output: extract_mesh_targets(
-                "source.fbx",
-                output,
-                target_spec="targets.json",
-                view_dir="-0.707107,-0.698325,0.111097",
-                view_up="0,0.157115,0.98758",
-            ),
-            "extract-mesh-targets",
         ),
     ],
 )

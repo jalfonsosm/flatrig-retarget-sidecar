@@ -14,8 +14,7 @@ through the narrow Python API exposed under `flatrig.scene_formats`.
 - Extract and transfer 3D armature animations into FlatRig's 2D animation
   representation.
 - Render sprite parts from a selected projection view.
-- Provide mesh cleanup and mesh-target extraction commands used by the native
-  optimizer.
+- Provide mesh cleanup helpers used by the native pipeline.
 
 ## Development
 
