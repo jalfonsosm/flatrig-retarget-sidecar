@@ -142,32 +142,6 @@ def main() -> None:
         choices=("full", "rotation_only", "local_rotation", "blend"),
     )
     extract_animations_parser.add_argument("--pose-blend", type=float, default=1.0)
-    extract_animations_parser.add_argument("--rotation-flatten", type=float, default=0.0)
-    extract_animations_parser.add_argument("--rotation-flatten-scope", default="all")
-    extract_animations_parser.add_argument("--rotation-flatten-bones", default="")
-    extract_animations_parser.add_argument(
-        "--connected-translation-scope",
-        default="none",
-        choices=("none", "terminal", "limbs", "all", "custom"),
-    )
-    extract_animations_parser.add_argument("--connected-translation-bones", default="")
-    extract_animations_parser.add_argument(
-        "--stretch-guard-enabled", action="store_true", default=False
-    )
-    extract_animations_parser.add_argument("--stretch-guard-max-scale", type=float, default=1.75)
-    extract_animations_parser.add_argument("--stretch-guard-strength", type=float, default=0.65)
-    extract_animations_parser.add_argument(
-        "--stretch-guard-bones",
-        default="all",
-        choices=("all", "terminal", "nonterminal"),
-    )
-    extract_animations_parser.add_argument(
-        "--ik-leaf-refine-enabled", action="store_true", default=False
-    )
-    extract_animations_parser.add_argument("--ik-leaf-strength", type=float, default=0.35)
-    extract_animations_parser.add_argument("--ik-leaf-iterations", type=int, default=6)
-    extract_animations_parser.add_argument("--ik-leaf-max-chain-length", type=int, default=3)
-    extract_animations_parser.add_argument("--ik-leaf-preserve-scale", type=float, default=0.65)
     extract_animations_parser.add_argument(
         "--drop-problematic-frames", action="store_true", default=False
     )
@@ -384,20 +358,6 @@ def main() -> None:
             force_loop_closing_keys=args.force_loop_closing_keys,
             pose_mode=args.pose_mode,
             pose_blend=args.pose_blend,
-            rotation_flatten=args.rotation_flatten,
-            rotation_flatten_scope=args.rotation_flatten_scope,
-            rotation_flatten_bones=args.rotation_flatten_bones,
-            connected_translation_scope=args.connected_translation_scope,
-            connected_translation_bones=args.connected_translation_bones,
-            stretch_guard_enabled=args.stretch_guard_enabled,
-            stretch_guard_max_scale=args.stretch_guard_max_scale,
-            stretch_guard_strength=args.stretch_guard_strength,
-            stretch_guard_bones=args.stretch_guard_bones,
-            ik_leaf_refine_enabled=args.ik_leaf_refine_enabled,
-            ik_leaf_strength=args.ik_leaf_strength,
-            ik_leaf_iterations=args.ik_leaf_iterations,
-            ik_leaf_max_chain_length=args.ik_leaf_max_chain_length,
-            ik_leaf_preserve_scale=args.ik_leaf_preserve_scale,
             drop_problematic_frames=args.drop_problematic_frames,
             preserve_root_motion=args.preserve_root_motion,
             preserve_root_rotation=args.preserve_root_rotation,

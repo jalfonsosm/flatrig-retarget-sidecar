@@ -44,10 +44,6 @@ def extract_bone_animations(
     projection_space="world",
     pose_mode="full",
     pose_blend=1.0,
-    rotation_flatten=None,
-    connected_translation=None,
-    stretch_guard=None,
-    leaf_ik_refine=None,
     problem_frame_filter=None,
     projection_reference_root=None,
     preserve_root_motion=False,
@@ -107,10 +103,6 @@ def extract_bone_animations(
                 projection_space=projection_space,
                 pose_mode=pose_mode,
                 pose_blend=pose_blend,
-                rotation_flatten=rotation_flatten,
-                connected_translation=connected_translation,
-                stretch_guard=stretch_guard,
-                leaf_ik_refine=leaf_ik_refine,
                 problem_frame_filter=problem_frame_filter,
                 projection_reference_root=projection_reference_root,
                 preserve_root_motion=preserve_root_motion,
@@ -181,10 +173,6 @@ def _extract_current_action_bone_animation(
     projection_space="world",
     pose_mode="full",
     pose_blend=1.0,
-    rotation_flatten=None,
-    connected_translation=None,
-    stretch_guard=None,
-    leaf_ik_refine=None,
     problem_frame_filter=None,
     projection_reference_root=None,
     preserve_root_motion=False,
@@ -205,11 +193,7 @@ def _extract_current_action_bone_animation(
         frame_end = scene.frame_end
     pose_mode = _normalize_pose_mode(pose_mode)
     pose_blend = _clamp(float(pose_blend), 0.0, 1.0)
-    rotation_flatten = _prepare_rotation_flatten(rotation_flatten)
-    connected_translation = _prepare_connected_translation(connected_translation)
-    leaf_ik_refine = _prepare_leaf_ik_refine(leaf_ik_refine)
     problem_frame_filter = _prepare_problem_frame_filter(problem_frame_filter)
-    leaf_ik_chains = _build_leaf_ik_chains(bones_setup, leaf_ik_refine)
 
     setup_local = {bone["name"]: bone for bone in bones_setup}
     root_motion_bone_name = next(
@@ -252,7 +236,6 @@ def _extract_current_action_bone_animation(
     bone_timelines = {}
     previous_rotation_values = {}
     previous_stable_poses = None
-    previous_leaf_ik_poses = None
     previous_sample_metrics = None
 
     for bone_info in bones_setup:
@@ -316,7 +299,6 @@ def _extract_current_action_bone_animation(
                 projected_segments=projected_segments,
                 projection_inverse=projection_inverse,
                 pose_mode="rotation_only",
-                rotation_flatten=rotation_flatten,
                 frozen_bone_names=frozen_bone_names,
             )
             raw_full_poses = _compute_frame_local_bone_poses_2d(
@@ -326,14 +308,12 @@ def _extract_current_action_bone_animation(
                 projected_segments=projected_segments,
                 projection_inverse=projection_inverse,
                 pose_mode="full",
-                rotation_flatten=rotation_flatten,
                 frozen_bone_names=frozen_bone_names,
             )
             stable_full_poses = _stabilize_frame_local_poses_2d(
                 raw_full_poses,
                 previous_stable_poses,
                 bones_setup,
-                stretch_guard=stretch_guard,
             )
             frame_poses = _blend_frame_local_poses_2d(
                 raw_rotation_poses,
@@ -349,7 +329,6 @@ def _extract_current_action_bone_animation(
                 projected_segments=projected_segments,
                 projection_inverse=projection_inverse,
                 pose_mode=pose_mode,
-                rotation_flatten=rotation_flatten,
                 local_rotation_reference=local_rotation_reference,
                 frozen_bone_names=frozen_bone_names,
             )
@@ -360,26 +339,8 @@ def _extract_current_action_bone_animation(
                     raw_frame_poses,
                     previous_stable_poses,
                     bones_setup,
-                    stretch_guard=stretch_guard,
                 )
                 previous_stable_poses = {name: pose.copy() for name, pose in frame_poses.items()}
-
-        if (
-            not _is_rotation_pose_mode(pose_mode)
-            and leaf_ik_refine.get("enabled", False)
-            and leaf_ik_chains
-        ):
-            frame_poses = _refine_frame_local_poses_with_leaf_ik(
-                frame_poses,
-                previous_leaf_ik_poses,
-                bones_setup,
-                projected_segments,
-                leaf_ik_chains,
-                leaf_ik_refine,
-            )
-            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
-        elif leaf_ik_refine.get("enabled", False):
-            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
 
         current_sample_metrics = _collect_problem_frame_metrics(
             bones_setup,
@@ -461,7 +422,7 @@ def _extract_current_action_bone_animation(
             )
             previous_rotation_values[name] = rel_rotation
 
-            allow_translate = _bone_allows_translate(setup, connected_translation, pose_mode)
+            allow_translate = _bone_allows_translate(setup, None, pose_mode)
             if allow_translate:
                 rel_x = current["x"] - setup.get("x", 0.0)
                 rel_y = current["y"] - setup.get("y", 0.0)
@@ -560,7 +521,6 @@ def _compute_frame_local_bone_poses_2d(
     projected_segments=None,
     projection_inverse=None,
     pose_mode="full",
-    rotation_flatten=None,
     local_rotation_reference=None,
     decouple_scale=False,
     frozen_bone_names=None,
@@ -592,12 +552,6 @@ def _compute_frame_local_bone_poses_2d(
         current_length = float(projected["length"])
         setup_length = (
             float(bone_info["length"]) if bone_info["length"] > BONE_SCALE_EPSILON else 1.0
-        )
-        segment, current_length = _apply_rotation_flatten(
-            segment,
-            current_length,
-            bone_info,
-            rotation_flatten,
         )
         rigid_segment = segment.copy()
         rigid_length = current_length

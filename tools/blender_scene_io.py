@@ -3277,20 +3277,6 @@ def extract_animations_cli(
     force_loop_closing_keys: bool = False,
     pose_mode: str = "full",
     pose_blend: float = 1.0,
-    rotation_flatten: float = 0.0,
-    rotation_flatten_scope: str = "all",
-    rotation_flatten_bones: str = "",
-    connected_translation_scope: str = "none",
-    connected_translation_bones: str = "",
-    stretch_guard_enabled: bool = False,
-    stretch_guard_max_scale: float = 1.75,
-    stretch_guard_strength: float = 0.65,
-    stretch_guard_bones: str = "all",
-    ik_leaf_refine_enabled: bool = False,
-    ik_leaf_strength: float = 0.35,
-    ik_leaf_iterations: int = 6,
-    ik_leaf_max_chain_length: int = 3,
-    ik_leaf_preserve_scale: float = 0.65,
     drop_problematic_frames: bool = False,
     preserve_root_motion: bool = False,
     preserve_root_rotation: bool = False,
@@ -3399,20 +3385,6 @@ def extract_animations_cli(
                 projection_space=projection_space,
                 pose_mode=pose_mode,
                 pose_blend=pose_blend,
-                rotation_flatten=rotation_flatten,
-                rotation_flatten_scope=rotation_flatten_scope,
-                rotation_flatten_bones=rotation_flatten_bones,
-                connected_translation_scope=connected_translation_scope,
-                connected_translation_bones=connected_translation_bones,
-                stretch_guard_enabled=stretch_guard_enabled,
-                stretch_guard_max_scale=stretch_guard_max_scale,
-                stretch_guard_strength=stretch_guard_strength,
-                stretch_guard_bones=stretch_guard_bones,
-                ik_leaf_refine_enabled=ik_leaf_refine_enabled,
-                ik_leaf_strength=ik_leaf_strength,
-                ik_leaf_iterations=ik_leaf_iterations,
-                ik_leaf_max_chain_length=ik_leaf_max_chain_length,
-                ik_leaf_preserve_scale=ik_leaf_preserve_scale,
                 drop_problematic_frames=drop_problematic_frames,
                 preserve_root_motion=preserve_root_motion,
                 preserve_root_rotation=preserve_root_rotation,
@@ -3433,36 +3405,6 @@ def extract_animations_cli(
                 projection_space=projection_space,
                 pose_mode=pose_mode,
                 pose_blend=pose_blend,
-                rotation_flatten={
-                    "amount": rotation_flatten,
-                    "scope": rotation_flatten_scope,
-                    "bones": rotation_flatten_bones,
-                }
-                if rotation_flatten > 0
-                else None,
-                connected_translation={
-                    "scope": connected_translation_scope,
-                    "bones": connected_translation_bones,
-                }
-                if connected_translation_scope != "none"
-                else None,
-                stretch_guard={
-                    "enabled": True,
-                    "max_scale": stretch_guard_max_scale,
-                    "strength": stretch_guard_strength,
-                    "bones": stretch_guard_bones,
-                }
-                if stretch_guard_enabled
-                else None,
-                leaf_ik_refine={
-                    "enabled": True,
-                    "strength": ik_leaf_strength,
-                    "iterations": ik_leaf_iterations,
-                    "max_chain_length": ik_leaf_max_chain_length,
-                    "preserve_scale": ik_leaf_preserve_scale,
-                }
-                if ik_leaf_refine_enabled
-                else None,
                 problem_frame_filter={"enabled": True} if drop_problematic_frames else None,
                 projection_reference_root=None,
                 preserve_root_motion=preserve_root_motion,
@@ -3737,20 +3679,6 @@ def _extract_transferred_animation(
     projection_space="world",
     pose_mode="full",
     pose_blend=1.0,
-    rotation_flatten=None,
-    rotation_flatten_scope=None,
-    rotation_flatten_bones="",
-    connected_translation_scope="none",
-    connected_translation_bones="",
-    stretch_guard_enabled=False,
-    stretch_guard_max_scale=1.75,
-    stretch_guard_strength=0.65,
-    stretch_guard_bones="all",
-    ik_leaf_refine_enabled=False,
-    ik_leaf_strength=0.35,
-    ik_leaf_iterations=6,
-    ik_leaf_max_chain_length=3,
-    ik_leaf_preserve_scale=0.65,
     drop_problematic_frames=False,
     preserve_root_motion=False,
     preserve_root_rotation=False,
@@ -3774,14 +3702,9 @@ def _extract_transferred_animation(
         _collect_problem_frame_metrics,
         _evaluate_problem_frame_sample,
         _select_problem_frame_samples,
-        _prepare_rotation_flatten,
-        _prepare_leaf_ik_refine,
         _prepare_problem_frame_filter,
-        _build_leaf_ik_chains,
         _build_local_rotation_reference,
         _camera_parallel_bone_names,
-        _refine_frame_local_poses_with_leaf_ik,
-        _is_rotation_pose_mode,
     )
 
     # Build bone name mapping (source → target) — the same flat stem map the
@@ -3816,23 +3739,6 @@ def _extract_transferred_animation(
         frame_end = action_end
     fps = max(1.0, fps)
     total_duration = max(0.0, (frame_end - frame_start) / fps)
-    rotation_flatten_config = _prepare_rotation_flatten(
-        {
-            "amount": rotation_flatten or 0.0,
-            "scope": rotation_flatten_scope or "all",
-            "bones": rotation_flatten_bones or "",
-        }
-    )
-    leaf_ik_refine = _prepare_leaf_ik_refine(
-        {
-            "enabled": ik_leaf_refine_enabled,
-            "strength": ik_leaf_strength,
-            "iterations": ik_leaf_iterations,
-            "max_chain_length": ik_leaf_max_chain_length,
-            "preserve_scale": ik_leaf_preserve_scale,
-        }
-    )
-    leaf_ik_chains = _build_leaf_ik_chains(bones_setup, leaf_ik_refine)
 
     # Build sample times
     sample_points = []
@@ -3863,22 +3769,9 @@ def _extract_transferred_animation(
         view_cfg,
         projected_segments=setup_segments,
         pose_mode=pose_mode,
-        rotation_flatten=rotation_flatten_config,
         local_rotation_reference=local_rotation_reference,
         decouple_scale=decouple_scale,
         frozen_bone_names=frozen_bone_names,
-    )
-
-    # Build stretch guard config
-    stretch_guard = (
-        {
-            "enabled": stretch_guard_enabled,
-            "max_scale": stretch_guard_max_scale,
-            "strength": stretch_guard_strength,
-            "bones": stretch_guard_bones,
-        }
-        if stretch_guard_enabled
-        else None
     )
 
     # Build problem frame filter config
@@ -3893,7 +3786,6 @@ def _extract_transferred_animation(
 
     previous_rotation = {}
     previous_stable_poses = None
-    previous_leaf_ik_poses = None
     previous_sample_metrics = None
     sample_records = []
 
@@ -3926,7 +3818,6 @@ def _extract_transferred_animation(
             view_cfg,
             projected_segments=segments,
             pose_mode=pose_mode,
-            rotation_flatten=rotation_flatten_config,
             local_rotation_reference=local_rotation_reference,
             decouple_scale=decouple_scale,
             frozen_bone_names=frozen_bone_names,
@@ -3935,28 +3826,11 @@ def _extract_transferred_animation(
         # Stabilize frame poses (prevents short-bone flipping)
         if previous_stable_poses is not None:
             frame_poses = _stabilize_frame_local_poses_2d(
-                raw_poses, previous_stable_poses, bones_setup, stretch_guard=stretch_guard
+                raw_poses, previous_stable_poses, bones_setup
             )
         else:
             frame_poses = raw_poses
         previous_stable_poses = {name: pose.copy() for name, pose in frame_poses.items()}
-
-        if (
-            not _is_rotation_pose_mode(pose_mode)
-            and leaf_ik_refine.get("enabled", False)
-            and leaf_ik_chains
-        ):
-            frame_poses = _refine_frame_local_poses_with_leaf_ik(
-                frame_poses,
-                previous_leaf_ik_poses,
-                bones_setup,
-                segments,
-                leaf_ik_chains,
-                leaf_ik_refine,
-            )
-            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
-        elif leaf_ik_refine.get("enabled", False):
-            previous_leaf_ik_poses = {name: pose.copy() for name, pose in frame_poses.items()}
 
         # Collect problem frame metrics
         current_metrics = _collect_problem_frame_metrics(bones_setup, segments, frame_poses)
@@ -4789,20 +4663,6 @@ def main() -> None:
             force_loop_closing_keys=args.force_loop_closing_keys,
             pose_mode=args.pose_mode,
             pose_blend=args.pose_blend,
-            rotation_flatten=args.rotation_flatten,
-            rotation_flatten_scope=args.rotation_flatten_scope,
-            rotation_flatten_bones=args.rotation_flatten_bones,
-            connected_translation_scope=args.connected_translation_scope,
-            connected_translation_bones=args.connected_translation_bones,
-            stretch_guard_enabled=args.stretch_guard_enabled,
-            stretch_guard_max_scale=args.stretch_guard_max_scale,
-            stretch_guard_strength=args.stretch_guard_strength,
-            stretch_guard_bones=args.stretch_guard_bones,
-            ik_leaf_refine_enabled=args.ik_leaf_refine_enabled,
-            ik_leaf_strength=args.ik_leaf_strength,
-            ik_leaf_iterations=args.ik_leaf_iterations,
-            ik_leaf_max_chain_length=args.ik_leaf_max_chain_length,
-            ik_leaf_preserve_scale=args.ik_leaf_preserve_scale,
             drop_problematic_frames=args.drop_problematic_frames,
             preserve_root_motion=args.preserve_root_motion,
             preserve_root_rotation=args.preserve_root_rotation,

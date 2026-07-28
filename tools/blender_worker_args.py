@@ -115,35 +115,6 @@ def parse_worker_args(
     parser.add_argument(
         "--pose-blend", type=float, default=1.0, help="Blend amount for pose-mode=blend"
     )
-    parser.add_argument(
-        "--rotation-flatten", type=float, default=0.0, help="Rotation flatten amount"
-    )
-    parser.add_argument("--rotation-flatten-scope", default="all", help="Rotation flatten scope")
-    parser.add_argument("--rotation-flatten-bones", default="", help="Rotation flatten custom bones")
-    parser.add_argument(
-        "--connected-translation-scope",
-        default="none",
-        choices=("none", "terminal", "limbs", "all", "custom"),
-        help="Connected-bone translation emission scope",
-    )
-    parser.add_argument(
-        "--connected-translation-bones",
-        default="",
-        help="Custom bones for connected translation emission",
-    )
-    parser.add_argument("--stretch-guard-enabled", action="store_true", default=False)
-    parser.add_argument("--stretch-guard-max-scale", type=float, default=1.75)
-    parser.add_argument("--stretch-guard-strength", type=float, default=0.65)
-    parser.add_argument(
-        "--stretch-guard-bones",
-        default="all",
-        choices=("all", "terminal", "nonterminal"),
-    )
-    parser.add_argument("--ik-leaf-refine-enabled", action="store_true", default=False)
-    parser.add_argument("--ik-leaf-strength", type=float, default=0.35)
-    parser.add_argument("--ik-leaf-iterations", type=int, default=6)
-    parser.add_argument("--ik-leaf-max-chain-length", type=int, default=3)
-    parser.add_argument("--ik-leaf-preserve-scale", type=float, default=0.65)
     parser.add_argument("--drop-problematic-frames", action="store_true", default=False)
     parser.add_argument("--preserve-root-motion", action="store_true", default=False)
     parser.add_argument("--preserve-root-rotation", action="store_true", default=False)
