@@ -213,3 +213,34 @@ def test_bake_predicted_rig_forwards_original_mesh_path(monkeypatch, tmp_path) -
     extra_args = captured["extra_args"]
     option_index = extra_args.index("--mesh-path")
     assert extra_args[option_index + 1] == str(mesh_path.resolve())
+
+
+def test_render_sprites_forwards_fast_render_flag(monkeypatch, tmp_path) -> None:
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(
+        "flatrig.scene_formats.probe_scene_backend_impl",
+        lambda: BlenderProbe(
+            available=True,
+            detail="ready",
+            mode="bpy_module",
+            script="worker.py",
+        ),
+    )
+
+    def run_worker(command, source, output, extra_args):
+        captured.update(command=command, source=source, output=output, extra_args=extra_args)
+        return SceneCommandResult(ok=True, detail="ready")
+
+    monkeypatch.setattr("flatrig.scene_formats._run_bpy_command_with_args", run_worker)
+
+    result = render_sprites(
+        "source.fbx",
+        str(tmp_path / "sprites.json"),
+        parts_json="parts.json",
+        images_dir="images",
+        fast_render=True,
+    )
+
+    assert result.ok is True
+    assert captured["command"] == "render-sprites"
+    assert "--fast-render" in captured["extra_args"]

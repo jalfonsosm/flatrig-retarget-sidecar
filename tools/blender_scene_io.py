@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sys
 from pathlib import Path
@@ -3395,12 +3396,18 @@ def render_sprites_cli(
     mesh_target_vertices: int = 5000,
     weight_aware_decimation: bool = False,
     bind_from_animation: str = None,
+    fast_render: bool = False,
 ) -> dict[str, object]:
     """CLI wrapper for sprite rendering.
 
     This renders part sprites using the projection and sprite functions.
     """
     import json as json_module
+
+    if fast_render:
+        os.environ["FLATRIG_FAST_SPRITE_RENDER"] = "1"
+    else:
+        os.environ.pop("FLATRIG_FAST_SPRITE_RENDER", None)
 
     bpy.ops.wm.read_factory_settings(use_empty=True)
     import_model(source_path)
@@ -3610,6 +3617,7 @@ def render_sprites_cli(
             "setup_pose": setup_pose,
             "bind_borrow": bind_borrow_info,
             "use_rest_pose": bool(use_rest_pose),
+            "fast_render": bool(fast_render),
             "mesh_reduction": mesh_reduction_report,
             "renders": renders,
         }
@@ -3766,6 +3774,7 @@ def main() -> None:
             mesh_target_vertices=args.mesh_target_vertices,
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
+            fast_render=getattr(args, "fast_render", False),
         )
     else:
         raise AssertionError(f"Unhandled command: {args.command}")

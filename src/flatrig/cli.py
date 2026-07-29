@@ -203,6 +203,7 @@ def main() -> None:
     render_sprites_parser.add_argument("--images-dir", required=True)
     render_sprites_parser.add_argument("--resolution", type=int, default=2048)
     render_sprites_parser.add_argument("--bind-frame", type=int, default=0)
+    render_sprites_parser.add_argument("--fast-render", action="store_true", default=False)
     render_sprites_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
     render_sprites_parser.add_argument(
         "--no-mesh-reduction", dest="mesh_reduction", action="store_false", default=True
@@ -425,6 +426,7 @@ def main() -> None:
             mesh_target_vertices=args.mesh_target_vertices,
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
+            fast_render=args.fast_render,
         )
         _emit_result(result)
         return

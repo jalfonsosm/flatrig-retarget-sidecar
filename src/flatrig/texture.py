@@ -3,6 +3,7 @@ Orthographic preview and part sprite rendering for the Blender worker.
 """
 
 import os
+import time
 
 import bmesh
 import bpy
@@ -16,16 +17,109 @@ from flatrig.projection import (
 )
 
 
+def _fast_sprite_render_enabled():
+    return os.environ.get("FLATRIG_FAST_SPRITE_RENDER", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def _pick_render_engine(scene):
     engine_property = scene.render.bl_rna.properties.get("engine")
     available = {
         item.identifier
         for item in (engine_property.enum_items if engine_property is not None else [])
     }
-    for candidate in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH", "CYCLES"):
+    fast_render = _fast_sprite_render_enabled()
+    requested = (
+        os.environ.get("FLATRIG_SPRITE_RENDER_ENGINE", "").strip()
+        if fast_render
+        else ""
+    )
+    candidates = []
+    if requested:
+        candidates.append(requested)
+    if fast_render:
+        candidates.extend(("BLENDER_WORKBENCH", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"))
+    else:
+        candidates.extend(("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH", "CYCLES"))
+    for candidate in candidates:
         if candidate in available:
             return candidate
     return scene.render.engine
+
+
+def _set_enum_if_available(owner, attr, value):
+    prop = getattr(getattr(owner, "bl_rna", None), "properties", {}).get(attr)
+    if prop is not None:
+        allowed = {item.identifier for item in prop.enum_items}
+        if value not in allowed:
+            return False
+    try:
+        setattr(owner, attr, value)
+        return True
+    except Exception:
+        return False
+
+
+def _configure_sprite_render(scene, engine):
+    """Keep orthographic sprite renders cheap: flat/textured, transparent PNGs."""
+    scene.render.engine = engine
+    scene.render.film_transparent = True
+    scene.render.image_settings.file_format = "PNG"
+    scene.render.image_settings.color_mode = "RGBA"
+
+    if engine == "BLENDER_WORKBENCH":
+        shading = getattr(getattr(scene, "display", None), "shading", None)
+        if shading is not None:
+            _set_enum_if_available(shading, "light", "FLAT")
+            if not _set_enum_if_available(shading, "color_type", "TEXTURE"):
+                _set_enum_if_available(shading, "color_type", "MATERIAL")
+            _set_enum_if_available(shading, "background_type", "TRANSPARENT")
+            if hasattr(shading, "show_object_outline"):
+                shading.show_object_outline = False
+            if hasattr(shading, "show_cavity"):
+                shading.show_cavity = False
+        display = getattr(scene, "display", None)
+        if display is not None:
+            _set_enum_if_available(display, "render_aa", "8")
+            _set_enum_if_available(display, "viewport_aa", "8")
+        return
+
+    if engine.startswith("BLENDER_EEVEE"):
+        eevee = getattr(scene, "eevee", None)
+        if eevee is None:
+            return
+        if not _fast_sprite_render_enabled():
+            return
+        try:
+            samples = int(os.environ.get("FLATRIG_SPRITE_RENDER_SAMPLES", "4"))
+        except ValueError:
+            samples = 4
+        samples = max(1, min(samples, 64))
+        for attr in ("taa_render_samples", "taa_samples"):
+            if hasattr(eevee, attr):
+                setattr(eevee, attr, samples)
+        for attr in (
+            "use_gtao",
+            "use_bloom",
+            "use_motion_blur",
+            "use_shadows",
+            "use_volumetric_shadows",
+            "use_taa_reprojection",
+        ):
+            if hasattr(eevee, attr):
+                setattr(eevee, attr, False)
+        for attr in (
+            "shadow_ray_count",
+            "shadow_step_count",
+            "volumetric_samples",
+            "volumetric_shadow_samples",
+        ):
+            if hasattr(eevee, attr):
+                setattr(eevee, attr, 1)
 
 
 def _frame_to_world_center(projection_frame, view_cfg, depth_center=0.0, projection_matrix=None):
@@ -99,20 +193,22 @@ def setup_orthographic_camera(
 
 def render_projected_sprite(scene, output_path, resolution=2048):
     """Render the current scene from its active orthographic camera."""
-    print(f"[sidecar_texture] Rendering sprite at {resolution}x{resolution}...")
+    engine = _pick_render_engine(scene)
+    print(f"[sidecar_texture] Rendering sprite at {resolution}x{resolution} with {engine}...")
 
-    scene.render.engine = _pick_render_engine(scene)
     scene.render.resolution_x = resolution
     scene.render.resolution_y = resolution
     scene.render.resolution_percentage = 100
-    scene.render.film_transparent = True
-    scene.render.image_settings.file_format = "PNG"
-    scene.render.image_settings.color_mode = "RGBA"
     scene.render.filepath = output_path
+    _configure_sprite_render(scene, engine)
 
     try:
+        started = time.perf_counter()
         bpy.ops.render.render(write_still=True)
-        print(f"[sidecar_texture] Sprite rendered to: {output_path}")
+        print(
+            f"[sidecar_texture] Sprite rendered to: {output_path} "
+            f"({time.perf_counter() - started:.3f}s)"
+        )
         return True
     except Exception as exc:
         print(f"[sidecar_texture] Render failed: {exc}")

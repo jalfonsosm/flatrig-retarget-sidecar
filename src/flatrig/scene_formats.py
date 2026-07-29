@@ -772,6 +772,7 @@ def render_sprites(
     mesh_target_vertices: int = 5000,
     weight_aware_decimation: bool = False,
     bind_from_animation: str = None,
+    fast_render: bool = False,
 ) -> SceneCommandResult:
     """Render sprites using projection."""
     extra_args = [
@@ -806,6 +807,8 @@ def render_sprites(
         extra_args.extend(["--bind-frame", str(bind_frame)])
     if bind_from_animation:
         extra_args.extend(["--bind-from-animation", str(bind_from_animation)])
+    if fast_render:
+        extra_args.append("--fast-render")
 
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:
