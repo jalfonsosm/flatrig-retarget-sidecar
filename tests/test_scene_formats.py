@@ -215,7 +215,12 @@ def test_bake_predicted_rig_forwards_original_mesh_path(monkeypatch, tmp_path) -
     assert extra_args[option_index + 1] == str(mesh_path.resolve())
 
 
-def test_render_sprites_forwards_fast_render_flag(monkeypatch, tmp_path) -> None:
+def test_render_sprites_emits_no_render_quality_toggle(monkeypatch, tmp_path) -> None:
+    """Sprite render quality is a fixed internal setting, not a caller option.
+
+    The renderer tunes Eevee itself (see ``texture.DEFAULT_SPRITE_RENDER_SAMPLES``),
+    so no speed/quality flag may leak back into the worker command line.
+    """
     captured: dict[str, object] = {}
     monkeypatch.setattr(
         "flatrig.scene_formats.probe_scene_backend_impl",
@@ -238,9 +243,8 @@ def test_render_sprites_forwards_fast_render_flag(monkeypatch, tmp_path) -> None
         str(tmp_path / "sprites.json"),
         parts_json="parts.json",
         images_dir="images",
-        fast_render=True,
     )
 
     assert result.ok is True
     assert captured["command"] == "render-sprites"
-    assert "--fast-render" in captured["extra_args"]
+    assert "--fast-render" not in captured["extra_args"]

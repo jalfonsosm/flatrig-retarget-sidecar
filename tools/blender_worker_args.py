@@ -133,12 +133,6 @@ def parse_worker_args(
         "--bind-frame", type=int, default=0, help="Frame to use for bind-pose sprite rendering"
     )
     parser.add_argument(
-        "--fast-render",
-        action="store_true",
-        default=False,
-        help="Use the experimental fast sprite renderer for debug quality comparisons",
-    )
-    parser.add_argument(
         "--mesh-target-vertices",
         type=int,
         default=5000,

@@ -104,24 +104,27 @@ def test_parse_worker_args_reads_bake_predicted_rig_mesh_path() -> None:
     assert args.mesh_path == "source mesh.glb"
 
 
-def test_parse_worker_args_reads_fast_render_flag() -> None:
-    args = worker_args.parse_worker_args(
-        ["front", "side"],
-        [
-            "python",
-            "blender_scene_io.py",
-            "--",
-            "render-sprites",
-            "source.fbx",
-            "--output",
-            "sprites.json",
-            "--parts-json",
-            "parts.json",
-            "--images-dir",
-            "images",
-            "--fast-render",
-        ],
-    )
-
-    assert args.command == "render-sprites"
-    assert args.fast_render is True
+def test_parse_worker_args_rejects_removed_fast_render_flag() -> None:
+    """``--fast-render`` was removed; the worker must not silently accept it."""
+    try:
+        worker_args.parse_worker_args(
+            ["front", "side"],
+            [
+                "python",
+                "blender_scene_io.py",
+                "--",
+                "render-sprites",
+                "source.fbx",
+                "--output",
+                "sprites.json",
+                "--parts-json",
+                "parts.json",
+                "--images-dir",
+                "images",
+                "--fast-render",
+            ],
+        )
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("expected argparse to reject --fast-render")

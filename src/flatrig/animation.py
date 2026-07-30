@@ -27,7 +27,8 @@ from flatrig_private.projection_math import (
 # Pure 2D animation math (no ``bpy``). Re-exported so callers that still do
 # ``from flatrig.animation import _stabilize_frame_local_poses_2d`` (etc.)
 # resolve here, and so the ``bpy``-bound functions below find the helpers
-# (``_clamp``, ``_build_2d_basis``, ``BONE_SCALE_EPSILON``, ...) in module scope.
+# (``_clamp``, ``_build_2d_basis_with_shear``, ``BONE_SCALE_EPSILON``, ...) in
+# module scope.
 from flatrig_private.animation_math import *  # noqa: F401,F403
 
 
@@ -581,7 +582,9 @@ def _compute_frame_local_bone_poses_2d(
                 local_y = float(bone_info.get("y", 0.0))
                 local_rotation = float(bone_info.get("rotation", 0.0))
                 local_scale_x = 1.0
-                world_matrix = parent_state["rigid_matrix"] @ _build_2d_basis(local_rotation, 1.0)
+                world_matrix = parent_state["rigid_matrix"] @ _build_2d_basis_with_shear(
+                    local_rotation, 1.0
+                )
                 world_head = parent_state["head"] + (
                     parent_state["matrix"] @ np.array((local_x, local_y), dtype=np.float64)
                 )
@@ -605,7 +608,9 @@ def _compute_frame_local_bone_poses_2d(
                     local_x_axis = rigid_inverse @ rigid_segment
                     local_rotation = math.degrees(math.atan2(local_x_axis[1], local_x_axis[0]))
                 local_scale_x = 1.0
-                world_matrix = parent_state["rigid_matrix"] @ _build_2d_basis(local_rotation, 1.0)
+                world_matrix = parent_state["rigid_matrix"] @ _build_2d_basis_with_shear(
+                    local_rotation, 1.0
+                )
                 world_head = parent_state["head"] + (
                     parent_state["matrix"] @ np.array((local_x, local_y), dtype=np.float64)
                 )
@@ -632,7 +637,7 @@ def _compute_frame_local_bone_poses_2d(
                     world_rotation = math.degrees(
                         math.atan2(world_x_axis[1], world_x_axis[0])
                     )
-                    target_world = _build_2d_basis(world_rotation, world_scale, 1.0)
+                    target_world = _build_2d_basis_with_shear(world_rotation, world_scale, 1.0)
                     rotation_basis = (
                         parent_state["rigid_matrix"]
                         if inherit_mode == "NoScale"
@@ -687,7 +692,7 @@ def _compute_frame_local_bone_poses_2d(
                 local_rotation = math.degrees(math.atan2(rotation_segment[1], rotation_segment[0]))
             else:
                 local_rotation = float(bone_info["rotation"])
-            world_matrix = _build_2d_basis(local_rotation, local_scale_x)
+            world_matrix = _build_2d_basis_with_shear(local_rotation, local_scale_x)
             world_head = np.array((local_x, local_y), dtype=np.float64)
 
         frame_poses[bone_name] = {
