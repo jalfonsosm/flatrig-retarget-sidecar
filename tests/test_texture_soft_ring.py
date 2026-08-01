@@ -127,3 +127,42 @@ def test_opaque_underlay_survives_different_page_scales(left_size, right_size):
     # sprites deliberately use up to a 4x difference in pixel density.
     seam = common_size[0] // 2
     assert np.min(composite[common_size[1] // 2, seam - 12 : seam + 12]) == pytest.approx(1.0)
+
+
+def test_straight_recovery_does_not_whiten_the_antialiased_fringe():
+    """The un-premultiply must not turn a dark edge into a white rim.
+
+    A mid-grey shape rendered against transparency arrives 8-bit quantised.
+    Dividing the fringe's premultiplied RGB by its own tiny alpha amplifies one
+    rounding step into a saturated colour, which is what drew a white outline
+    around every sprite silhouette.
+    """
+    from flatrig.texture import _recover_straight_rgb
+
+    height, width = 32, 64
+    colour = np.float32(0.25)  # clearly darker than any white rim
+
+    coverage = np.zeros((height, width), dtype=np.float32)
+    coverage[:, :30] = 1.0
+    # An antialiased ramp down to a single 8-bit step of coverage.
+    for index, alpha in enumerate((0.5, 0.25, 0.12, 0.06, 0.03, 0.012, 0.004)):
+        coverage[:, 30 + index] = alpha
+
+    # Quantise exactly like a rendered PNG round trip.
+    premultiplied = np.rint(coverage * colour * 255.0)[..., None] / 255.0
+    premultiplied = np.repeat(premultiplied, 3, axis=-1)
+    coverage = np.rint(coverage * 255.0) / 255.0
+
+    recovered = _recover_straight_rgb(premultiplied, coverage)
+
+    fringe = (coverage > 0.0) & (coverage < 0.9)
+    assert fringe.sum() > 0
+    fringe_values = recovered[fringe]
+    # Nothing in the fringe may saturate, and the recovered colour has to stay
+    # near the real one rather than drifting toward white.
+    assert fringe_values.max() < 0.6, fringe_values.max()
+    assert abs(float(fringe_values.mean()) - float(colour)) < 0.1
+
+    # The reliable interior is still recovered exactly.
+    interior = coverage >= 0.99
+    assert np.allclose(recovered[interior], colour, atol=2.0 / 255.0)

@@ -71,12 +71,52 @@ def _set_enum_if_available(owner, attr, value):
         return False
 
 
+def _configure_sprite_colour_management(scene):
+    """Render sprites through an identity view transform.
+
+    Blender defaults to AgX, a filmic tone mapper. Two things go wrong when a
+    sprite is rendered through it.
+
+    The sprite is an unlit emission render of an albedo texture, so any tone
+    curve is pure distortion: the point is to reproduce the source texture, not
+    to grade a lit scene.
+
+    Worse, `film_transparent` output is premultiplied, so a partially covered
+    edge texel stores ``colour * coverage`` -- a very small number. A filmic
+    curve lifts small values hard, so the stored RGB gets pushed up while alpha
+    stays put, and the texel's effective straight colour ``rgb / alpha`` runs
+    away toward white. That is a white rim one texel wide around every
+    silhouette (measured on a teal character: fringe luma 240 against a body
+    luma of 103). Standard leaves the fringe at the body's own colour.
+    """
+    view_settings = getattr(scene, "view_settings", None)
+    if view_settings is None:
+        return
+    # `view_transform` and `look` are filled in from the active OCIO config, so
+    # a headless bpy reports their enum as just ("NONE",) until it resolves.
+    # _set_enum_if_available would read that as "unsupported" and silently skip
+    # the assignment, so set these directly and let the exception be the test.
+    for attr, value in (
+        ("view_transform", "Standard"),
+        ("look", "None"),
+        ("exposure", 0.0),
+        ("gamma", 1.0),
+    ):
+        if not hasattr(view_settings, attr):
+            continue
+        try:
+            setattr(view_settings, attr, value)
+        except Exception:
+            pass
+
+
 def _configure_sprite_render(scene, engine):
     """Keep orthographic sprite renders cheap: flat/textured, transparent PNGs."""
     scene.render.engine = engine
     scene.render.film_transparent = True
     scene.render.image_settings.file_format = "PNG"
     scene.render.image_settings.color_mode = "RGBA"
+    _configure_sprite_colour_management(scene)
 
     if engine == "BLENDER_WORKBENCH":
         shading = getattr(getattr(scene, "display", None), "shading", None)
@@ -315,6 +355,49 @@ def _filter_alpha(alpha, image_filter):
     return np.asarray(filtered, dtype=np.float32) / 255.0
 
 
+#: Coverage below which an un-premultiplied colour cannot be trusted. The
+#: render arrives 8-bit quantised, so recovering ``rgb / alpha`` divides a value
+#: carrying +-0.5/255 of rounding error by a very small number: at alpha 2/255
+#: the recovered colour is wrong by up to 25%, and the clip to 1.0 turns that
+#: into pure white. At this floor one rounding step is under 5%.
+_MIN_RELIABLE_COVERAGE = 12.0 / 255.0
+
+#: Radius of the alpha-weighted colour bleed that fills the unreliable texels.
+_COLOR_BLEED_RADIUS = 3.0
+
+
+def _recover_straight_rgb(premultiplied_rgb, coverage):
+    """Un-premultiply, bleeding colour outward where coverage is too low.
+
+    Dividing by a near-zero coverage amplifies the render's 8-bit rounding into
+    a saturated colour, which is why the naive round trip painted a white rim
+    around every silhouette (measured: 50-74% of a sprite's fringe texels
+    clipped to white, fringe luma ~2x the interior). Texels below
+    ``_MIN_RELIABLE_COVERAGE`` therefore take an alpha-weighted average of
+    their neighbourhood instead: blurring the premultiplied colour and the
+    coverage and then dividing yields exactly the coverage-weighted mean
+    colour, so the fringe inherits the colour of the geometry it belongs to.
+    """
+    from PIL import ImageFilter
+
+    safe = np.maximum(coverage, 1e-6)
+    direct = premultiplied_rgb / safe[..., None]
+
+    blurred_coverage = _filter_alpha(coverage, ImageFilter.GaussianBlur(_COLOR_BLEED_RADIUS))
+    bled = np.empty_like(premultiplied_rgb)
+    for channel in range(premultiplied_rgb.shape[-1]):
+        blurred_channel = _filter_alpha(
+            premultiplied_rgb[..., channel], ImageFilter.GaussianBlur(_COLOR_BLEED_RADIUS)
+        )
+        bled[..., channel] = blurred_channel / np.maximum(blurred_coverage, 1e-6)
+
+    reliable = (coverage >= _MIN_RELIABLE_COVERAGE)[..., None]
+    # Where even the neighbourhood carries no coverage there is no colour to
+    # recover; those texels are fully transparent, so the value is irrelevant.
+    recovered = np.where(reliable, direct, bled)
+    return np.clip(recovered, 0.0, 1.0)
+
+
 def _build_soft_ring_alpha(
     core_alpha,
     coverage_alpha,
@@ -463,10 +546,10 @@ def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024
         # show up as white halos or dark fringes at sprite edges in runtimes
         # that expect premultiplied textures (PixiJS with alphaMode =
         # "premultiplied-alpha"). Un-premultiply by the old alpha, then
-        # re-premultiply by the new alpha.
-        safe_coverage = np.maximum(coverage, 1e-4)
-        rgb_straight = color[..., :3] / safe_coverage[..., None]
-        rgb_straight = np.clip(rgb_straight, 0.0, 1.0)
+        # re-premultiply by the new alpha -- bleeding colour inward from
+        # reliable coverage rather than dividing 8-bit data by a near-zero
+        # alpha, which is what turned the antialiased fringe white.
+        rgb_straight = _recover_straight_rgb(color[..., :3], coverage)
         rgb_repremultiplied = rgb_straight * output_alpha[..., None]
 
         pixels = np.empty_like(color)
