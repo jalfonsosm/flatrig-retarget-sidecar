@@ -428,6 +428,7 @@ def extract_scene(
     weight_aware_decimation: bool = False,
     bind_from_animation: str = None,
     base_color_texture_output: str = None,
+    keep_projection_slivers: bool = False,
 ) -> SceneCommandResult:
     """Extract scene data (mesh, bones, weights) using projection.
 
@@ -448,6 +449,8 @@ def extract_scene(
     ]
     if view_dir:
         extra_args.append(f"--view-dir={view_dir}")
+    if keep_projection_slivers:
+        extra_args.append("--keep-projection-slivers")
     if view_up:
         extra_args.append(f"--view-up={view_up}")
     if view_roll != 0.0:

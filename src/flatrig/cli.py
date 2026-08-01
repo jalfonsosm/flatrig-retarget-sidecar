@@ -87,6 +87,11 @@ def main() -> None:
         "extract-scene",
         help="extract mesh, skeleton, and weights from a 3D source as JSON",
     )
+    extract_scene_parser.add_argument(
+        "--keep-projection-slivers",
+        action="store_true",
+        help="keep triangles that project edge-on (needed for 3D preview)",
+    )
     extract_scene_parser.add_argument("source")
     extract_scene_parser.add_argument("--output", required=True)
     _add_projection_args(extract_scene_parser)
@@ -319,6 +324,7 @@ def main() -> None:
             mesh_target_vertices=args.mesh_target_vertices,
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
+            keep_projection_slivers=getattr(args, "keep_projection_slivers", False),
             base_color_texture_output=getattr(
                 args, "base_color_texture_output", None
             ),

@@ -235,6 +235,14 @@ def parse_worker_args(
         help="Original mesh path to keep textures and materials",
     )
     parser.add_argument(
+        "--keep-projection-slivers",
+        action="store_true",
+        help=(
+            "extract-scene: keep triangles that project edge-on to the chosen "
+            "view. Required for 3D preview, where they are ordinary surface"
+        ),
+    )
+    parser.add_argument(
         "--reduce-to-vertices",
         type=int,
         default=0,

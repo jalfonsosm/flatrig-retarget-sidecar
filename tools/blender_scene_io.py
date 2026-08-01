@@ -370,6 +370,7 @@ def extract_2d_mesh(
     source_frame=None,
     projection_inverse=None,
     use_rest_pose=False,
+    drop_projection_slivers=True,
 ):
     """Extract the bind-pose mesh projected to 2D."""
     scene = bpy.context.scene
@@ -504,7 +505,14 @@ def extract_2d_mesh(
         # shards seen on the neck/torso. Shape quality = 4*sqrt(3)*area/sum(edge^2)
         # is 1 for equilateral and ~0 for a sliver; a healthy decimated triangle
         # sits well above the threshold, so this only removes the artifacts.
-        min_quality = 0.01
+        # ...but only when the caller is actually building the 2D projection.
+        # A triangle that is edge-on to THIS view is ordinary surface from any
+        # other angle, so deleting it punches a real hole in a mesh that is
+        # going to be rendered in 3D. The viewer's 3D source preview shares this
+        # extractor, which is why a watertight exported FBX (9996 triangles)
+        # previewed as 9895 with pale gashes along the silhouette while the same
+        # file opened in Blender showed none.
+        min_quality = 0.01 if drop_projection_slivers else -1.0
         kept_triangles = []
         kept_keys = []
         kept_visible = []
@@ -2448,6 +2456,7 @@ def _extract_scene_mesh_payload(
     mesh_target_vertices,
     weight_aware_decimation,
     base_color_texture_output,
+    drop_projection_slivers=True,
 ):
     """Reduce, project and weight-transfer a single mesh object.
 
@@ -2470,6 +2479,7 @@ def _extract_scene_mesh_payload(
         view_cfg,
         source_frame=setup_frame,
         use_rest_pose=use_rest_pose,
+        drop_projection_slivers=drop_projection_slivers,
     )
     mesh_reduction_report["output_vertex_count"] = len(mesh_data.get("vertices_2d") or [])
     mesh_reduction_report["output_triangle_count"] = len(mesh_data.get("triangles") or [])
@@ -2627,6 +2637,7 @@ def extract_scene_cli(
     weight_aware_decimation: bool = False,
     bind_from_animation: str = None,
     base_color_texture_output: str = None,
+    drop_projection_slivers: bool = True,
 ) -> dict[str, object]:
     """CLI wrapper for scene extraction (mesh + bones + weights).
 
@@ -2783,6 +2794,7 @@ def extract_scene_cli(
             mesh_vertex_budgets[mesh_index],
             weight_aware_decimation,
             mesh_texture_output,
+            drop_projection_slivers=drop_projection_slivers,
         )
         mesh_reduction_report["allocated_target_vertices"] = mesh_vertex_budgets[mesh_index]
         mesh_reduction_report["global_target_vertices"] = int(mesh_target_vertices or 0)
@@ -3947,6 +3959,7 @@ def main() -> None:
             weight_aware_decimation=args.weight_aware_decimation,
             bind_from_animation=getattr(args, "bind_from_animation", None),
             base_color_texture_output=getattr(args, "base_color_texture_output", None),
+            drop_projection_slivers=not getattr(args, "keep_projection_slivers", False),
         )
     elif args.command == "extract-animations":
         payload = extract_animations_cli(
