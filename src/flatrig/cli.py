@@ -259,6 +259,15 @@ def main() -> None:
     bake_predicted_rig_parser.add_argument("--output", required=True)
     bake_predicted_rig_parser.add_argument("--fbx-output", required=True)
     bake_predicted_rig_parser.add_argument("--mesh-path", default=None, help="Original mesh path to keep textures and materials")
+    bake_predicted_rig_parser.add_argument(
+        "--reduce-to-vertices",
+        type=int,
+        default=0,
+        help=(
+            "reduce the rigged mesh to this vertex budget using the predicted "
+            "skin weights as the importance signal (0 = no reduction)"
+        ),
+    )
 
     export_rest_bvh_parser = subparsers.add_parser(
         "export-3d-rest-bvh",
@@ -403,7 +412,13 @@ def main() -> None:
 
 
     if args.command == "bake-predicted-rig":
-        result = bake_predicted_rig(args.source, args.output, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
+        result = bake_predicted_rig(
+            args.source,
+            args.output,
+            fbx_output=args.fbx_output,
+            mesh_path=args.mesh_path,
+            reduce_to_vertices=args.reduce_to_vertices,
+        )
         _emit_result(result)
         return
     if args.command == "render-sprites":

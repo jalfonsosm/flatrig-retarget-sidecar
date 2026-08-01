@@ -45,6 +45,7 @@ from blender_io.mesh_reduction import (  # noqa: E402
     MAX_DECIMATION_PASSES,
     _discard_mesh_snapshot,
     _mesh_triangle_count,
+    _assess_exact_position_weld,
     _restore_mesh_snapshot,
     _weld_exact_position_duplicates,
     _weld_position_duplicates,
@@ -1762,7 +1763,13 @@ def _fit_orientation_preserving_similarity(
     }
 
 
-def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None = None) -> dict[str, object]:
+def bake_predicted_rig(
+    npz_path: str,
+    *,
+    fbx_output: str,
+    mesh_path: str | None = None,
+    reduce_to_vertices: int = 0,
+) -> dict[str, object]:
     """Build a from-scratch armature for an externally predicted rig and export FBX.
 
     ``npz_path`` is not a 3D source file: it's a numpy ``.npz`` written by an
@@ -1904,6 +1911,48 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
 
     bpy.context.view_layer.update()
 
+    # Reduce AFTER rigging, not before. Decimating the generated surface first
+    # spends the triangle budget uniformly, because the only importance signal
+    # available at generation time is curvature. Here the mesh already carries
+    # the predicted skin weights, so the collapse can keep detail where the
+    # character actually deforms (joints, blend regions) and collapse flat
+    # rigid areas harder -- the same weight-aware path the 3D asset loader uses.
+    # Weld the UV seam duplicates back together before anything else.
+    # glTF cannot share a vertex across a UV seam, so the cleaned GLB the
+    # predictor loaded carries one copy per chart border; the prediction .npz
+    # echoes that split list, and building the mesh straight from it leaves the
+    # asset physically cracked along every chart border -- 2316 boundary edges
+    # and 44 open loops on a mesh whose own cleanup stage had just reported
+    # watertight. Those cracks are the "holes" seen on the exported character,
+    # including the cut across the mouth.
+    seam_weld_report: dict[str, object] = {"welded": 0, "safe": None, "issues": []}
+    weld_assessment = _assess_exact_position_weld(mesh_obj)
+    seam_weld_report["safe"] = bool(weld_assessment["safe"])
+    seam_weld_report["duplicate_cluster_count"] = int(
+        weld_assessment["duplicate_cluster_count"]
+    )
+    if weld_assessment["safe"] and weld_assessment["clusters"]:
+        seam_weld_report["welded"] = int(
+            _weld_exact_position_duplicates(mesh_obj, weld_assessment["clusters"])
+        )
+        bpy.context.view_layer.update()
+    else:
+        seam_weld_report["issues"] = list(weld_assessment["issues"])
+
+    mesh_reduction_report: dict[str, object] = {"requested": False}
+    if reduce_to_vertices and int(reduce_to_vertices) > 0:
+        bpy.ops.object.select_all(action="DESELECT")
+        mesh_obj.select_set(True)
+        bpy.context.view_layer.objects.active = mesh_obj
+        mesh_reduction_report = reduce_mesh_object(
+            mesh_obj,
+            target_vertices=int(reduce_to_vertices),
+            enabled=True,
+            weight_aware_decimation=True,
+        )
+        mesh_reduction_report["requested"] = True
+        bpy.context.view_layer.update()
+
     export_path = Path(fbx_output).expanduser().resolve()
     if export_path.suffix.lower() != ".fbx":
         export_path = export_path.with_suffix(".fbx")
@@ -1932,7 +1981,10 @@ def bake_predicted_rig(npz_path: str, *, fbx_output: str, mesh_path: str | None 
         "source": npz_path,
         "output": str(export_path),
         "bone_count": len(bone_names),
-        "vertex_count": int(vertex_count),
+        "vertex_count": int(len(mesh_obj.data.vertices)),
+        "predicted_vertex_count": int(vertex_count),
+        "mesh_reduction": mesh_reduction_report,
+        "seam_weld": seam_weld_report,
         "surface_transfer": surface_transfer,
         "embedded_texture_paths": embedded_texture_paths,
         "source_alignment": (
@@ -3994,7 +4046,12 @@ def main() -> None:
     elif args.command == "bake-predicted-rig":
         if not args.fbx_output:
             raise ValueError("--fbx-output is required for bake-predicted-rig")
-        payload = bake_predicted_rig(source_path, fbx_output=args.fbx_output, mesh_path=args.mesh_path)
+        payload = bake_predicted_rig(
+            source_path,
+            fbx_output=args.fbx_output,
+            mesh_path=args.mesh_path,
+            reduce_to_vertices=getattr(args, "reduce_to_vertices", 0),
+        )
     elif args.command == "render-sprites":
         payload = render_sprites_cli(
             source_path,

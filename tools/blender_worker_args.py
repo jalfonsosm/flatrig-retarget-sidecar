@@ -235,6 +235,15 @@ def parse_worker_args(
         help="Original mesh path to keep textures and materials",
     )
     parser.add_argument(
+        "--reduce-to-vertices",
+        type=int,
+        default=0,
+        help=(
+            "bake-predicted-rig: reduce the rigged mesh to this vertex budget "
+            "using the predicted skin weights as the importance signal"
+        ),
+    )
+    parser.add_argument(
         "--orientation-fix",
         default="none",
         choices=("none", "y_up_to_z_up"),

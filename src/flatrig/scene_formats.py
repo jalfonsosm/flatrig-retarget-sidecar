@@ -516,7 +516,14 @@ def cleanup_mesh(
     return _run_blender_command_with_args("cleanup-mesh", source, output, extra_args)
 
 
-def bake_predicted_rig(source: str, output: str, *, fbx_output: str, mesh_path: str | None = None) -> SceneCommandResult:
+def bake_predicted_rig(
+    source: str,
+    output: str,
+    *,
+    fbx_output: str,
+    mesh_path: str | None = None,
+    reduce_to_vertices: int = 0,
+) -> SceneCommandResult:
     """Build a from-scratch armature for an externally predicted rig, export FBX.
 
     ``source`` is a numpy ``.npz`` (mesh vertices/triangles + bone names/
@@ -527,6 +534,8 @@ def bake_predicted_rig(source: str, output: str, *, fbx_output: str, mesh_path: 
     extra_args = ["--fbx-output", str(Path(fbx_output).expanduser().resolve())]
     if mesh_path:
         extra_args.extend(["--mesh-path", str(Path(mesh_path).expanduser().resolve())])
+    if reduce_to_vertices and int(reduce_to_vertices) > 0:
+        extra_args.extend(["--reduce-to-vertices", str(int(reduce_to_vertices))])
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:
         return _run_bpy_command_with_args("bake-predicted-rig", source, output, extra_args)

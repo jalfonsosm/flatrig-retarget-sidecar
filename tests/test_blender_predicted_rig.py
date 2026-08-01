@@ -254,3 +254,63 @@ def test_bake_predicted_rig_copies_surface_and_aligns_only_parent(
     assert np.asarray(armature_obj.matrix_world) == pytest.approx(
         expected_parent_matrix, abs=1e-6
     )
+
+
+def test_bake_predicted_rig_welds_uv_seam_duplicates(monkeypatch, tmp_path) -> None:
+    """glTF cannot share a vertex across a UV seam, so the cleaned GLB the
+    predictor loads carries one copy per chart border and the prediction .npz
+    echoes that split list. Building the mesh straight from it left the exported
+    asset physically cracked along every seam -- measured on a shipped TRELLIS
+    asset as 2316 boundary edges and 44 open loops, on a mesh whose own cleanup
+    stage had just reported watertight.
+    """
+    # A closed tetrahedron, then split so every face owns private vertices.
+    closed = np.asarray(
+        [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)],
+        dtype=np.float32,
+    )
+    closed_faces = np.asarray(
+        [(0, 1, 2), (0, 3, 1), (0, 2, 3), (1, 3, 2)], dtype=np.uint32
+    )
+    split_vertices = closed[closed_faces.reshape(-1)].astype(np.float32)
+    split_faces = np.arange(len(split_vertices), dtype=np.uint32).reshape(-1, 3)
+    assert len(split_vertices) == 12
+
+    prediction_path = tmp_path / "prediction.npz"
+    np.savez(
+        prediction_path,
+        vertices=split_vertices,
+        triangles=split_faces,
+        bone_names=np.asarray(["root"]),
+        parent_indices=np.asarray([-1], dtype=np.int32),
+        heads=np.asarray([(0.0, 0.0, 0.0)], dtype=np.float32),
+        tails=np.asarray([(0.0, 1.0, 0.0)], dtype=np.float32),
+        joints_top4=np.zeros((len(split_vertices), 4), dtype=np.uint8),
+        weights_top4=np.asarray(
+            [(1.0, 0.0, 0.0, 0.0)] * len(split_vertices), dtype=np.float32
+        ),
+    )
+
+    report = scene_io.bake_predicted_rig(
+        str(prediction_path),
+        fbx_output=str(tmp_path / "rigged.fbx"),
+    )
+
+    assert report["ok"] is True
+    seam_weld = report["seam_weld"]
+    assert seam_weld["safe"] is True
+    assert seam_weld["welded"] == 8, seam_weld
+    assert report["predicted_vertex_count"] == 12
+    assert report["vertex_count"] == 4
+
+    mesh_obj = next(obj for obj in bpy.context.scene.objects if obj.type == "MESH")
+    mesh = mesh_obj.data
+    assert len(mesh.vertices) == 4
+    assert len(mesh.polygons) == 4
+    # Every edge shared by exactly two faces: no cracks left to render through.
+    open_edges = sum(
+        1
+        for edge in mesh.edges
+        if sum(1 for poly in mesh.polygons if edge.key in poly.edge_keys) != 2
+    )
+    assert open_edges == 0
