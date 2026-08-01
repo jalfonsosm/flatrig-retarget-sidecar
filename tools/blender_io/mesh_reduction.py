@@ -6,9 +6,10 @@ Two layers, kept together because the decimator depends on the welder:
   that looks watertight arrives as loose triangles. ``_weld_exact_position_duplicates``
   merges vertices that share an exact position, but only after
   ``_assess_exact_position_weld`` proves the merge is safe: the duplicates must
-  agree on UVs, vertex-group weights and every point attribute, and welding must
-  not create non-manifold fans. A mesh that fails the assessment is left alone
-  rather than silently corrupted.
+  agree on vertex-group weights and every point attribute, and welding must not
+  create non-manifold fans. A mesh that fails the assessment remains unwelded;
+  its reduction is still attempted transactionally and kept only when topology
+  metrics do not regress.
 * **Decimation** — ``reduce_mesh_object`` drives Blender's collapse decimator
   toward a vertex budget. With ``enabled`` it biases the collapse using a
   weight-importance vertex group (``_build_decimation_weight_importance``) so
@@ -82,9 +83,7 @@ def _exact_position_duplicate_clusters(mesh_obj) -> list[tuple[int, ...]]:
     return [tuple(indices) for indices in by_position.values() if len(indices) > 1]
 
 
-def _weld_exact_position_duplicates(
-    mesh_obj, clusters: list[tuple[int, ...]] | None = None
-) -> int:
+def _weld_exact_position_duplicates(mesh_obj, clusters: list[tuple[int, ...]] | None = None) -> int:
     """Weld only explicitly identified exact-position clusters.
 
     Blender clamps ``bpy.ops.mesh.remove_doubles`` to a minimum threshold of
@@ -259,6 +258,358 @@ def _bmesh_weld_metrics(bm) -> dict[str, int]:
     }
 
 
+def _bmesh_surface_topology(bm) -> tuple[int, int]:
+    """Return face-connected components and surface Euler characteristic."""
+    bm.verts.ensure_lookup_table()
+    bm.edges.ensure_lookup_table()
+    bm.faces.ensure_lookup_table()
+    bm.verts.index_update()
+    bm.edges.index_update()
+    bm.faces.index_update()
+    if not bm.faces:
+        return 0, 0
+
+    adjacency = [set() for _face in bm.faces]
+    for edge in bm.edges:
+        linked = [int(face.index) for face in edge.link_faces]
+        for index in linked:
+            adjacency[index].update(other for other in linked if other != index)
+    remaining = set(range(len(bm.faces)))
+    components = 0
+    while remaining:
+        components += 1
+        pending = [remaining.pop()]
+        while pending:
+            face_index = pending.pop()
+            neighbors = adjacency[face_index] & remaining
+            remaining.difference_update(neighbors)
+            pending.extend(neighbors)
+
+    used_vertices = {
+        int(vertex.index) for face in bm.faces for vertex in face.verts
+    }
+    used_edges = {int(edge.index) for face in bm.faces for edge in face.edges}
+    euler = len(used_vertices) - len(used_edges) + len(bm.faces)
+    return components, euler
+
+
+def mesh_topology_metrics(mesh_obj) -> dict[str, object]:
+    """Return stable topology evidence without mutating the mesh.
+
+    Boundary and overfull edges are reported separately because an imported
+    seam-split mesh can start with many boundaries while a genuinely
+    non-manifold mesh contains edges shared by more than two faces.  Consumers
+    also get their sum as ``non_manifold_edges`` and a conservative
+    ``watertight`` boolean.
+    """
+    empty = {
+        "readable": False,
+        "vertex_count": 0,
+        "edge_count": 0,
+        "face_count": 0,
+        "duplicate_faces": 0,
+        "degenerate_faces": 0,
+        "boundary_edges": 0,
+        "overfull_edges": 0,
+        "non_manifold_edges": 0,
+        "non_manifold_vertices": 0,
+        "non_finite_vertices": 0,
+        "components": 0,
+        "euler": 0,
+        "handles": None,
+        "valid": False,
+        "watertight": False,
+    }
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != "MESH":
+        return empty
+
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh_obj.data)
+        metrics = _bmesh_weld_metrics(bm)
+        components, euler = _bmesh_surface_topology(bm)
+        non_finite_vertices = sum(
+            1
+            for vertex in bm.verts
+            if not all(math.isfinite(float(component)) for component in vertex.co)
+        )
+        non_manifold_vertices = sum(
+            1 for vertex in bm.verts if _bmesh_face_fan_count(vertex) > 1
+        )
+        metrics.update(
+            {
+                "readable": True,
+                "vertex_count": len(bm.verts),
+                "edge_count": len(bm.edges),
+                "non_manifold_edges": int(metrics["boundary_edges"])
+                + int(metrics["overfull_edges"]),
+                "non_finite_vertices": non_finite_vertices,
+                "non_manifold_vertices": non_manifold_vertices,
+                "components": components,
+                "euler": euler,
+            }
+        )
+        metrics["valid"] = bool(
+            metrics["face_count"] > 0
+            and metrics["non_finite_vertices"] == 0
+            and metrics["overfull_edges"] == 0
+            and metrics["degenerate_faces"] == 0
+            and metrics["duplicate_faces"] == 0
+        )
+        metrics["watertight"] = bool(
+            metrics["valid"] and metrics["boundary_edges"] == 0 and metrics["overfull_edges"] == 0
+        )
+        metrics["handles"] = (
+            max(0, int(round(components - euler / 2.0)))
+            if metrics["watertight"]
+            else None
+        )
+        return metrics
+    except Exception:
+        return empty
+    finally:
+        bm.free()
+
+
+def geometric_boundary_pair_metrics(mesh_obj) -> dict[str, object]:
+    """Measure whether split boundary edges still occupy the same seam.
+
+    UV/normal seams appear as pairs of boundary edges with identical endpoint
+    positions. Counting only combinatorial boundary edges cannot detect two
+    copies drifting apart during an unwelded decimation, so this metric groups
+    edges by a scale-relative geometric signature.
+    """
+    empty = {
+        "boundary_edges": 0,
+        "paired_boundary_edges": 0,
+        "unpaired_boundary_edges": 0,
+        "paired_fraction": 1.0,
+        "position_tolerance": 0.0,
+    }
+    if mesh_obj is None or getattr(mesh_obj, "type", None) != "MESH":
+        return empty
+    bm = bmesh.new()
+    try:
+        bm.from_mesh(mesh_obj.data)
+        boundary_edges = [edge for edge in bm.edges if len(edge.link_faces) == 1]
+        if not boundary_edges:
+            return empty
+        coordinates = [
+            tuple(float(component) for component in vertex.co)
+            for edge in boundary_edges
+            for vertex in edge.verts
+        ]
+        extent = max(
+            max(point[axis] for point in coordinates)
+            - min(point[axis] for point in coordinates)
+            for axis in range(3)
+        )
+        tolerance = max(float(extent) * 1e-7, 1e-9)
+
+        def point_key(vertex) -> tuple[int, int, int]:
+            return tuple(
+                int(round(float(component) / tolerance)) for component in vertex.co
+            )
+
+        signatures: dict[tuple[tuple[int, int, int], tuple[int, int, int]], int] = {}
+        for edge in boundary_edges:
+            signature = tuple(sorted(point_key(vertex) for vertex in edge.verts))
+            signatures[signature] = signatures.get(signature, 0) + 1
+        total = len(boundary_edges)
+        paired = sum(count - count % 2 for count in signatures.values())
+        unpaired = total - paired
+        return {
+            "boundary_edges": total,
+            "paired_boundary_edges": paired,
+            "unpaired_boundary_edges": unpaired,
+            "paired_fraction": float(paired) / float(total),
+            "position_tolerance": tolerance,
+        }
+    finally:
+        bm.free()
+
+
+def geometric_boundary_regression_issues(
+    before: dict[str, object], after: dict[str, object]
+) -> list[str]:
+    """Reject visible seam separation after an unwelded decimation."""
+    before_total = int(before.get("boundary_edges") or 0)
+    after_total = int(after.get("boundary_edges") or 0)
+    if before_total <= 0 or after_total <= 0:
+        return []
+    issues: list[str] = []
+    before_unpaired = int(before.get("unpaired_boundary_edges") or 0)
+    after_unpaired = int(after.get("unpaired_boundary_edges") or 0)
+    if after_unpaired > before_unpaired:
+        issues.append("topology_new_geometric_seam_gaps")
+    return issues
+
+
+def topology_regression_issues(before: dict[str, object], after: dict[str, object]) -> list[str]:
+    """Describe destructive topology changes introduced by a reduction pass."""
+    issues: list[str] = []
+    if not bool(after.get("readable")):
+        issues.append("topology_unreadable")
+        return issues
+    if int(after.get("non_finite_vertices") or 0) > 0:
+        issues.append("topology_non_finite_vertices")
+    if int(before.get("face_count") or 0) > 0 and int(after.get("face_count") or 0) <= 0:
+        issues.append("topology_all_faces_removed")
+    if int(after.get("boundary_edges") or 0) > int(before.get("boundary_edges") or 0):
+        issues.append("topology_new_boundary_edges")
+    if int(after.get("overfull_edges") or 0) > int(before.get("overfull_edges") or 0):
+        issues.append("topology_new_overfull_edges")
+    if int(after.get("non_manifold_vertices") or 0) > int(
+        before.get("non_manifold_vertices") or 0
+    ):
+        issues.append("topology_new_non_manifold_vertices")
+    if int(after.get("duplicate_faces") or 0) > int(before.get("duplicate_faces") or 0):
+        issues.append("topology_duplicate_faces")
+    if int(after.get("degenerate_faces") or 0) > int(before.get("degenerate_faces") or 0):
+        issues.append("topology_degenerate_faces")
+    if int(after.get("components") or 0) > int(before.get("components") or 0):
+        issues.append("topology_new_components")
+    if bool(before.get("watertight")) and bool(after.get("watertight")):
+        before_handles = before.get("handles")
+        after_handles = after.get("handles")
+        if (
+            isinstance(before_handles, int)
+            and isinstance(after_handles, int)
+            and after_handles > before_handles
+        ):
+            issues.append("topology_new_handles")
+    return issues
+
+
+def _discard_mesh_snapshot(mesh_data) -> None:
+    if mesh_data is not None and getattr(mesh_data, "users", 0) == 0:
+        bpy.data.meshes.remove(mesh_data)
+
+
+def _restore_mesh_snapshot(mesh_obj, snapshot) -> None:
+    damaged = mesh_obj.data
+    mesh_obj.data = snapshot
+    if damaged is not snapshot and getattr(damaged, "users", 0) == 0:
+        bpy.data.meshes.remove(damaged)
+    mesh_obj.data.update()
+    bpy.context.view_layer.update()
+
+
+def _add_flat_topology_metrics(
+    report: dict[str, object], prefix: str, metrics: dict[str, object]
+) -> None:
+    report[f"boundary_edges_{prefix}"] = int(metrics.get("boundary_edges") or 0)
+    report[f"overfull_edges_{prefix}"] = int(metrics.get("overfull_edges") or 0)
+    report[f"non_manifold_edges_{prefix}"] = int(metrics.get("non_manifold_edges") or 0)
+    report[f"watertight_{prefix}"] = bool(metrics.get("watertight"))
+
+
+def _finalize_reduction_report(report: dict[str, object], mesh_obj) -> dict[str, object]:
+    if mesh_obj is not None:
+        mesh_obj.data.update()
+        output_vertex_count = int(len(mesh_obj.data.vertices))
+        output_triangle_count = _mesh_triangle_count(mesh_obj)
+        topology_after = mesh_topology_metrics(mesh_obj)
+    else:
+        output_vertex_count = 0
+        output_triangle_count = 0
+        topology_after = mesh_topology_metrics(None)
+
+    target_vertices = int(report.get("target_vertices") or 0)
+    topology_issues = list(report.get("topology_validation_issues") or [])
+    mesh_valid_after = bool(topology_after.get("valid"))
+    if not mesh_valid_after and "topology_invalid_output" not in topology_issues:
+        topology_issues.append("topology_invalid_output")
+    topology_validated = bool(
+        report.get("topology_validated") is True and mesh_valid_after
+    )
+    report.update(
+        {
+            "output_vertex_count": output_vertex_count,
+            "output_triangle_count": output_triangle_count,
+            # This count is captured before extract_2d_mesh duplicates vertices
+            # at loop/UV seams and is therefore the value the Blender reduction
+            # budget actually controls.
+            "reduced_vertex_count": output_vertex_count,
+            "budget_satisfied": bool(
+                target_vertices > 0 and output_vertex_count <= target_vertices
+            ),
+            "topology_after": topology_after,
+            "mesh_valid_after": mesh_valid_after,
+            "topology_validation_issues": topology_issues,
+            "topology_validated": topology_validated,
+        }
+    )
+    _add_flat_topology_metrics(report, "after", topology_after)
+    return report
+
+
+MESH_VERTEX_BUDGET_FLOOR = 64
+
+
+def allocate_mesh_vertex_budgets(mesh_objects, total_target_vertices: int) -> list[int]:
+    """Allocate one deterministic global vertex budget across scene meshes.
+
+    Small accessories are kept intact up to a modest floor, then the remaining
+    budget is distributed proportionally to each object's reducible excess.
+    The allocations sum to the requested target whenever that target is
+    feasible, preventing a scene with N meshes from silently receiving N times
+    the configured budget.
+    """
+    counts = [max(0, int(len(mesh_obj.data.vertices))) for mesh_obj in mesh_objects]
+    target = int(total_target_vertices or 0)
+    if not counts:
+        return []
+    if target <= 0:
+        return [0 for _ in counts]
+    if sum(counts) <= target:
+        return counts
+
+    positive_count = sum(1 for count in counts if count > 0)
+    viable_floor = min(
+        MESH_VERTEX_BUDGET_FLOOR,
+        max(1, target // max(positive_count * 10, 1)),
+    )
+    budgets = [min(count, viable_floor) for count in counts]
+
+    # Extremely small targets can be lower than even one vertex per object.
+    # Keep one vertex allocated to every non-empty object rather than turning a
+    # positive target into reduce_mesh_object's special "no target" value.
+    if sum(budgets) > target:
+        budgets = [min(count, 1) for count in counts]
+        if sum(budgets) >= target:
+            return budgets
+
+    remaining = max(0, target - sum(budgets))
+    capacities = [max(0, count - budget) for count, budget in zip(counts, budgets)]
+    capacity_total = sum(capacities)
+    if remaining <= 0 or capacity_total <= 0:
+        return budgets
+
+    numerators = [remaining * capacity for capacity in capacities]
+    additions = [numerator // capacity_total for numerator in numerators]
+    for index, addition in enumerate(additions):
+        budgets[index] += min(capacities[index], addition)
+
+    leftover = target - sum(budgets)
+    ranked = sorted(
+        range(len(counts)),
+        key=lambda index: (
+            -(numerators[index] % capacity_total),
+            -capacities[index],
+            index,
+        ),
+    )
+    for index in ranked:
+        if leftover <= 0:
+            break
+        if budgets[index] >= counts[index]:
+            continue
+        budgets[index] += 1
+        leftover -= 1
+    return budgets
+
+
 def _exact_weld_topology_issues(mesh_obj, clusters: list[tuple[int, ...]]) -> list[str]:
     """Simulate an exact weld and reject topology damage before mutating Blender data."""
     if not clusters:
@@ -271,6 +622,7 @@ def _exact_weld_topology_issues(mesh_obj, clusters: list[tuple[int, ...]]) -> li
     try:
         bm.from_mesh(mesh_obj.data)
         before = _bmesh_weld_metrics(bm)
+        before_components, before_euler = _bmesh_surface_topology(bm)
         # Mirror the real mutation exactly. A distance-based operator can have
         # implementation-specific minimum tolerances; this explicit map only
         # joins the exact-position clusters found above.
@@ -282,6 +634,7 @@ def _exact_weld_topology_issues(mesh_obj, clusters: list[tuple[int, ...]]) -> li
                 target_map[bm.verts[vertex_index]] = target
         bmesh.ops.weld_verts(bm, targetmap=target_map)
         after = _bmesh_weld_metrics(bm)
+        after_components, after_euler = _bmesh_surface_topology(bm)
 
         issues: list[str] = []
         if after["face_count"] != before["face_count"]:
@@ -294,6 +647,36 @@ def _exact_weld_topology_issues(mesh_obj, clusters: list[tuple[int, ...]]) -> li
             issues.append("topology_new_boundary_edges")
         if after["overfull_edges"] > before["overfull_edges"]:
             issues.append("topology_non_manifold_edges")
+        if after_components > before_components:
+            issues.append("topology_new_components")
+        after_watertight = bool(
+            after["face_count"] > 0
+            and after["boundary_edges"] == 0
+            and after["overfull_edges"] == 0
+            and after["duplicate_faces"] == 0
+            and after["degenerate_faces"] == 0
+        )
+        if after_watertight:
+            after_handles = max(
+                0, int(round(after_components - after_euler / 2.0))
+            )
+            before_watertight = bool(
+                before["face_count"] > 0
+                and before["boundary_edges"] == 0
+                and before["overfull_edges"] == 0
+                and before["duplicate_faces"] == 0
+                and before["degenerate_faces"] == 0
+            )
+            before_handles = (
+                max(0, int(round(before_components - before_euler / 2.0)))
+                if before_watertight
+                else 0
+            )
+            # Closing an exporter seam is safe only when it does not turn the
+            # open seam into a genuine tunnel (for example, welding the two
+            # coincident end rings of a cylinder into a torus).
+            if after_handles > before_handles:
+                issues.append("topology_new_handles")
         for vertex in bm.verts:
             position = tuple(float(component) for component in vertex.co)
             if position not in duplicate_positions:
@@ -426,6 +809,11 @@ DECIMATE_MIN_REGION_VERTS = 25
 # A region must retain at least this fraction of its *fair share* (before_count *
 # global_ratio). Below it, the prior genuinely hollowed the region.
 DECIMATE_REGION_STARVE_FACTOR = 0.45
+# A weighted modifier can preserve enough high-importance vertices that one
+# ratio pass stops above budget. Recompute the ratio from the actual output and
+# retry a bounded number of times; topology validation below still decides
+# whether the result is safe to keep.
+MAX_DECIMATION_PASSES = 4
 
 
 def _dominant_group_counts(mesh_obj) -> dict:
@@ -460,13 +848,10 @@ def _weight_aware_starved(before: dict, after: dict, global_ratio: float) -> tup
 
 
 def _run_collapse_passes(mesh_obj, target_vertices, source_vertex_count, importance_group):
-    """Apply Collapse decimation and return the output vertex count.
-
-    With an importance group a single pass keeps the protected regions dense;
-    without one it iterates toward the target.
-    """
+    """Apply bounded Collapse passes and return ``(vertices, pass_count)``."""
     current_vertices = source_vertex_count
-    for pass_index in range(4):
+    pass_count = 0
+    for pass_index in range(MAX_DECIMATION_PASSES):
         if current_vertices <= target_vertices:
             break
         ratio = max(0.01, min(1.0, float(target_vertices) / max(float(current_vertices), 1.0)))
@@ -494,14 +879,23 @@ def _run_collapse_passes(mesh_obj, target_vertices, source_vertex_count, importa
         modifier_index = mesh_obj.modifiers.find(modifier.name)
         if modifier_index > 0:
             mesh_obj.modifiers.move(modifier_index, 0)
-        bpy.ops.object.modifier_apply(modifier=modifier.name)
+        try:
+            bpy.ops.object.modifier_apply(modifier=modifier.name)
+        except Exception:
+            # Applying normally removes the modifier. On failure Blender can
+            # leave it behind; never let a rejected transactional pass leak a
+            # live modifier into later extraction/rendering.
+            if modifier.name in mesh_obj.modifiers:
+                mesh_obj.modifiers.remove(mesh_obj.modifiers[modifier.name])
+            raise
         bpy.context.view_layer.update()
-        current_vertices = int(len(mesh_obj.data.vertices))
-        if importance_group is not None:
-            # Single weight-aware pass: re-collapsing to chase the target would
-            # hollow out the unprotected rigid surfaces.
+        pass_count += 1
+        next_vertices = int(len(mesh_obj.data.vertices))
+        if next_vertices >= current_vertices:
+            current_vertices = next_vertices
             break
-    return current_vertices
+        current_vertices = next_vertices
+    return current_vertices, pass_count
 
 
 def reduce_mesh_object(
@@ -520,6 +914,7 @@ def reduce_mesh_object(
     source_vertex_count = int(len(mesh_obj.data.vertices)) if mesh_obj is not None else 0
     source_triangle_count = _mesh_triangle_count(mesh_obj) if mesh_obj is not None else 0
     target_vertices = int(target_vertices or 0)
+    topology_before = mesh_topology_metrics(mesh_obj)
     report = {
         "enabled": bool(enabled),
         "applied": False,
@@ -536,26 +931,36 @@ def reduce_mesh_object(
         "seam_weld_checked": False,
         "seam_weld_safe": None,
         "seam_weld_issues": [],
+        "seam_weld_skipped": False,
         "position_duplicate_cluster_count": 0,
         "reduction_skipped": False,
         "decimation_applied": False,
+        "decimation_attempted": False,
+        "decimation_passes": 0,
+        "weight_aware_passes": 0,
+        "uniform_passes": 0,
+        "topology_before": topology_before,
+        "topology_validation_issues": [],
+        "topology_validated": True,
     }
+    _add_flat_topology_metrics(report, "before", topology_before)
 
     if not enabled:
-        return report
+        return _finalize_reduction_report(report, mesh_obj)
     if mesh_obj is None:
         report["reason"] = "no_mesh"
-        return report
+        report["topology_validated"] = False
+        return _finalize_reduction_report(report, mesh_obj)
     if target_vertices <= 0:
         report["reason"] = "no_target"
-        return report
+        return _finalize_reduction_report(report, mesh_obj)
     if source_vertex_count <= target_vertices:
         # No reduction is needed, so leave even exactly coincident authored
         # surfaces untouched.  The seam weld is only a prerequisite for an
         # actual collapse pass (or for discovering that seam duplicates alone
         # account for the apparent excess over the budget).
         report["reason"] = "source_under_target"
-        return report
+        return _finalize_reduction_report(report, mesh_obj)
     if bpy.ops.object.mode_set.poll():
         bpy.ops.object.mode_set(mode="OBJECT")
     for obj in bpy.context.scene.objects:
@@ -563,71 +968,99 @@ def reduce_mesh_object(
     mesh_obj.select_set(True)
     bpy.context.view_layer.objects.active = mesh_obj
 
-    weld_assessment = _assess_exact_position_weld(mesh_obj)
+    try:
+        weld_assessment = _assess_exact_position_weld(mesh_obj)
+    except Exception as exc:
+        weld_assessment = {
+            "safe": False,
+            "clusters": [],
+            "duplicate_cluster_count": 0,
+            "issues": [f"weld_preflight_failed:{type(exc).__name__}"],
+        }
     report["seam_weld_checked"] = True
     report["seam_weld_safe"] = bool(weld_assessment["safe"])
     report["seam_weld_issues"] = list(weld_assessment["issues"])
-    report["position_duplicate_cluster_count"] = int(
-        weld_assessment["duplicate_cluster_count"]
-    )
-    if not weld_assessment["safe"]:
-        report["reason"] = "unsafe_position_weld_skipped_reduction"
-        report["reduction_skipped"] = True
-        return report
+    report["position_duplicate_cluster_count"] = int(weld_assessment["duplicate_cluster_count"])
+    geometric_boundary_before = geometric_boundary_pair_metrics(mesh_obj)
+    report["geometric_boundary_before"] = geometric_boundary_before
+    seam_vertices_welded = 0
+    if weld_assessment["safe"]:
+        # Keep welding transactional too. A bpy/runtime failure must not strand
+        # a partially welded source; restore it and continue with an unwelded,
+        # topology-checked decimation attempt.
+        weld_snapshot = mesh_obj.data.copy()
+        try:
+            # Exact equality is intentional here. Unlike generated-mesh cleanup,
+            # external FBX input may contain authored layers that are merely close
+            # together; only exporter-created vertices at the identical base-mesh
+            # position are candidates, and the preflight above validates their data
+            # and the resulting topology before this mutation is allowed.
+            seam_vertices_welded = _weld_exact_position_duplicates(
+                mesh_obj, clusters=weld_assessment["clusters"]
+            )
+        except Exception as exc:
+            _restore_mesh_snapshot(mesh_obj, weld_snapshot)
+            report["seam_weld_safe"] = False
+            report["seam_weld_skipped"] = True
+            report["seam_weld_issues"].append(f"weld_failed:{type(exc).__name__}")
+        else:
+            _discard_mesh_snapshot(weld_snapshot)
+    else:
+        # An unsafe weld can represent intentional coincident shells or
+        # incompatible authored data. Preserve those vertices, but do not let
+        # one unsafe cluster cancel reduction of the entire mesh. The collapse
+        # itself runs from a snapshot and is accepted only if boundary and
+        # overfull-edge counts do not regress.
+        report["seam_weld_skipped"] = True
 
-    try:
-        # Exact equality is intentional here. Unlike generated-mesh cleanup,
-        # external FBX input may contain authored layers that are merely close
-        # together; only exporter-created vertices at the identical base-mesh
-        # position are candidates, and the preflight above validates their data
-        # and the resulting topology before this mutation is allowed.
-        seam_vertices_welded = _weld_exact_position_duplicates(
-            mesh_obj, clusters=weld_assessment["clusters"]
-        )
-    except Exception as exc:
-        raise RuntimeError(f"Source mesh seam weld failed: {exc}") from exc
     reduction_source_vertex_count = int(len(mesh_obj.data.vertices))
     report["seam_vertices_welded"] = seam_vertices_welded
     report["welded_source_vertex_count"] = reduction_source_vertex_count
-    report["output_vertex_count"] = reduction_source_vertex_count
-    report["output_triangle_count"] = _mesh_triangle_count(mesh_obj)
     if reduction_source_vertex_count <= target_vertices:
         report["applied"] = seam_vertices_welded > 0
         report["reason"] = (
-            "source_under_target_after_weld"
-            if seam_vertices_welded > 0
-            else "source_under_target"
+            "source_under_target_after_weld" if seam_vertices_welded > 0 else "source_under_target"
         )
-        return report
+        return _finalize_reduction_report(report, mesh_obj)
 
-    try:
-        importance_group = _build_decimation_weight_importance(
-            mesh_obj,
-            enabled=bool(weight_aware_decimation),
-        )
-    except Exception:
-        importance_group = None
+    # Everything after this point is transactional. Safe welding, when it ran,
+    # is the baseline we restore to; an unsafe weld leaves the original mesh as
+    # that baseline. This makes it safe to try Blender's decimator on Walk-like
+    # assets without accepting new holes or overfull edges.
+    reduction_snapshot = mesh_obj.data.copy()
+    decimation_topology_before = mesh_topology_metrics(mesh_obj)
+    report["decimation_topology_before"] = decimation_topology_before
+    report["decimation_attempted"] = True
 
-    weight_aware_attempted = importance_group is not None
+    importance_group = None
+    weight_aware_attempted = False
     weight_aware_used = False
     fallback_applied = False
+    decimation_passes = 0
+    weight_aware_passes = 0
+    uniform_passes = 0
+    decimation_error = None
     try:
+        try:
+            importance_group = _build_decimation_weight_importance(
+                mesh_obj,
+                enabled=bool(weight_aware_decimation),
+            )
+        except Exception:
+            importance_group = None
+        weight_aware_attempted = importance_group is not None
+
         if importance_group is not None:
-            # Try weight-aware, but keep a copy so we can undo if it starves a
-            # region. The check is the user's rule: measure the reduction per
-            # vertex-group region; if the most aggressively reduced (flattest)
-            # one collapses near a hole, switch to uniform automatically.
             before_counts = _dominant_group_counts(mesh_obj)
-            backup_mesh = mesh_obj.data.copy()
-            _run_collapse_passes(
+            _, weighted_passes = _run_collapse_passes(
                 mesh_obj,
                 target_vertices,
                 reduction_source_vertex_count,
                 importance_group,
             )
-            global_ratio = float(target_vertices) / max(
-                float(reduction_source_vertex_count), 1.0
-            )
+            decimation_passes += weighted_passes
+            weight_aware_passes += weighted_passes
+            global_ratio = float(target_vertices) / max(float(reduction_source_vertex_count), 1.0)
             starved, _worst = _weight_aware_starved(
                 before_counts, _dominant_group_counts(mesh_obj), global_ratio
             )
@@ -635,49 +1068,103 @@ def reduce_mesh_object(
                 mesh_obj.vertex_groups.remove(mesh_obj.vertex_groups[importance_group])
             importance_group = None
             if starved:
-                hollowed = mesh_obj.data
-                mesh_obj.data = backup_mesh
-                bpy.data.meshes.remove(hollowed)
+                # Restore an independent copy so the original transaction
+                # snapshot remains available if the uniform retry also damages
+                # topology or fails.
+                _restore_mesh_snapshot(mesh_obj, reduction_snapshot.copy())
                 if IMPORTANCE_GROUP_NAME in mesh_obj.vertex_groups:
                     mesh_obj.vertex_groups.remove(mesh_obj.vertex_groups[IMPORTANCE_GROUP_NAME])
                 fallback_applied = True
-                _run_collapse_passes(
+                _, uniform_passes = _run_collapse_passes(
                     mesh_obj, target_vertices, reduction_source_vertex_count, None
                 )
+                decimation_passes += uniform_passes
             else:
                 weight_aware_used = True
-                bpy.data.meshes.remove(backup_mesh)
         else:
-            _run_collapse_passes(
+            _, uniform_passes = _run_collapse_passes(
                 mesh_obj, target_vertices, reduction_source_vertex_count, None
             )
+            decimation_passes += uniform_passes
     except Exception as exc:
-        raise RuntimeError(f"Source mesh reduction failed: {exc}") from exc
+        decimation_error = f"{type(exc).__name__}: {exc}"
     finally:
         # The importance group must never reach extraction; otherwise it would be
         # read back as a spurious bone weight.
         if IMPORTANCE_GROUP_NAME in mesh_obj.vertex_groups:
             mesh_obj.vertex_groups.remove(mesh_obj.vertex_groups[IMPORTANCE_GROUP_NAME])
 
+    report["decimation_passes"] = decimation_passes
+    report["weight_aware_passes"] = weight_aware_passes
+    report["uniform_passes"] = uniform_passes
+    report["weight_aware"] = weight_aware_used
+    report["weight_aware_attempted"] = weight_aware_attempted
+    report["weight_aware_fallback"] = fallback_applied
+
+    if decimation_error is not None:
+        _restore_mesh_snapshot(mesh_obj, reduction_snapshot)
+        report.update(
+            {
+                "reason": "decimation_failed_restored",
+                "applied": seam_vertices_welded > 0,
+                "reduction_skipped": seam_vertices_welded == 0,
+                "decimation_error": decimation_error,
+                "topology_validated": False,
+            }
+        )
+        return _finalize_reduction_report(report, mesh_obj)
+
     mesh_obj.data.update()
+    decimation_topology_after = mesh_topology_metrics(mesh_obj)
+    topology_issues = topology_regression_issues(
+        decimation_topology_before, decimation_topology_after
+    )
+    geometric_boundary_after = geometric_boundary_pair_metrics(mesh_obj)
+    report["geometric_boundary_after"] = geometric_boundary_after
+    if not bool(weld_assessment["safe"]):
+        topology_issues.extend(
+            geometric_boundary_regression_issues(
+                geometric_boundary_before, geometric_boundary_after
+            )
+        )
+        topology_issues = list(dict.fromkeys(topology_issues))
+    report["decimation_topology_after"] = decimation_topology_after
+    report["topology_validation_issues"] = topology_issues
+    if topology_issues:
+        _restore_mesh_snapshot(mesh_obj, reduction_snapshot)
+        report.update(
+            {
+                "reason": "decimation_topology_rejected",
+                "applied": seam_vertices_welded > 0,
+                "reduction_skipped": seam_vertices_welded == 0,
+                "topology_validated": False,
+            }
+        )
+        return _finalize_reduction_report(report, mesh_obj)
+
+    _discard_mesh_snapshot(reduction_snapshot)
     output_vertex_count = int(len(mesh_obj.data.vertices))
-    output_triangle_count = _mesh_triangle_count(mesh_obj)
+    budget_satisfied = output_vertex_count <= target_vertices
     if fallback_applied:
-        reason = "weight_aware_fallback_uniform"
+        reason = (
+            "weight_aware_fallback_uniform"
+            if budget_satisfied
+            else "weight_aware_fallback_uniform_budget_not_reached"
+        )
     elif weight_aware_used:
-        reason = "weight_aware_single_pass"
+        reason = (
+            "weight_aware_target_reached" if budget_satisfied else "weight_aware_budget_not_reached"
+        )
     else:
-        reason = "target_reached" if output_vertex_count <= target_vertices else "best_effort"
+        reason = "target_reached" if budget_satisfied else "best_effort_budget_not_reached"
     report.update(
         {
-            "applied": output_vertex_count < source_vertex_count,
+            "applied": output_vertex_count < source_vertex_count or seam_vertices_welded > 0,
             "decimation_applied": output_vertex_count < reduction_source_vertex_count,
-            "output_vertex_count": output_vertex_count,
-            "output_triangle_count": output_triangle_count,
             "reason": reason,
-            "weight_aware": weight_aware_used,
-            "weight_aware_attempted": weight_aware_attempted,
-            "weight_aware_fallback": fallback_applied,
+            "reduction_skipped": not (
+                output_vertex_count < source_vertex_count or seam_vertices_welded > 0
+            ),
         }
     )
-    return report
+    return _finalize_reduction_report(report, mesh_obj)

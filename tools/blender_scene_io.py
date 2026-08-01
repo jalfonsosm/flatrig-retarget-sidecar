@@ -42,10 +42,16 @@ from blender_io.math_utils import VECTOR_EPSILON  # noqa: E402
 # underscore-prefixed helpers stay reachable as blender_scene_io attributes for
 # the callers and tests that already use them by that name.
 from blender_io.mesh_reduction import (  # noqa: E402
+    MAX_DECIMATION_PASSES,
+    _discard_mesh_snapshot,
     _mesh_triangle_count,
+    _restore_mesh_snapshot,
     _weld_exact_position_duplicates,
     _weld_position_duplicates,
+    allocate_mesh_vertex_budgets,
+    mesh_topology_metrics,
     reduce_mesh_object,
+    topology_regression_issues,
 )
 from blender_io.bone_hierarchy import (  # noqa: E402,F401
     _annotate_bone_topology,
@@ -1413,6 +1419,7 @@ def cleanup_generated_mesh(
         bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
 
     triangles_before = _mesh_triangle_count(mesh_obj)
+    topology_before = mesh_topology_metrics(mesh_obj)
 
     # Weld position-duplicate vertices before any island/decimate step.
     # Generators that bake a UV atlas (e.g. via xatlas) ship the GLB with
@@ -1422,7 +1429,7 @@ def cleanup_generated_mesh(
     # hundreds of floating charts and the debris filter tears real holes in
     # the surface (and the decimate modifier tears along seams the same way).
     # UVs live on face loops, so merging coincident vertices preserves seams.
-    _weld_position_duplicates(mesh_obj)
+    vertices_welded = _weld_position_duplicates(mesh_obj)
 
     dropped_islands = 0
     if remove_loose:
@@ -1438,67 +1445,167 @@ def cleanup_generated_mesh(
             voxel_remesh_applied = True
 
     triangles_current = _mesh_triangle_count(mesh_obj)
+    topology_before_decimation = mesh_topology_metrics(mesh_obj)
     decimated = False
+    decimation_rejected = False
+    decimation_error = None
+    decimation_passes = 0
+    topology_validation_issues = []
+    topology_after_decimation = topology_before_decimation
     if target_triangles > 0 and triangles_current > target_triangles:
-        modifier = mesh_obj.modifiers.new(name="flatrig_cleanup_decimate", type="DECIMATE")
-        modifier.ratio = max(0.01, float(target_triangles) / float(triangles_current))
-        modifier.use_collapse_triangulate = True
-        bpy.context.view_layer.objects.active = mesh_obj
-        bpy.ops.object.modifier_apply(modifier=modifier.name)
-        decimated = True
+        decimation_snapshot = mesh_obj.data.copy()
+        modifier_name = None
+        try:
+            current_triangles = triangles_current
+            for pass_index in range(MAX_DECIMATION_PASSES):
+                if current_triangles <= target_triangles:
+                    break
+                modifier = mesh_obj.modifiers.new(
+                    name=f"flatrig_cleanup_decimate_{pass_index + 1}", type="DECIMATE"
+                )
+                modifier_name = modifier.name
+                modifier.ratio = max(
+                    0.01, float(target_triangles) / float(current_triangles)
+                )
+                modifier.use_collapse_triangulate = True
+                bpy.context.view_layer.objects.active = mesh_obj
+                bpy.ops.object.modifier_apply(modifier=modifier.name)
+                decimation_passes += 1
+                next_triangles = _mesh_triangle_count(mesh_obj)
+                if next_triangles >= current_triangles:
+                    break
+                current_triangles = next_triangles
+            topology_after_decimation = mesh_topology_metrics(mesh_obj)
+            topology_validation_issues = topology_regression_issues(
+                topology_before_decimation, topology_after_decimation
+            )
+            if topology_validation_issues:
+                _restore_mesh_snapshot(mesh_obj, decimation_snapshot)
+                decimation_rejected = True
+            else:
+                _discard_mesh_snapshot(decimation_snapshot)
+                decimated = True
+        except Exception as exc:
+            if modifier_name is not None and modifier_name in mesh_obj.modifiers:
+                mesh_obj.modifiers.remove(mesh_obj.modifiers[modifier_name])
+            _restore_mesh_snapshot(mesh_obj, decimation_snapshot)
+            decimation_rejected = True
+            decimation_error = f"{type(exc).__name__}: {exc}"
+
+    triangles_after = int(_mesh_triangle_count(mesh_obj))
+    topology_after = mesh_topology_metrics(mesh_obj)
+    if (
+        not bool(topology_after.get("valid"))
+        and "topology_invalid_output" not in topology_validation_issues
+    ):
+        topology_validation_issues.append("topology_invalid_output")
+
+    budget_satisfied = bool(
+        int(target_triangles) > 0 and triangles_after <= int(target_triangles)
+    )
+    topology_validated = bool(
+        topology_after.get("valid")
+        and not topology_validation_issues
+        and decimation_error is None
+    )
+    strict_topology_satisfied = bool(
+        topology_after.get("valid")
+        and topology_after.get("watertight")
+        and topology_after.get("components") == 1
+        and topology_after.get("euler") == 2
+        and topology_after.get("handles") == 0
+    )
+    contract_issues = []
+    if int(target_triangles) > 0 and not budget_satisfied:
+        contract_issues.append("triangle_budget_not_satisfied")
+    if not topology_validated:
+        contract_issues.append("topology_validation_failed")
+    if not strict_topology_satisfied:
+        contract_issues.append("closed_zero_handle_topology_not_satisfied")
+    cleanup_contract_ok = not contract_issues
 
     export_path = Path(glb_output).expanduser().resolve()
     if export_path.suffix.lower() != ".glb":
         export_path = export_path.with_suffix(".glb")
-    export_path.parent.mkdir(parents=True, exist_ok=True)
-    bpy.ops.object.select_all(action="DESELECT")
-    mesh_obj.select_set(True)
-    bpy.context.view_layer.objects.active = mesh_obj
-    bpy.ops.export_scene.gltf(
-        filepath=str(export_path),
-        export_format="GLB",
-        export_yup=True,
-        export_animations=False,
-        export_skins=False,
-        export_texcoords=True,
-        export_normals=True,
-        export_materials="EXPORT",
-        use_selection=True,
-    )
-
     fbx_export_path = None
-    if fbx_output:
-        fbx_export_path = Path(fbx_output).expanduser().resolve()
-        if fbx_export_path.suffix.lower() != ".fbx":
-            fbx_export_path = fbx_export_path.with_suffix(".fbx")
-        fbx_export_path.parent.mkdir(parents=True, exist_ok=True)
-        # Relink base colour + write packed textures to disk so the FBX
-        # export actually carries the texture (see helper for the two glTF/
-        # FBX quirks that otherwise drop it).
-        _prepare_materials_for_fbx_export(mesh_obj, fbx_export_path.parent, fbx_export_path.stem)
+    if cleanup_contract_ok:
+        export_path.parent.mkdir(parents=True, exist_ok=True)
         bpy.ops.object.select_all(action="DESELECT")
         mesh_obj.select_set(True)
         bpy.context.view_layer.objects.active = mesh_obj
-        bpy.ops.export_scene.fbx(
-            filepath=str(fbx_export_path),
+        bpy.ops.export_scene.gltf(
+            filepath=str(export_path),
+            export_format="GLB",
+            export_yup=True,
+            export_animations=False,
+            export_skins=False,
+            export_texcoords=True,
+            export_normals=True,
+            export_materials="EXPORT",
             use_selection=True,
-            add_leaf_bones=False,
-            bake_anim=False,
-            path_mode="COPY",
-            embed_textures=True,
         )
 
+        if fbx_output:
+            fbx_export_path = Path(fbx_output).expanduser().resolve()
+            if fbx_export_path.suffix.lower() != ".fbx":
+                fbx_export_path = fbx_export_path.with_suffix(".fbx")
+            fbx_export_path.parent.mkdir(parents=True, exist_ok=True)
+            # Relink base colour + write packed textures to disk so the FBX
+            # export actually carries the texture (see helper for the two glTF/
+            # FBX quirks that otherwise drop it).
+            _prepare_materials_for_fbx_export(
+                mesh_obj, fbx_export_path.parent, fbx_export_path.stem
+            )
+            bpy.ops.object.select_all(action="DESELECT")
+            mesh_obj.select_set(True)
+            bpy.context.view_layer.objects.active = mesh_obj
+            bpy.ops.export_scene.fbx(
+                filepath=str(fbx_export_path),
+                use_selection=True,
+                add_leaf_bones=False,
+                bake_anim=False,
+                path_mode="COPY",
+                embed_textures=True,
+            )
+
     return {
-        "ok": True,
-        "detail": "cleaned",
+        "ok": cleanup_contract_ok,
+        "detail": (
+            "cleaned"
+            if cleanup_contract_ok
+            else "Mesh cleanup contract failed: " + "; ".join(contract_issues)
+        ),
         "source": source_path,
-        "output": str(export_path),
+        "output": str(export_path) if cleanup_contract_ok else None,
         "fbx_output": str(fbx_export_path) if fbx_export_path else None,
         "triangles_before": int(triangles_before),
-        "triangles_after": int(_mesh_triangle_count(mesh_obj)),
+        "triangles_after": triangles_after,
+        "target_triangles": int(target_triangles),
+        "budget_satisfied": budget_satisfied,
+        "vertices_welded": int(vertices_welded),
         "islands_dropped": int(dropped_islands),
         "voxel_remesh_applied": bool(voxel_remesh_applied),
         "decimated": bool(decimated),
+        "decimation_passes": int(decimation_passes),
+        "decimation_rejected": bool(decimation_rejected),
+        "decimation_error": decimation_error,
+        "topology_validated": topology_validated,
+        "strict_topology_satisfied": strict_topology_satisfied,
+        "contract_ok": cleanup_contract_ok,
+        "contract_issues": contract_issues,
+        "topology_validation_issues": topology_validation_issues,
+        "topology_before": topology_before,
+        "topology_before_decimation": topology_before_decimation,
+        "topology_after_decimation": topology_after_decimation,
+        "topology_after": topology_after,
+        "boundary_edges_before": int(topology_before.get("boundary_edges") or 0),
+        "boundary_edges_after": int(topology_after.get("boundary_edges") or 0),
+        "overfull_edges_before": int(topology_before.get("overfull_edges") or 0),
+        "overfull_edges_after": int(topology_after.get("overfull_edges") or 0),
+        "non_manifold_edges_before": int(topology_before.get("non_manifold_edges") or 0),
+        "non_manifold_edges_after": int(topology_after.get("non_manifold_edges") or 0),
+        "watertight_before": bool(topology_before.get("watertight")),
+        "watertight_after": bool(topology_after.get("watertight")),
     }
 
 
@@ -2367,6 +2474,92 @@ def _extract_scene_mesh_payload(
     return mesh_data, mesh_reduction_report, source_weights
 
 
+def _annotate_global_mesh_reduction(
+    reports: list[dict[str, object]], total_target_vertices: int
+) -> dict[str, object]:
+    """Attach scene-wide budget evidence to every per-object report."""
+    total_source_vertices = sum(int(report.get("source_vertex_count") or 0) for report in reports)
+    total_output_vertices = sum(int(report.get("reduced_vertex_count") or 0) for report in reports)
+    boundary_edges_before = sum(int(report.get("boundary_edges_before") or 0) for report in reports)
+    boundary_edges_after = sum(int(report.get("boundary_edges_after") or 0) for report in reports)
+    overfull_edges_before = sum(int(report.get("overfull_edges_before") or 0) for report in reports)
+    overfull_edges_after = sum(int(report.get("overfull_edges_after") or 0) for report in reports)
+    target = int(total_target_vertices or 0)
+    has_meshes = bool(reports)
+    summary = {
+        "target_vertices": target,
+        "source_vertex_count": total_source_vertices,
+        "output_vertex_count": total_output_vertices,
+        "mesh_count": len(reports),
+        "budget_satisfied": (
+            bool(target > 0 and total_output_vertices <= target)
+            if has_meshes
+            else None
+        ),
+        "all_topology_validated": (
+            all(bool(report.get("topology_validated")) for report in reports)
+            if has_meshes
+            else None
+        ),
+        "all_meshes_valid": (
+            all(bool(report.get("mesh_valid_after")) for report in reports)
+            if has_meshes
+            else None
+        ),
+        "all_meshes_watertight": (
+            all(bool(report.get("watertight_after")) for report in reports)
+            if has_meshes
+            else None
+        ),
+        "boundary_edges_before": boundary_edges_before,
+        "boundary_edges_after": boundary_edges_after,
+        "overfull_edges_before": overfull_edges_before,
+        "overfull_edges_after": overfull_edges_after,
+        "non_manifold_edges_before": boundary_edges_before + overfull_edges_before,
+        "non_manifold_edges_after": boundary_edges_after + overfull_edges_after,
+    }
+    for report in reports:
+        report.update(
+            {
+                "global_target_vertices": target,
+                "global_output_vertex_count": total_output_vertices,
+                "global_budget_satisfied": summary["budget_satisfied"],
+                "global_all_topology_validated": summary["all_topology_validated"],
+                "global_all_meshes_watertight": summary["all_meshes_watertight"],
+            }
+        )
+    return summary
+
+
+def _mesh_reduction_contract_issues(
+    reports: list[dict[str, object]],
+    summary: dict[str, object],
+    *,
+    enabled: bool,
+    target_vertices: int,
+) -> list[str]:
+    """Reject explicit reduction failures before geometry is consumed again."""
+    if not enabled or int(target_vertices or 0) <= 0 or not reports:
+        return []
+    issues: list[str] = []
+    for key, detail in (
+        ("budget_satisfied", "scene-wide vertex budget was not satisfied"),
+        ("all_topology_validated", "one or more meshes failed topology validation"),
+        ("all_meshes_valid", "one or more meshes are invalid after reduction"),
+    ):
+        if summary.get(key) is False:
+            issues.append(detail)
+    for index, report in enumerate(reports):
+        for key, detail in (
+            ("budget_satisfied", "allocated vertex budget was not satisfied"),
+            ("topology_validated", "topology validation failed"),
+            ("mesh_valid_after", "mesh is invalid after reduction"),
+        ):
+            if report.get(key) is False:
+                issues.append(f"mesh {index}: {detail}")
+    return issues
+
+
 def extract_scene_cli(
     source_path: str,
     output_path: str,
@@ -2510,6 +2703,12 @@ def extract_scene_cli(
     primary_mesh_data = None
     primary_source_weights = None
     primary_reduction = None
+    reduction_reports = []
+    mesh_vertex_budgets = (
+        allocate_mesh_vertex_budgets(all_meshes, mesh_target_vertices)
+        if mesh_reduction
+        else [int(mesh_target_vertices or 0) for _ in all_meshes]
+    )
     # Every mesh writes its base-color texture to its own PNG beside the output
     # JSON (never inline). Honour an explicit --base-color-texture-output for the
     # primary mesh; derive the rest so multi-object scenes (body + sword) each
@@ -2529,10 +2728,13 @@ def extract_scene_cli(
             use_rest_pose,
             bone_name_to_index,
             mesh_reduction,
-            mesh_target_vertices,
+            mesh_vertex_budgets[mesh_index],
             weight_aware_decimation,
             mesh_texture_output,
         )
+        mesh_reduction_report["allocated_target_vertices"] = mesh_vertex_budgets[mesh_index]
+        mesh_reduction_report["global_target_vertices"] = int(mesh_target_vertices or 0)
+        reduction_reports.append(mesh_reduction_report)
         meshes_payload.append(
             {
                 "object_name": scene_mesh.name,
@@ -2546,9 +2748,24 @@ def extract_scene_cli(
             primary_source_weights = source_weights
             primary_reduction = mesh_reduction_report
 
+    mesh_reduction_summary = _annotate_global_mesh_reduction(
+        reduction_reports, mesh_target_vertices
+    )
+    reduction_contract_issues = _mesh_reduction_contract_issues(
+        reduction_reports,
+        mesh_reduction_summary,
+        enabled=mesh_reduction,
+        target_vertices=mesh_target_vertices,
+    )
+
     return {
-        "ok": True,
-        "detail": "extracted",
+        "ok": not reduction_contract_issues,
+        "detail": (
+            "extracted"
+            if not reduction_contract_issues
+            else "Mesh reduction contract failed: "
+            + "; ".join(reduction_contract_issues)
+        ),
         "source": source_path,
         "setup_frame": setup_frame,
         "setup_pose": setup_pose,
@@ -2564,6 +2781,8 @@ def extract_scene_cli(
         "bones_3d": bones_3d,
         "source_weights": _weights_to_json(primary_source_weights or []),
         "mesh_reduction": primary_reduction,
+        "mesh_reduction_summary": mesh_reduction_summary,
+        "mesh_reduction_contract_issues": reduction_contract_issues,
     }
 
 
@@ -3424,16 +3643,43 @@ def render_sprites_cli(
     # (the primary body, a sword, etc.).
     mesh_by_name = {}
     mesh_reduction_report = None
+    mesh_reduction_reports = []
+    mesh_vertex_budgets = (
+        allocate_mesh_vertex_budgets(all_meshes, mesh_target_vertices)
+        if mesh_reduction
+        else [int(mesh_target_vertices or 0) for _ in all_meshes]
+    )
     for mesh_index, scene_mesh in enumerate(all_meshes):
         report = reduce_mesh_object(
             scene_mesh,
-            target_vertices=mesh_target_vertices,
+            target_vertices=mesh_vertex_budgets[mesh_index],
             enabled=mesh_reduction,
             weight_aware_decimation=weight_aware_decimation,
         )
+        report["allocated_target_vertices"] = mesh_vertex_budgets[mesh_index]
+        report["global_target_vertices"] = int(mesh_target_vertices or 0)
+        mesh_reduction_reports.append(report)
         mesh_by_name[scene_mesh.name] = scene_mesh
         if mesh_index == 0:
             mesh_reduction_report = report
+    mesh_reduction_summary = _annotate_global_mesh_reduction(
+        mesh_reduction_reports, mesh_target_vertices
+    )
+    reduction_contract_issues = _mesh_reduction_contract_issues(
+        mesh_reduction_reports,
+        mesh_reduction_summary,
+        enabled=mesh_reduction,
+        target_vertices=mesh_target_vertices,
+    )
+    if reduction_contract_issues:
+        return {
+            "ok": False,
+            "detail": "Mesh reduction contract failed before rendering: "
+            + "; ".join(reduction_contract_issues),
+            "mesh_reduction": mesh_reduction_report,
+            "mesh_reduction_summary": mesh_reduction_summary,
+            "mesh_reduction_contract_issues": reduction_contract_issues,
+        }
 
     if not parts_json or not images_dir:
         return {"ok": False, "detail": "parts-json and images-dir are required"}
@@ -3612,6 +3858,7 @@ def render_sprites_cli(
             "bind_borrow": bind_borrow_info,
             "use_rest_pose": bool(use_rest_pose),
             "mesh_reduction": mesh_reduction_report,
+            "mesh_reduction_summary": mesh_reduction_summary,
             "renders": renders,
         }
         if reference_result is not None:
