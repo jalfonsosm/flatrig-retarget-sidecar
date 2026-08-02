@@ -9,6 +9,7 @@ import math
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -3686,6 +3687,7 @@ def render_sprites_cli(
     """
     import json as json_module
 
+    command_started = time.perf_counter()
     bpy.ops.wm.read_factory_settings(use_empty=True)
     import_model(source_path)
 
@@ -3806,7 +3808,12 @@ def render_sprites_cli(
     # Get render_part_sprite function if available
     try:
         from flatrig.projection import get_projection_reference_matrix
-        from flatrig.texture import render_part_sprite, render_preview_sprite
+        from flatrig.texture import (
+            _sprite_render_samples,
+            render_part_sprite,
+            render_preview_sprite,
+            sprite_render_device_label,
+        )
 
         projection_matrix = (
             get_projection_reference_matrix(
@@ -3872,7 +3879,9 @@ def render_sprites_cli(
             }
 
         renders = []
+        render_seconds = 0.0
         for part in parts:
+            part_started = time.perf_counter()
             attachment_name = str(part.get("attachment_name") or part.get("name") or "part")
             part_output = output_dir / f"{attachment_name}.png"
             # Render each part against its owning mesh object; fall back to the
@@ -3901,6 +3910,8 @@ def render_sprites_cli(
                 projection_matrix=projection_matrix,
                 core_triangle_keys=core_triangle_keys,
             )
+            part_seconds = time.perf_counter() - part_started
+            render_seconds += part_seconds
             renders.append(
                 {
                     "name": str(part.get("name") or attachment_name),
@@ -3910,6 +3921,7 @@ def render_sprites_cli(
                     "output_path": str(part_output),
                     "width": resolution,
                     "height": resolution,
+                    "seconds": round(part_seconds, 3),
                 }
             )
 
@@ -3924,6 +3936,19 @@ def render_sprites_cli(
             "mesh_reduction": mesh_reduction_report,
             "mesh_reduction_summary": mesh_reduction_summary,
             "renders": renders,
+            # Which engine/device actually ran, and how much of this command's
+            # wall time was spent rendering rather than importing, reducing and
+            # splitting the mesh. Without this the only way to tell an Eevee
+            # run on an integrated GPU from a Cycles run on a discrete one was
+            # to attach a profiler to the worker.
+            "render_profile": {
+                "engine": str(bpy.context.scene.render.engine),
+                "device": sprite_render_device_label(),
+                "samples": _sprite_render_samples(),
+                "part_count": len(renders),
+                "render_seconds": round(render_seconds, 3),
+                "command_seconds": round(time.perf_counter() - command_started, 3),
+            },
         }
         if reference_result is not None:
             payload["reference"] = reference_result

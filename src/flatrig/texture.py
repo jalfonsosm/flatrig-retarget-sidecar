@@ -38,24 +38,150 @@ def _sprite_render_samples():
     return max(1, min(samples, 64))
 
 
+def _engine_is_selectable(scene, identifier):
+    """Whether ``identifier`` can actually be assigned as the render engine.
+
+    ``render.engine``'s enum only lists the engines built into Blender itself.
+    Add-on engines register a RenderEngine subclass instead and never appear
+    there, so Cycles is reported as unavailable by an enum check even though
+    the property accepts it. Probing by assignment is the only reliable test.
+    """
+    previous = scene.render.engine
+    if previous == identifier:
+        return True
+    try:
+        scene.render.engine = identifier
+    except (TypeError, ValueError):
+        return False
+    selected = scene.render.engine
+    scene.render.engine = previous
+    return selected == identifier
+
+
 def _pick_render_engine(scene):
-    engine_property = scene.render.bl_rna.properties.get("engine")
-    available = {
-        item.identifier
-        for item in (engine_property.enum_items if engine_property is not None else [])
-    }
     candidates = []
     requested = os.environ.get("FLATRIG_SPRITE_RENDER_ENGINE", "").strip()
     if requested:
         candidates.append(requested)
-    # Eevee first: it is the only engine that reproduces the emission materials
-    # and alpha-blended textures the sprite path relies on. Workbench is a
-    # last-resort fallback for builds where Eevee is unavailable.
+    elif cycles_gpu_devices():
+        # Cycles first, but only when it can reach a real compute device.
+        #
+        # Eevee has no device selector: it renders on whichever GPU the
+        # process' OpenGL context landed on, and on a hybrid-graphics laptop
+        # that is the integrated one. Cycles enumerates compute devices and
+        # can be pointed at the discrete card. Measured on a GTX 1070 Max-Q +
+        # UHD 630 machine, a 12-sprite 2048x2048 batch took 116.4s through
+        # Eevee on the iGPU versus 80.2s through Cycles on the dGPU, most of
+        # the difference being Eevee's ~20s cold shader compilation.
+        #
+        # Without a GPU the ranking inverts (Cycles CPU at 16 samples measured
+        # 4.6s per render against Eevee's 2.7s), hence the guard.
+        candidates.append("CYCLES")
+    # Eevee reproduces the emission materials and alpha-blended textures the
+    # sprite path relies on. Workbench is a last-resort fallback for builds
+    # where Eevee is unavailable.
     candidates.extend(("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH", "CYCLES"))
     for candidate in candidates:
-        if candidate in available:
+        if candidate == "CYCLES":
+            _ensure_cycles_addon()
+        if _engine_is_selectable(scene, candidate):
             return candidate
     return scene.render.engine
+
+
+def _ensure_cycles_addon():
+    """Register Cycles so it can be selected. Best effort; safe if missing."""
+    try:
+        import addon_utils
+
+        addon_utils.enable("cycles", default_set=False, persistent=True)
+    except Exception:
+        pass
+
+
+# Order matters: the first backend with a usable device wins. CUDA is tried
+# before OptiX because sprites are a single-bounce emission pass, where OptiX's
+# ray-tracing advantage barely applies but its first-render kernel compile is
+# still paid. On a GTX 1070 the two finished a 12-sprite batch within 0.1s of
+# each other, while in isolation OptiX stalled ~6s compiling kernels on the
+# first render.
+_CYCLES_GPU_BACKENDS = ("METAL", "CUDA", "OPTIX", "HIP", "ONEAPI")
+
+
+def cycles_gpu_devices():
+    """``(backend, [device names])`` for the first usable Cycles GPU backend.
+
+    Returns ``None`` when Cycles cannot reach any GPU. Enabling the devices is
+    left to :func:`_configure_cycles_device`; this only answers "is there one",
+    so engine selection can ask before committing to Cycles.
+    """
+    _ensure_cycles_addon()
+    try:
+        preferences = bpy.context.preferences.addons["cycles"].preferences
+    except (AttributeError, KeyError):
+        return None
+    for backend in _CYCLES_GPU_BACKENDS:
+        try:
+            preferences.compute_device_type = backend
+        except (TypeError, ValueError):
+            continue
+        try:
+            preferences.get_devices()
+        except Exception:
+            continue
+        names = [device.name for device in preferences.devices if device.type == backend]
+        if names:
+            return backend, names
+    return None
+
+
+def _configure_cycles_device(scene):
+    """Point Cycles at a discrete GPU when one is usable.
+
+    Unlike Eevee -- whose device is whatever GPU the process' OpenGL context
+    landed on, whether or not that is the fast one -- Cycles enumerates the
+    real compute devices and lets us choose. On a hybrid-graphics laptop the
+    OpenGL context defaults to the integrated GPU, so this is the only path
+    that reaches the discrete card. Returns a human-readable device label.
+    """
+    cycles = getattr(scene, "cycles", None)
+    if cycles is None:
+        return "cycles settings unavailable"
+
+    cycles.samples = _sprite_render_samples()
+    for attr in ("use_denoising", "use_adaptive_sampling"):
+        if hasattr(cycles, attr):
+            setattr(cycles, attr, False)
+    # Sprites are unlit emission: no bounce carries any signal, so every extra
+    # bounce is pure cost. Transparent bounces stay put -- alpha-clipped
+    # textures need them to composite correctly.
+    for attr in (
+        "max_bounces",
+        "diffuse_bounces",
+        "glossy_bounces",
+        "transmission_bounces",
+        "volume_bounces",
+    ):
+        if hasattr(cycles, attr):
+            setattr(cycles, attr, 0)
+
+    selected = cycles_gpu_devices()
+    # Enumerating compute devices invalidates previously fetched RNA pointers,
+    # so `cycles` captured above is stale from here on: re-fetch it rather than
+    # reusing it, or the assignment below raises AttributeError.
+    cycles = scene.cycles
+    if selected is None:
+        cycles.device = "CPU"
+        return "CPU (no GPU compute device found)"
+
+    backend, names = selected
+    preferences = bpy.context.preferences.addons["cycles"].preferences
+    # cycles_gpu_devices() already left compute_device_type on `backend`; now
+    # actually enable those devices and disable everything else.
+    for device in preferences.devices:
+        device.use = device.type == backend
+    scene.cycles.device = "GPU"
+    return f"{backend}: {', '.join(names)}"
 
 
 def _set_enum_if_available(owner, attr, value):
@@ -118,6 +244,11 @@ def _configure_sprite_render(scene, engine):
     scene.render.image_settings.color_mode = "RGBA"
     _configure_sprite_colour_management(scene)
 
+    if engine == "CYCLES":
+        device = _configure_cycles_device(scene)
+        print(f"[sidecar_texture] Cycles device: {device}")
+        return
+
     if engine == "BLENDER_WORKBENCH":
         shading = getattr(getattr(scene, "display", None), "shading", None)
         if shading is not None:
@@ -161,6 +292,34 @@ def _configure_sprite_render(scene, engine):
         ):
             if hasattr(eevee, attr):
                 setattr(eevee, attr, 1)
+
+
+def sprite_render_device_label():
+    """Which physical device the current render engine will actually use.
+
+    Eevee has no device selector: it renders on whatever GPU the process'
+    OpenGL context landed on, which on a hybrid-graphics laptop is the
+    integrated one. Reporting it is the only way a build log can show that.
+    """
+    engine = str(bpy.context.scene.render.engine)
+    if engine == "CYCLES":
+        cycles = getattr(bpy.context.scene, "cycles", None)
+        if cycles is None:
+            return "unknown"
+        if getattr(cycles, "device", "CPU") != "GPU":
+            return "CPU"
+        try:
+            preferences = bpy.context.preferences.addons["cycles"].preferences
+            enabled = [d.name for d in preferences.devices if d.use]
+            return f"{preferences.compute_device_type}: {', '.join(enabled)}"
+        except (AttributeError, KeyError):
+            return "GPU"
+    try:
+        import gpu
+
+        return gpu.platform.renderer_get()
+    except Exception:
+        return "unknown"
 
 
 def _frame_to_world_center(projection_frame, view_cfg, depth_center=0.0, projection_matrix=None):
