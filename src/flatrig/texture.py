@@ -355,47 +355,73 @@ def _filter_alpha(alpha, image_filter):
     return np.asarray(filtered, dtype=np.float32) / 255.0
 
 
-#: Coverage below which an un-premultiplied colour cannot be trusted. The
-#: render arrives 8-bit quantised, so recovering ``rgb / alpha`` divides a value
-#: carrying +-0.5/255 of rounding error by a very small number: at alpha 2/255
-#: the recovered colour is wrong by up to 25%, and the clip to 1.0 turns that
-#: into pure white. At this floor one rounding step is under 5%.
+#: Coverage below which a saved texel's colour cannot be trusted. Blender's
+#: render buffer is premultiplied but its 8-bit PNG writer saves *straight*
+#: (unassociated) alpha, so it divides the covered colour by a very small,
+#: rounding-limited alpha for the fringe texels and writes whatever comes out
+#: -- and plain black wherever nothing was rasterized at all. Below this floor
+#: the colour is taken from the neighbourhood instead.
 _MIN_RELIABLE_COVERAGE = 12.0 / 255.0
 
 #: Radius of the alpha-weighted colour bleed that fills the unreliable texels.
 _COLOR_BLEED_RADIUS = 3.0
 
 
-def _recover_straight_rgb(premultiplied_rgb, coverage):
-    """Un-premultiply, bleeding colour outward where coverage is too low.
+def _straight_rgb_with_bleed(straight_rgb, coverage):
+    """Return the render's straight colour, bled inward where coverage is low.
 
-    Dividing by a near-zero coverage amplifies the render's 8-bit rounding into
-    a saturated colour, which is why the naive round trip painted a white rim
-    around every silhouette (measured: 50-74% of a sprite's fringe texels
-    clipped to white, fringe luma ~2x the interior). Texels below
-    ``_MIN_RELIABLE_COVERAGE`` therefore take an alpha-weighted average of
-    their neighbourhood instead: blurring the premultiplied colour and the
-    coverage and then dividing yields exactly the coverage-weighted mean
-    colour, so the fringe inherits the colour of the geometry it belongs to.
+    The saved PNG already carries straight (unassociated) RGB, so no
+    un-premultiply is needed -- dividing it by coverage a second time is what
+    painted a white rim around every silhouette (measured: 50-74% of a sprite's
+    fringe texels clipped to white, fringe luma ~2x the interior). Only the
+    texels under ``_MIN_RELIABLE_COVERAGE`` carry no usable colour of their own;
+    those take a coverage-weighted average of their neighbourhood, so the
+    fringe -- and any texel the soft ring cut turns opaque where the render was
+    transparent -- inherits the colour of the geometry it belongs to.
     """
     from PIL import ImageFilter
 
-    safe = np.maximum(coverage, 1e-6)
-    direct = premultiplied_rgb / safe[..., None]
-
     blurred_coverage = _filter_alpha(coverage, ImageFilter.GaussianBlur(_COLOR_BLEED_RADIUS))
-    bled = np.empty_like(premultiplied_rgb)
-    for channel in range(premultiplied_rgb.shape[-1]):
+    bled = np.empty_like(straight_rgb)
+    for channel in range(straight_rgb.shape[-1]):
         blurred_channel = _filter_alpha(
-            premultiplied_rgb[..., channel], ImageFilter.GaussianBlur(_COLOR_BLEED_RADIUS)
+            straight_rgb[..., channel] * coverage,
+            ImageFilter.GaussianBlur(_COLOR_BLEED_RADIUS),
         )
         bled[..., channel] = blurred_channel / np.maximum(blurred_coverage, 1e-6)
 
     reliable = (coverage >= _MIN_RELIABLE_COVERAGE)[..., None]
     # Where even the neighbourhood carries no coverage there is no colour to
     # recover; those texels are fully transparent, so the value is irrelevant.
-    recovered = np.where(reliable, direct, bled)
+    recovered = np.where(reliable, straight_rgb, bled)
     return np.clip(recovered, 0.0, 1.0)
+
+
+def _premultiply_saved_sprite(output_path):
+    """Rewrite a finished sprite PNG with premultiplied RGB.
+
+    Blender saves straight alpha, but the sprite atlas declares ``pma: true``
+    and the viewer uploads the pages as already-premultiplied. Handing a
+    straight-alpha page to a premultiplied blend adds the full fringe colour on
+    top of the background instead of ``colour * alpha``, which is the white halo
+    that outlines every sprite and its seams. Sprites that go through the soft
+    ring cut are premultiplied there; this covers the rest -- a welded sprite, a
+    lone accessory object, any part with no borrowed ring.
+    """
+    if not _soft_cut_support_available() or not os.path.isfile(output_path):
+        return False
+    from PIL import Image
+
+    image = Image.open(output_path).convert("RGBA")
+    pixels = np.asarray(image, dtype=np.float32) / 255.0
+    alpha = pixels[..., 3]
+    premultiplied = np.empty_like(pixels)
+    premultiplied[..., :3] = _straight_rgb_with_bleed(pixels[..., :3], alpha) * alpha[..., None]
+    premultiplied[..., 3] = alpha
+    Image.fromarray(
+        np.rint(np.clip(premultiplied * 255.0, 0.0, 255.0)).astype(np.uint8)
+    ).save(output_path)
+    return True
 
 
 def _build_soft_ring_alpha(
@@ -537,19 +563,13 @@ def _apply_soft_ring_cut(scene, part_obj, core_obj, output_path, resolution=1024
         coverage = color[..., 3]
         output_alpha = _build_soft_ring_alpha(core_alpha, coverage)
 
-        # Blender renders premultiplied alpha (film_transparent=True), so the
-        # RGB in `color` is already premultiplied by `coverage`. The soft-ring
-        # cut replaces `coverage` with `output_alpha`, so the RGB must be
-        # re-premultiplied to stay valid. Leaving the original premultiplied
-        # RGB paired with a different alpha creates invalid pixels (RGB > alpha
-        # where alpha was lowered, or RGB < alpha where it was raised), which
-        # show up as white halos or dark fringes at sprite edges in runtimes
-        # that expect premultiplied textures (PixiJS with alphaMode =
-        # "premultiplied-alpha"). Un-premultiply by the old alpha, then
-        # re-premultiply by the new alpha -- bleeding colour inward from
-        # reliable coverage rather than dividing 8-bit data by a near-zero
-        # alpha, which is what turned the antialiased fringe white.
-        rgb_straight = _recover_straight_rgb(color[..., :3], coverage)
+        # Blender's PNG writer saves straight (unassociated) alpha, so `color`
+        # holds the plain surface colour and the soft cut only has to pair it
+        # with the new matte. Both consumers of the atlas -- the `pma: true`
+        # header and the viewer's "premultiplied-alpha" upload -- expect
+        # premultiplied pages, so premultiply by `output_alpha` here; leaving
+        # the page straight is what outlines every sprite with a white halo.
+        rgb_straight = _straight_rgb_with_bleed(color[..., :3], coverage)
         rgb_repremultiplied = rgb_straight * output_alpha[..., None]
 
         pixels = np.empty_like(color)
@@ -867,14 +887,22 @@ def render_part_sprite(
 
     try:
         success = render_projected_sprite(scene, output_path, resolution=resolution)
+        soft_cut = False
         if success and core_obj is not None:
-            _apply_soft_ring_cut(
-                scene,
-                render_obj,
-                core_obj,
-                output_path,
-                resolution=resolution,
+            soft_cut = bool(
+                _apply_soft_ring_cut(
+                    scene,
+                    render_obj,
+                    core_obj,
+                    output_path,
+                    resolution=resolution,
+                )
             )
+        if success and not soft_cut:
+            # No borrowed ring (a welded sprite, a lone accessory object) or no
+            # soft-cut support: the render is still straight alpha and the atlas
+            # promises premultiplied pages, so convert it here.
+            _premultiply_saved_sprite(output_path)
         return success
     finally:
         _restore_materials(restore_info, created_materials)
