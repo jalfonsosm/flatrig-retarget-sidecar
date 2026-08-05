@@ -83,6 +83,7 @@ from blender_io.scene_pose import (  # noqa: E402,F401
     _restore_scene_armature_pose_positions,
     _set_scene_armatures_rest_pose,
 )
+import splat_utils  # noqa: E402
 
 from blender_worker_args import parse_worker_args  # noqa: E402
 from blender_view import (  # noqa: E402
@@ -2657,6 +2658,20 @@ def extract_scene_cli(
     if mesh_obj is None and armature_obj is None:
         return {"ok": False, "detail": "No mesh or armature found in scene"}
 
+    setup_frame = _resolve_setup_frame(
+        armature_obj,
+        source_frame=source_frame,
+        use_rest_pose=use_rest_pose,
+        neutral_auto_pose=True,
+    )
+
+    # If this is a splat source (TripoSplat), the .ply is in T-pose alongside the .obj
+    # Map and deform it before the mesh changes pose!
+    if mesh_obj:
+        splat_path = source_path.replace(".fbx", ".ply").replace(".obj", ".ply")
+        splat_out = output_path.replace(".json", "_splat_deformed.ply")
+        splat_utils.process_and_deform_splat(splat_path, splat_out, mesh_obj, armature_obj, setup_frame)
+
     # Borrow the canonical setup pose from the donor animation whenever the
     # caller provides one. The donor contributes retargeted joint rotations;
     # setup extraction below keeps the target rig's own offsets/lengths.
@@ -2667,12 +2682,6 @@ def extract_scene_cli(
         use_rest_pose=use_rest_pose,
     )
 
-    setup_frame = _resolve_setup_frame(
-        armature_obj,
-        source_frame=source_frame,
-        use_rest_pose=use_rest_pose,
-        neutral_auto_pose=True,
-    )
     bpy.context.scene.frame_set(setup_frame)
     # When the rig uses its OWN action, it can carry a constant root yaw vs the
     # normalized rest (root-bone roll convention differs from the donor's), so
