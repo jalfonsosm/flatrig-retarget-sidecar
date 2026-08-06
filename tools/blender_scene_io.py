@@ -809,7 +809,15 @@ def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
     return report
 
 
-def import_model(filepath: str) -> None:
+def import_model(filepath: str) -> float:
+    """Import a model file and return the normalization yaw in degrees.
+
+    The returned angle is the Z-axis rotation (in degrees) that
+    ``normalize_model_orientation`` applied to align the rig to
+    canonical -Y.  Callers that also operate on companion data (e.g.
+    Gaussian Splat PLY files) must apply the same rotation to keep
+    everything aligned.
+    """
     extension = Path(filepath).suffix.lower()
     before = set(bpy.context.scene.objects)
     if extension == ".fbx":
@@ -822,8 +830,9 @@ def import_model(filepath: str) -> None:
     imported = [obj for obj in bpy.context.scene.objects if obj not in before]
     _strip_object_transform_animation(imported)
     # (Removed) Mixamo is no longer canonicalized to mannequin; it maps directly to canonical later.
-    normalize_model_orientation(imported)
+    normalization_yaw_deg = normalize_model_orientation(imported)
     sanitize_imported_armature_terminal_geometry(imported)
+    return normalization_yaw_deg
 
 
 
@@ -2646,7 +2655,7 @@ def extract_scene_cli(
     This combines extract_2d_mesh and extract_bone_hierarchy with weight transfer.
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_model(source_path)
+    normalization_yaw_deg = import_model(source_path)
 
     all_meshes, armature_obj = find_all_meshes_and_armature()
     mesh_obj = all_meshes[0] if all_meshes else None
@@ -2670,7 +2679,10 @@ def extract_scene_cli(
     if mesh_obj:
         splat_path = source_path.replace(".fbx", ".ply").replace(".obj", ".ply")
         splat_out = output_path.replace(".json", "_splat_deformed.ply")
-        splat_utils.process_and_deform_splat(splat_path, splat_out, mesh_obj, armature_obj, setup_frame)
+        splat_utils.process_and_deform_splat(
+            splat_path, splat_out, mesh_obj, armature_obj, setup_frame,
+            normalization_yaw_deg=normalization_yaw_deg,
+        )
 
     # Borrow the canonical setup pose from the donor animation whenever the
     # caller provides one. The donor contributes retargeted joint rotations;

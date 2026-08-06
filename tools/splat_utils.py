@@ -9,7 +9,8 @@ try:
 except ImportError:
     pass
 
-def process_and_deform_splat(splat_path, output_path, mesh_obj, armature_obj, setup_frame):
+def process_and_deform_splat(splat_path, output_path, mesh_obj, armature_obj, setup_frame,
+                             *, normalization_yaw_deg=0.0):
     if not os.path.exists(splat_path):
         return None
 
@@ -42,6 +43,28 @@ def process_and_deform_splat(splat_path, output_path, mesh_obj, armature_obj, se
     # 17 floats * 4 bytes = 68 bytes per point
     pts = np.frombuffer(data, dtype=np.float32).reshape(-1, 17).copy()
     
+    # Apply the same Z-axis yaw rotation that normalize_model_orientation
+    # applied to the mesh inside Blender.  Without this, splat positions
+    # are in the original (pre-normalization) coordinate frame while the
+    # mesh vertices have already been rotated, causing BVH nearest-vertex
+    # lookups to match the wrong geometry.
+    if abs(normalization_yaw_deg) > 0.01:
+        angle_rad = math.radians(normalization_yaw_deg)
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+        x = pts[:, 0].copy()
+        y = pts[:, 1].copy()
+        pts[:, 0] = cos_a * x - sin_a * y
+        pts[:, 1] = sin_a * x + cos_a * y
+        # Also rotate the per-splat quaternions (WXYZ in columns 13-16)
+        # by the same Z-axis yaw so their orientations stay consistent.
+        q_yaw = mathutils.Quaternion((0, 0, 1), angle_rad)
+        for i in range(len(pts)):
+            q = mathutils.Quaternion((pts[i, 13], pts[i, 14], pts[i, 15], pts[i, 16]))
+            q = q_yaw @ q
+            q.normalize()
+            pts[i, 13:17] = [q.w, q.x, q.y, q.z]
+        print(f"[SPLAT] Pre-rotated splat data by {normalization_yaw_deg:.1f}° around Z")
+
     # Get vertex groups
     vgroups = {g.index: g.name for g in mesh_obj.vertex_groups}
     
