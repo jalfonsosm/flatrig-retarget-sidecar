@@ -117,6 +117,23 @@ def main() -> None:
         default=None,
         help="Write the model's full-resolution base-color texture to this PNG path.",
     )
+    extract_scene_parser.add_argument(
+        "--splat-input",
+        default=None,
+        help=(
+            "Gaussian-splat companion cloud (.ply) of the source, in the source "
+            "file's own coordinate frame. Requires --splat-output."
+        ),
+    )
+    extract_scene_parser.add_argument(
+        "--splat-output",
+        default=None,
+        help=(
+            "Write the splat cloud here, carried into the extracted scene's world "
+            "space and setup pose. A sibling <name>_weights.json lists each "
+            "splat's dominant bone."
+        ),
+    )
 
 
     extract_animations_parser = subparsers.add_parser(
@@ -195,6 +212,16 @@ def main() -> None:
     reduce_rig_parser.add_argument("source")
     reduce_rig_parser.add_argument("--output", required=True)
     reduce_rig_parser.add_argument("--flat-output", required=True)
+    reduce_rig_parser.add_argument(
+        "--splat-input",
+        default=None,
+        help="Gaussian-splat companion cloud (.ply) of the source. Requires --splat-output.",
+    )
+    reduce_rig_parser.add_argument(
+        "--splat-output",
+        default=None,
+        help="Write the cloud here, carried into the frame the reduced model is exported in.",
+    )
 
     render_sprites_parser = subparsers.add_parser(
         "render-sprites",
@@ -328,6 +355,8 @@ def main() -> None:
             base_color_texture_output=getattr(
                 args, "base_color_texture_output", None
             ),
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
         )
         _emit_result(result)
         return
@@ -398,6 +427,8 @@ def main() -> None:
             args.source,
             args.output,
             flat_output=args.flat_output,
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
         )
         _emit_result(result)
         return

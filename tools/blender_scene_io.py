@@ -762,14 +762,22 @@ def _reduce_armature_to_canonical(armature_obj, meshes):
     return {"kept_count": len([c for c in canon.values() if c]), "dropped_count": len(dropped)}
 
 
-def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
+def reduce_rig_to_canonical_cli(
+    source_path, output_path, flat_output, splat_input=None, splat_output=None
+):
     """Reduce a humanoid rig to canonical and export to ``flat_output`` (.fbx).
 
     Non-humanoid rigs are exported unchanged with ``reduced=False`` so the caller
     can fall back to the existing cross-rig retarget path.
+
+    ``splat_input``/``splat_output`` carry a Gaussian-splat companion cloud into
+    the frame the reduced model is exported in. The export bakes the normalized
+    orientation into the file, so a cloud left behind in the source's frame would
+    read as correct here (the re-imported model needs no further normalization)
+    while sitting at a right angle to the mesh.
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_model(source_path)
+    normalization_matrix = import_model(source_path)
     mesh_obj, armature_obj = find_mesh_and_armature()
     if armature_obj is None:
         return {"ok": False, "detail": "No armature found in source."}
@@ -806,17 +814,21 @@ def reduce_rig_to_canonical_cli(source_path, output_path, flat_output):
         path_mode="COPY", embed_textures=True, bake_space_transform=True,
     )
     report["flat_output"] = str(flat_path)
+    if splat_input and splat_output:
+        report["splat"] = splat_utils.carry_splat_to_world(
+            splat_input, splat_output, normalization_matrix=normalization_matrix
+        )
     return report
 
 
-def import_model(filepath: str) -> float:
-    """Import a model file and return the normalization yaw in degrees.
+def import_model(filepath: str):
+    """Import a model file and return the applied normalization matrix.
 
-    The returned angle is the Z-axis rotation (in degrees) that
-    ``normalize_model_orientation`` applied to align the rig to
-    canonical -Y.  Callers that also operate on companion data (e.g.
-    Gaussian Splat PLY files) must apply the same rotation to keep
-    everything aligned.
+    The returned 4x4 is the world-space rotation ``normalize_model_orientation``
+    used to align the rig to canonical -Y (identity when the rig already faced
+    it). Callers that also own companion data outside the scene -- a Gaussian
+    Splat PLY, a baked point cloud -- must push it through the same matrix, or
+    it stays in the pre-normalization frame while the mesh moves.
     """
     extension = Path(filepath).suffix.lower()
     before = set(bpy.context.scene.objects)
@@ -830,9 +842,9 @@ def import_model(filepath: str) -> float:
     imported = [obj for obj in bpy.context.scene.objects if obj not in before]
     _strip_object_transform_animation(imported)
     # (Removed) Mixamo is no longer canonicalized to mannequin; it maps directly to canonical later.
-    normalization_yaw_deg = normalize_model_orientation(imported)
+    normalization_matrix = normalize_model_orientation(imported)
     sanitize_imported_armature_terminal_geometry(imported)
-    return normalization_yaw_deg
+    return normalization_matrix
 
 
 
@@ -841,7 +853,7 @@ def import_model(filepath: str) -> float:
 
 
 
-def normalize_model_orientation(objects=None, target_forward=NORMALIZE_TARGET_FORWARD) -> float:
+def normalize_model_orientation(objects=None, target_forward=NORMALIZE_TARGET_FORWARD):
     return _orientation_normalize_model_orientation(
         objects,
         target_forward=target_forward,
@@ -2649,13 +2661,23 @@ def extract_scene_cli(
     bind_from_animation: str = None,
     base_color_texture_output: str = None,
     drop_projection_slivers: bool = True,
+    splat_input: str = None,
+    splat_output: str = None,
 ) -> dict[str, object]:
     """CLI wrapper for scene extraction (mesh + bones + weights).
 
     This combines extract_2d_mesh and extract_bone_hierarchy with weight transfer.
+
+    ``splat_input``/``splat_output`` are the optional Gaussian-splat companion
+    cloud of the source (TripoSplat writes one next to the mesh). Both paths are
+    supplied by the caller rather than derived here: the file the caller hands
+    to extraction is often a canonical-reduced copy in a scratch directory that
+    has no cloud beside it, and the deformed cloud has to land where the caller
+    collects its artifacts. Skinning a 260k-point cloud is not free, so it only
+    runs when a caller actually asks for it.
     """
     bpy.ops.wm.read_factory_settings(use_empty=True)
-    normalization_yaw_deg = import_model(source_path)
+    normalization_matrix = import_model(source_path)
 
     all_meshes, armature_obj = find_all_meshes_and_armature()
     mesh_obj = all_meshes[0] if all_meshes else None
@@ -2673,16 +2695,6 @@ def extract_scene_cli(
         use_rest_pose=use_rest_pose,
         neutral_auto_pose=True,
     )
-
-    # If this is a splat source (TripoSplat), the .ply is in T-pose alongside the .obj
-    # Map and deform it before the mesh changes pose!
-    if mesh_obj:
-        splat_path = source_path.replace(".fbx", ".ply").replace(".obj", ".ply")
-        splat_out = output_path.replace(".json", "_splat_deformed.ply")
-        splat_utils.process_and_deform_splat(
-            splat_path, splat_out, mesh_obj, armature_obj, setup_frame,
-            normalization_yaw_deg=normalization_yaw_deg,
-        )
 
     # Borrow the canonical setup pose from the donor animation whenever the
     # caller provides one. The donor contributes retargeted joint rotations;
@@ -2707,6 +2719,21 @@ def extract_scene_cli(
         source_frame=source_frame,
         use_rest_pose=use_rest_pose,
     )
+
+    # Carry the Gaussian-splat companion cloud into the same frame and pose the
+    # mesh payload below is extracted in. It runs *here*, after the bind borrow,
+    # the root alignment and the auto setup pose, because those three still move
+    # the rig -- deforming the cloud any earlier freezes it in a pose the sprites
+    # never see.
+    splat_summary = None
+    if mesh_obj is not None and splat_input and splat_output:
+        splat_summary = splat_utils.deform_splat_to_setup_pose(
+            splat_input,
+            splat_output,
+            mesh_obj,
+            armature_obj,
+            normalization_matrix=normalization_matrix,
+        )
 
     # Build view configuration
     view_cfg = get_scene_view_config(
@@ -2869,6 +2896,9 @@ def extract_scene_cli(
         "mesh_reduction": primary_reduction,
         "mesh_reduction_summary": mesh_reduction_summary,
         "mesh_reduction_contract_issues": reduction_contract_issues,
+        # Present only when a Gaussian-splat cloud was requested and found. The
+        # written cloud shares this payload's world space and setup pose.
+        "splat": splat_summary,
     }
 
 
@@ -4006,6 +4036,8 @@ def main() -> None:
             bind_from_animation=getattr(args, "bind_from_animation", None),
             base_color_texture_output=getattr(args, "base_color_texture_output", None),
             drop_projection_slivers=not getattr(args, "keep_projection_slivers", False),
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
         )
     elif args.command == "extract-animations":
         payload = extract_animations_cli(
@@ -4089,6 +4121,8 @@ def main() -> None:
             source_path,
             str(output_path),
             args.flat_output,
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
         )
     elif args.command == "cleanup-mesh":
         if not args.glb_output:

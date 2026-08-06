@@ -127,6 +127,20 @@ def parse_worker_args(
         help="Optional PNG path for the model's full-resolution base-color texture",
     )
     parser.add_argument(
+        "--splat-input",
+        help=(
+            "extract-scene: Gaussian-splat companion cloud (.ply) of the source, "
+            "in the source file's own coordinate frame"
+        ),
+    )
+    parser.add_argument(
+        "--splat-output",
+        help=(
+            "extract-scene: write the splat cloud here, carried into the "
+            "extracted scene's world space and setup pose"
+        ),
+    )
+    parser.add_argument(
         "--resolution", type=int, default=2048, help="Render resolution for each part image"
     )
     parser.add_argument(

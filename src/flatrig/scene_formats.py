@@ -429,6 +429,8 @@ def extract_scene(
     bind_from_animation: str = None,
     base_color_texture_output: str = None,
     keep_projection_slivers: bool = False,
+    splat_input: str = None,
+    splat_output: str = None,
 ) -> SceneCommandResult:
     """Extract scene data (mesh, bones, weights) using projection.
 
@@ -470,6 +472,15 @@ def extract_scene(
     if base_color_texture_output:
         extra_args.extend(
             ["--base-color-texture-output", str(base_color_texture_output)]
+        )
+    if splat_input and splat_output:
+        extra_args.extend(
+            [
+                "--splat-input",
+                str(splat_input),
+                "--splat-output",
+                str(splat_output),
+            ]
         )
 
     probe = probe_scene_backend_impl()
@@ -677,11 +688,21 @@ def reduce_rig_to_canonical(
     output: str,
     *,
     flat_output: str,
+    splat_input: str = None,
+    splat_output: str = None,
 ) -> SceneCommandResult:
     """Reduce a biped-humanoid rig to the FlatRig HML22 canonical skeleton in place on the
     mesh and export it to ``flat_output``. Non-humanoid rigs export unchanged
-    (``reduced=False`` in the report)."""
+    (``reduced=False`` in the report).
+
+    ``splat_input``/``splat_output`` carry a Gaussian-splat companion cloud into
+    the frame the reduced model is exported in, so the pair stays in step.
+    """
     extra_args = ["--flat-output", str(Path(flat_output).expanduser().resolve())]
+    if splat_input and splat_output:
+        extra_args.extend(
+            ["--splat-input", str(splat_input), "--splat-output", str(splat_output)]
+        )
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:
         return _run_bpy_command_with_args("reduce-rig-to-canonical", source, output, extra_args)

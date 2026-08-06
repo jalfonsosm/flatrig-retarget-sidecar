@@ -279,31 +279,38 @@ def normalize_model_orientation(
     *,
     target_forward=(0.0, -1.0, 0.0),
     deform_bone_names_fn: Callable | None = None,
-) -> float:
-    """Rotate just-imported rig objects about world Z so the rig faces canonical -Y."""
+):
+    """Rotate just-imported rig objects about world Z so the rig faces canonical -Y.
+
+    Returns the world-space 4x4 that was applied (identity when the rig already
+    faces the target). Callers holding companion data that is NOT a scene object
+    -- a Gaussian-splat PLY, a baked point cloud -- must push it through the same
+    matrix, pivot included, or it desynchronizes from the mesh.
+    """
+    identity = mathutils.Matrix.Identity(4)
     if objects is None:
         objects = list(bpy.context.scene.objects)
     if not objects:
-        return 0.0
+        return identity
     armature_obj = next((obj for obj in objects if obj.type == "ARMATURE"), None)
     if armature_obj is None:
-        return 0.0
+        return identity
     forward = rig_forward_world(armature_obj, deform_bone_names_fn)
     if forward is None:
-        return 0.0
+        return identity
     mesh_objects = [obj for obj in objects if obj.type == "MESH" and len(obj.data.vertices) > 0]
     if mesh_objects:
         forward = _disambiguate_forward_with_mesh(forward, mesh_objects)
     forward = _feet_forward_sign(armature_obj, forward)
     target = mathutils.Vector((float(target_forward[0]), float(target_forward[1]), 0.0))
     if target.length < 1e-6:
-        return 0.0
+        return identity
     target.normalize()
     cross_z = forward.x * target.y - forward.y * target.x
     dot = max(-1.0, min(1.0, forward.x * target.x + forward.y * target.y))
     angle = math.atan2(cross_z, dot)
     if abs(angle) < math.radians(1.0):
-        return 0.0
+        return identity
     pivot = armature_obj.matrix_world.translation.copy()
     rotation = (
         mathutils.Matrix.Translation(pivot)
@@ -315,4 +322,4 @@ def normalize_model_orientation(
         if obj.parent is None or obj.parent not in imported:
             obj.matrix_world = rotation @ obj.matrix_world
     bpy.context.view_layer.update()
-    return math.degrees(angle)
+    return rotation
