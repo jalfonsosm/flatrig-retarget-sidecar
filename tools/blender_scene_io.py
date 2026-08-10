@@ -13,6 +13,19 @@ import time
 from pathlib import Path
 from typing import Any
 
+# Blender's embedded Python intentionally starts without the sidecar virtual
+# environment on its import path. Bootstrap this checkout's public ``src``
+# package before bpy or any command-specific late ``flatrig.*`` imports. This
+# keeps the CLI fallback self-contained without PYTHONPATH or
+# --python-use-system-env.
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+
+from blender_worker_bootstrap import prepend_sidecar_src  # noqa: E402
+
+ROOT_DIR, SIDECAR_SRC_DIR = prepend_sidecar_src(__file__)
+
 try:
     # bpy must be imported before bmesh/mathutils in the managed bpy runtime.
     import bpy
@@ -25,10 +38,6 @@ except ImportError:
     bmesh = None
 
 import numpy as np
-
-TOOLS_DIR = Path(__file__).resolve().parent
-if str(TOOLS_DIR) not in sys.path:
-    sys.path.insert(0, str(TOOLS_DIR))
 
 from blender_io.math_utils import *
 from blender_io.bone_utils import *
@@ -3858,7 +3867,7 @@ def render_sprites_cli(
 
     # Get render_part_sprite function if available
     try:
-        from flatrig.projection import get_projection_reference_matrix
+        from flatrig._blender_projection import get_projection_reference_matrix
         from flatrig.texture import (
             _sprite_render_samples,
             render_part_sprite,

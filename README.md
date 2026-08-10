@@ -30,6 +30,17 @@ Run tests:
 python -m pytest
 ```
 
+The scene worker uses the installed `bpy` module when it can be loaded. On
+Windows, automatic mode first looks for a separate Blender process so an
+application-control policy never has to load an unsigned Python extension. It
+discovers the official installer through the `App Paths` registry entry and the
+standard `Program Files/Blender Foundation` layout. Portable installs can be
+selected with `FLATRIG_RETARGET_BLENDER` or by putting `blender` on `PATH`; no
+security-policy exception is required. If no Blender executable is present,
+automatic mode retains the `bpy` module fallback. The Blender worker adds this
+checkout's `src` directory itself, so the CLI fallback does not depend on
+`PYTHONPATH` or Blender's `--python-use-system-env` option.
+
 The private FlatRig repository fetches this sidecar during CMake configure. When
 developing both repositories side by side, edit the canonical sibling checkout,
 not the generated copy under the private repository's build directory.

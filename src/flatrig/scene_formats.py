@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,92 @@ def _append_mesh_reduction_args(
     extra_args.append("--no-weight-aware-decimation")
 
 
+def _blender_install_version(path: Path) -> tuple[int, ...]:
+    """Return the numeric version encoded by a standard Blender install dir."""
+
+    match = re.search(r"\bBlender\s+(\d+(?:\.\d+)*)\b", path.parent.name, re.IGNORECASE)
+    if match is None:
+        return ()
+    return tuple(int(component) for component in match.group(1).split("."))
+
+
+def _windows_registry_blender_candidates() -> list[Path]:
+    """Read Blender's per-user/machine ``App Paths`` registrations."""
+
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    key_path = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\blender.exe"
+    registry_views = [0]
+    for name in ("KEY_WOW64_64KEY", "KEY_WOW64_32KEY"):
+        value = getattr(winreg, name, 0)
+        if value and value not in registry_views:
+            registry_views.append(value)
+
+    candidates: list[Path] = []
+    seen: set[str] = set()
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for registry_view in registry_views:
+            try:
+                with winreg.OpenKey(
+                    hive,
+                    key_path,
+                    0,
+                    winreg.KEY_READ | registry_view,
+                ) as key:
+                    raw, _value_type = winreg.QueryValueEx(key, None)
+            except OSError:
+                continue
+            if not isinstance(raw, str) or not raw.strip():
+                continue
+            candidate = Path(os.path.expandvars(raw.strip().strip('"'))).expanduser()
+            normalized = os.path.normcase(str(candidate))
+            if normalized not in seen:
+                seen.add(normalized)
+                candidates.append(candidate)
+    return candidates
+
+
+def _windows_program_files_blender_candidates() -> list[Path]:
+    """Find official installer layouts, newest numeric version first."""
+
+    roots: list[Path] = []
+    seen_roots: set[str] = set()
+    for name in ("ProgramW6432", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        raw = os.environ.get(name)
+        if not raw:
+            continue
+        root = Path(raw).expanduser()
+        normalized = os.path.normcase(str(root))
+        if normalized in seen_roots:
+            continue
+        seen_roots.add(normalized)
+        roots.append(root)
+
+    candidates: list[Path] = []
+    for root in roots:
+        candidates.extend(
+            root.glob("Blender Foundation/Blender */blender.exe")
+        )
+    return sorted(
+        candidates,
+        key=lambda path: (_blender_install_version(path), os.path.normcase(str(path))),
+        reverse=True,
+    )
+
+
+def _resolve_windows_blender_executable() -> Path | None:
+    for candidate in (
+        *_windows_registry_blender_candidates(),
+        *_windows_program_files_blender_candidates(),
+    ):
+        if candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
 def resolve_blender_executable() -> Path | None:
     raw = os.environ.get(ENV_BLENDER)
     if raw:
@@ -78,6 +165,11 @@ def resolve_blender_executable() -> Path | None:
     resolved = shutil.which("blender")
     if resolved:
         return Path(resolved).resolve()
+
+    if sys.platform == "win32":
+        resolved_windows = _resolve_windows_blender_executable()
+        if resolved_windows is not None:
+            return resolved_windows
 
     if DEFAULT_MACOS_BLENDER.exists():
         return DEFAULT_MACOS_BLENDER.resolve()
@@ -131,7 +223,11 @@ def probe_blender_backend() -> BlenderProbe:
     if blender is None:
         return BlenderProbe(
             available=False,
-            detail="bpy is unavailable and no bundled Blender fallback was found.",
+            detail=(
+                "bpy is unavailable and no Blender executable was found. Install the "
+                "official Blender build, add blender to PATH, or set "
+                f"{ENV_BLENDER}."
+            ),
             mode="blender_cli",
             script=str(BLENDER_SCRIPT),
         )
@@ -159,10 +255,21 @@ def probe_scene_backend_impl() -> BlenderProbe:
     if preferred == "blender":
         return probe_blender_backend()
 
+    # Prefer the separately signed Blender application on Windows. Besides
+    # giving application-control products a trusted executable boundary, this
+    # avoids repeatedly attempting to load a blocked PyPI ``bpy`` extension in
+    # every short-lived sidecar command. Systems without Blender retain the
+    # module fallback below.
+    if sys.platform == "win32":
+        blender_probe = probe_blender_backend()
+        if blender_probe.available:
+            return blender_probe
+
     bpy_probe = probe_bpy_backend()
     if bpy_probe.available:
         return bpy_probe
-    blender_probe = probe_blender_backend()
+    if sys.platform != "win32":
+        blender_probe = probe_blender_backend()
     if blender_probe.available:
         return blender_probe
 

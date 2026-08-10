@@ -10,7 +10,7 @@ import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 
-from flatrig.projection import (
+from flatrig._blender_projection import (
     compose_projection_plane_point,
     transform_direction_from_projection_space,
     transform_point_from_projection_space,

@@ -18,8 +18,56 @@ from flatrig.scene_formats import (
 )
 
 
+def test_windows_program_files_candidates_prefer_numeric_version(
+    monkeypatch, tmp_path
+) -> None:
+    import flatrig.scene_formats as scene_formats
+
+    for name in ("ProgramW6432", "PROGRAMFILES", "PROGRAMFILES(X86)"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path))
+    installs = [
+        tmp_path / "Blender Foundation" / version / "blender.exe"
+        for version in ("Blender 4.3", "Blender 4.10", "Blender 5.2")
+    ]
+    for executable in installs:
+        executable.parent.mkdir(parents=True)
+        executable.touch()
+
+    candidates = scene_formats._windows_program_files_blender_candidates()
+
+    assert candidates == [installs[2], installs[1], installs[0]]
+
+
+def test_resolve_blender_executable_uses_windows_app_path(
+    monkeypatch, tmp_path
+) -> None:
+    import flatrig.scene_formats as scene_formats
+
+    executable = tmp_path / "Blender 5.2" / "blender.exe"
+    executable.parent.mkdir()
+    executable.touch()
+    monkeypatch.delenv("FLATRIG_RETARGET_BLENDER", raising=False)
+    monkeypatch.setattr(scene_formats, "ROOT_DIR", tmp_path / "missing-sidecar-root")
+    monkeypatch.setattr(scene_formats.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(scene_formats.sys, "platform", "win32")
+    monkeypatch.setattr(
+        scene_formats,
+        "_windows_registry_blender_candidates",
+        lambda: [executable],
+    )
+    monkeypatch.setattr(
+        scene_formats,
+        "_windows_program_files_blender_candidates",
+        lambda: [],
+    )
+
+    assert scene_formats.resolve_blender_executable() == executable.resolve()
+
+
 def test_probe_scene_backend_prefers_bpy(monkeypatch) -> None:
     monkeypatch.delenv("FLATRIG_RETARGET_SCENE_BACKEND", raising=False)
+    monkeypatch.setattr("flatrig.scene_formats.sys.platform", "linux")
     monkeypatch.setattr(
         "flatrig.scene_formats.probe_bpy_backend",
         lambda: BlenderProbe(available=True, detail="ready", mode="bpy_module", script="worker.py"),
@@ -41,7 +89,37 @@ def test_probe_scene_backend_prefers_bpy(monkeypatch) -> None:
     assert payload["available"] is True
 
 
+def test_probe_scene_backend_prefers_blender_cli_on_windows(monkeypatch) -> None:
+    monkeypatch.delenv("FLATRIG_RETARGET_SCENE_BACKEND", raising=False)
+    monkeypatch.setattr("flatrig.scene_formats.sys.platform", "win32")
+    monkeypatch.setattr(
+        "flatrig.scene_formats.probe_blender_backend",
+        lambda: BlenderProbe(
+            available=True,
+            detail="ready",
+            mode="blender_cli",
+            executable="blender.exe",
+            script="worker.py",
+        ),
+    )
+
+    def unexpected_bpy_probe() -> BlenderProbe:
+        raise AssertionError("Windows auto mode must not import bpy when Blender is available")
+
+    monkeypatch.setattr(
+        "flatrig.scene_formats.probe_bpy_backend",
+        unexpected_bpy_probe,
+    )
+
+    probe = probe_scene_backend_impl()
+
+    assert probe.mode == "blender_cli"
+    assert probe.executable == "blender.exe"
+
+
 def test_inspect_source_uses_bpy_worker_when_available(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("FLATRIG_RETARGET_SCENE_BACKEND", "bpy")
+
     class Worker:
         @staticmethod
         def inspect_source(source: str) -> dict[str, object]:

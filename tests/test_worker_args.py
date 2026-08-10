@@ -8,6 +8,21 @@ TOOLS_DIR = Path(__file__).resolve().parents[1] / "tools"
 sys.path.insert(0, str(TOOLS_DIR))
 
 import blender_worker_args as worker_args  # noqa: E402
+from blender_worker_bootstrap import prepend_sidecar_src  # noqa: E402
+
+
+def test_worker_bootstrap_prepends_checkout_src_without_duplicates(tmp_path) -> None:
+    worker = tmp_path / "sidecar" / "tools" / "blender_scene_io.py"
+    expected_root = worker.parents[1]
+    expected_src = expected_root / "src"
+    search_path = ["embedded-site-packages", str(expected_src), str(expected_src)]
+
+    root, src = prepend_sidecar_src(worker, search_path)
+
+    assert root == expected_root.resolve()
+    assert src == expected_src.resolve()
+    assert search_path[0] == str(expected_src.resolve())
+    assert search_path.count(str(expected_src.resolve())) == 1
 
 
 def test_parse_vec3_arg_accepts_three_numeric_components() -> None:
