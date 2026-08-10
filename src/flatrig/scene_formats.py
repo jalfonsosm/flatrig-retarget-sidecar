@@ -21,6 +21,8 @@ ENV_BLENDER = "FLATRIG_RETARGET_BLENDER"
 ENV_SCENE_BACKEND = "FLATRIG_RETARGET_SCENE_BACKEND"
 DEFAULT_MACOS_BLENDER = Path("/Applications/Blender.app/Contents/MacOS/Blender")
 BLENDER_SCRIPT = ROOT_DIR / "tools" / "blender_scene_io.py"
+MINIMUM_BLENDER_VERSION = (4, 2)
+MINIMUM_BLENDER_VERSION_TEXT = ".".join(str(component) for component in MINIMUM_BLENDER_VERSION)
 
 
 @dataclass(slots=True)
@@ -30,6 +32,8 @@ class BlenderProbe:
     mode: str | None = None
     executable: str | None = None
     script: str | None = None
+    version: str | None = None
+    minimum_version: str | None = None
 
 
 @dataclass(slots=True)
@@ -66,6 +70,52 @@ def _blender_install_version(path: Path) -> tuple[int, ...]:
     if match is None:
         return ()
     return tuple(int(component) for component in match.group(1).split("."))
+
+
+def _parse_blender_version(text: str) -> tuple[int, ...] | None:
+    """Parse the first ``Blender X.Y[.Z]`` banner in command output."""
+
+    match = re.search(r"(?:^|\n)Blender\s+(\d+(?:\.\d+)+)", text, re.IGNORECASE)
+    if match is None:
+        return None
+    return tuple(int(component) for component in match.group(1).split("."))
+
+
+def _blender_version(path: Path) -> tuple[int, ...] | None:
+    """Read a Blender version without importing ``bpy``.
+
+    Official installer layouts encode the version in their parent directory,
+    which avoids starting a second process on the normal Windows path. Portable
+    and Steam installs are queried with the signed executable's ``--version``
+    mode.
+    """
+
+    install_version = _blender_install_version(path)
+    if install_version:
+        return install_version
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        completed = subprocess.run(
+            [str(path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            creationflags=creation_flags,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return _parse_blender_version(f"{completed.stdout}\n{completed.stderr}")
+
+
+def _format_blender_version(version: tuple[int, ...] | None) -> str | None:
+    if not version:
+        return None
+    return ".".join(str(component) for component in version)
 
 
 def _windows_registry_blender_candidates() -> list[Path]:
@@ -135,12 +185,82 @@ def _windows_program_files_blender_candidates() -> list[Path]:
     )
 
 
+def _windows_steam_roots() -> list[Path]:
+    """Return Steam library roots without requiring the Steamworks API."""
+
+    roots: list[Path] = []
+    try:
+        import winreg
+    except ImportError:
+        winreg = None
+
+    if winreg is not None:
+        registry_values = (
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Valve\Steam", "SteamPath"),
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Valve\Steam", "InstallPath"),
+        )
+        for hive, key_path, value_name in registry_values:
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    raw, _value_type = winreg.QueryValueEx(key, value_name)
+            except OSError:
+                continue
+            if isinstance(raw, str) and raw.strip():
+                roots.append(Path(os.path.expandvars(raw.strip())).expanduser())
+
+    program_files_x86 = os.environ.get("PROGRAMFILES(X86)")
+    if program_files_x86:
+        roots.append(Path(program_files_x86) / "Steam")
+
+    # Steam's VDF is intentionally parsed only for quoted `path` entries. This
+    # is sufficient across the old and new libraryfolders formats and avoids a
+    # dependency on a general Valve KeyValues parser in the public sidecar.
+    for steam_root in list(roots):
+        library_file = steam_root / "steamapps" / "libraryfolders.vdf"
+        try:
+            contents = library_file.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for match in re.finditer(r'"path"\s*"((?:\\.|[^"\\])*)"', contents):
+            value = match.group(1).replace(r"\\", "\\")
+            if value:
+                roots.append(Path(value))
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in roots:
+        normalized = os.path.normcase(str(root))
+        if normalized not in seen:
+            seen.add(normalized)
+            unique.append(root)
+    return unique
+
+
+def _windows_steam_blender_candidates() -> list[Path]:
+    return [
+        root / "steamapps" / "common" / "Blender" / "blender.exe"
+        for root in _windows_steam_roots()
+    ]
+
+
 def _resolve_windows_blender_executable() -> Path | None:
+    """Return the first *verified compatible* automatic Windows candidate.
+
+    App Paths and Steam can point at portable layouts whose parent directory
+    carries no version.  Validate each executable before selecting it so an
+    old or unverifiable registration cannot hide a compatible installation
+    later in Program Files or another Steam library.
+    """
+
     for candidate in (
         *_windows_registry_blender_candidates(),
         *_windows_program_files_blender_candidates(),
+        *_windows_steam_blender_candidates(),
     ):
-        if candidate.is_file():
+        if not candidate.is_file():
+            continue
+        version = _blender_version(candidate)
+        if version is not None and version >= MINIMUM_BLENDER_VERSION:
             return candidate.resolve()
     return None
 
@@ -162,14 +282,16 @@ def resolve_blender_executable() -> Path | None:
         if candidate.exists():
             return candidate.resolve()
 
-    resolved = shutil.which("blender")
-    if resolved:
-        return Path(resolved).resolve()
-
+    # Prefer registered installs on Windows. A stale/old `blender` earlier on
+    # PATH must not mask a compatible official or Steam installation.
     if sys.platform == "win32":
         resolved_windows = _resolve_windows_blender_executable()
         if resolved_windows is not None:
             return resolved_windows
+
+    resolved = shutil.which("blender")
+    if resolved:
+        return Path(resolved).resolve()
 
     if DEFAULT_MACOS_BLENDER.exists():
         return DEFAULT_MACOS_BLENDER.resolve()
@@ -224,12 +346,13 @@ def probe_blender_backend() -> BlenderProbe:
         return BlenderProbe(
             available=False,
             detail=(
-                "bpy is unavailable and no Blender executable was found. Install the "
-                "official Blender build, add blender to PATH, or set "
-                f"{ENV_BLENDER}."
+                f"Blender {MINIMUM_BLENDER_VERSION_TEXT}+ was not found. Install the "
+                "official Blender build from https://www.blender.org/download/, add "
+                f"blender to PATH, or set {ENV_BLENDER}."
             ),
             mode="blender_cli",
             script=str(BLENDER_SCRIPT),
+            minimum_version=MINIMUM_BLENDER_VERSION_TEXT,
         )
     if not BLENDER_SCRIPT.exists():
         return BlenderProbe(
@@ -238,13 +361,43 @@ def probe_blender_backend() -> BlenderProbe:
             mode="blender_cli",
             executable=str(blender),
             script=str(BLENDER_SCRIPT),
+            minimum_version=MINIMUM_BLENDER_VERSION_TEXT,
+        )
+    version = _blender_version(blender)
+    version_text = _format_blender_version(version)
+    if version is None:
+        return BlenderProbe(
+            available=False,
+            detail=(
+                f"Could not verify the Blender version at {blender}. Donatello requires "
+                f"Blender {MINIMUM_BLENDER_VERSION_TEXT}+."
+            ),
+            mode="blender_cli",
+            executable=str(blender),
+            script=str(BLENDER_SCRIPT),
+            minimum_version=MINIMUM_BLENDER_VERSION_TEXT,
+        )
+    if version < MINIMUM_BLENDER_VERSION:
+        return BlenderProbe(
+            available=False,
+            detail=(
+                f"Blender {version_text} is too old; Donatello requires Blender "
+                f"{MINIMUM_BLENDER_VERSION_TEXT}+."
+            ),
+            mode="blender_cli",
+            executable=str(blender),
+            script=str(BLENDER_SCRIPT),
+            version=version_text,
+            minimum_version=MINIMUM_BLENDER_VERSION_TEXT,
         )
     return BlenderProbe(
         available=True,
-        detail="ready",
+        detail=f"ready (Blender {version_text})",
         mode="blender_cli",
         executable=str(blender),
         script=str(BLENDER_SCRIPT),
+        version=version_text,
+        minimum_version=MINIMUM_BLENDER_VERSION_TEXT,
     )
 
 
@@ -255,21 +408,19 @@ def probe_scene_backend_impl() -> BlenderProbe:
     if preferred == "blender":
         return probe_blender_backend()
 
-    # Prefer the separately signed Blender application on Windows. Besides
-    # giving application-control products a trusted executable boundary, this
-    # avoids repeatedly attempting to load a blocked PyPI ``bpy`` extension in
-    # every short-lived sidecar command. Systems without Blender retain the
-    # module fallback below.
+    # Windows auto mode deliberately has no bpy fallback. Smart App Control can
+    # block the wheel's native ``bpy.pyd`` before Python can recover, while the
+    # official Blender executable provides the signed process boundary this
+    # worker needs. Developers may still request `bpy` explicitly above.
     if sys.platform == "win32":
-        blender_probe = probe_blender_backend()
-        if blender_probe.available:
-            return blender_probe
+        return probe_blender_backend()
 
+    # Linux and macOS keep the lower-overhead managed bpy module as the normal
+    # path, with Blender CLI retained only as a fallback.
     bpy_probe = probe_bpy_backend()
     if bpy_probe.available:
         return bpy_probe
-    if sys.platform != "win32":
-        blender_probe = probe_blender_backend()
+    blender_probe = probe_blender_backend()
     if blender_probe.available:
         return blender_probe
 

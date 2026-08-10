@@ -16,13 +16,13 @@ import math
 import bpy
 import numpy as np
 
-from flatrig._sidecar_import import orthonormalize_2x2, orthonormalize_3x3, safe_inverse_2x2
-from flatrig.projection import get_projection_reference_inverse
-from flatrig_private.projection_math import (
+from flatrig._blender_projection import (
+    get_projection_reference_inverse,
     project_direction_ortho,
     project_point_ortho,
     transform_direction_to_projection_space,
 )
+from flatrig._sidecar_import import orthonormalize_2x2, orthonormalize_3x3, safe_inverse_2x2
 
 # Pure 2D animation math (no ``bpy``). Re-exported so callers that still do
 # ``from flatrig.animation import _stabilize_frame_local_poses_2d`` (etc.)

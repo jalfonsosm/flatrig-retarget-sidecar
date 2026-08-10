@@ -82,3 +82,21 @@ def test_exported_helpers_are_importable_by_name():
         name for name in getattr(animation_math, "__all__", ()) if not hasattr(animation_math, name)
     )
     assert not missing, f"__all__ lists names animation_math does not define: {missing}"
+
+
+def test_animation_projection_uses_the_public_blender_bridge():
+    tree = ast.parse(ANIMATION_SOURCE.read_text(encoding="utf-8"))
+    imports = {
+        node.module: {alias.name for alias in node.names}
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+    }
+
+    assert imports["flatrig._blender_projection"] >= {
+        "get_projection_reference_inverse",
+        "project_direction_ortho",
+        "project_point_ortho",
+        "transform_direction_to_projection_space",
+    }
+    assert "flatrig.projection" not in imports
+    assert "flatrig_private.projection_math" not in imports

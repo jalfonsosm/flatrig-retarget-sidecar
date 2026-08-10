@@ -30,16 +30,24 @@ Run tests:
 python -m pytest
 ```
 
-The scene worker uses the installed `bpy` module when it can be loaded. On
-Windows, automatic mode first looks for a separate Blender process so an
-application-control policy never has to load an unsigned Python extension. It
-discovers the official installer through the `App Paths` registry entry and the
-standard `Program Files/Blender Foundation` layout. Portable installs can be
-selected with `FLATRIG_RETARGET_BLENDER` or by putting `blender` on `PATH`; no
-security-policy exception is required. If no Blender executable is present,
-automatic mode retains the `bpy` module fallback. The Blender worker adds this
-checkout's `src` directory itself, so the CLI fallback does not depend on
-`PYTHONPATH` or Blender's `--python-use-system-env` option.
+On Linux and macOS the scene worker first uses the installed `bpy` module and
+keeps a separate Blender process as its fallback. Windows intentionally uses a
+different policy: automatic mode requires the official Blender 4.2+ executable
+and never imports the pip wheel's native `bpy.pyd`, which application-control
+products can block before Python can recover. An explicit
+`FLATRIG_RETARGET_SCENE_BACKEND=bpy` remains available for development only.
+The normal Windows package does not install the `bpy` wheel at all; installing
+the documented `.[dev]` extra adds it for sidecar tests and diagnostics.
+
+Windows discovery checks `FLATRIG_RETARGET_BLENDER`, bundled/portable layouts,
+`PATH`, the official installer's `App Paths` registration, standard
+`Program Files/Blender Foundation` installs, and Blender installed in a Steam
+library. `python -m flatrig.cli probe` reports the selected path, detected
+version, and minimum version. Blender 5.x is recommended; 5.2 is the version
+used for the current Windows integration validation. No security-policy
+exception is required. The
+Blender worker adds this checkout's `src` directory itself, so the CLI path does
+not depend on `PYTHONPATH` or Blender's `--python-use-system-env` option.
 
 The private FlatRig repository fetches this sidecar during CMake configure. When
 developing both repositories side by side, edit the canonical sibling checkout,

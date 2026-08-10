@@ -12,11 +12,16 @@ requires-python = ">=3.11,<3.12"
 # Blender-worker only.
 dependencies = [
   "numpy<2,>=1.26",
-  "bpy==5.0.1",
+  # Windows production uses the separately signed Blender CLI. Keeping the
+  # native bpy wheel out of that runtime avoids Smart App Control blocking it.
+  "bpy==5.0.1; sys_platform != 'win32'",
 ]
 
 [project.optional-dependencies]
 dev = [
+  # Explicit Windows bpy-mode remains available to sidecar developers without
+  # putting the wheel back into Donatello's production runtime.
+  "bpy==5.0.1; sys_platform == 'win32'",
   "pre-commit>=3.7,<5",
   "pytest>=8.2,<9",
   "pytest-cov>=5,<7",
