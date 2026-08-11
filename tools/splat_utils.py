@@ -48,6 +48,45 @@ _MAX_INFLUENCES = 4
 _CHUNK = 65536
 
 
+def _write_skin_table(path, bone_names, indices, weights):
+    """Write the per-splat skinning table the sprite renderer poses the cloud with.
+
+    Binary, because a 262k-point cloud with four influences is a million index
+    and weight pairs: as JSON that is tens of megabytes to write and parse for
+    every render.
+
+    Layout (little-endian, the only byte order this pipeline runs on)::
+
+        "FRSKIN1\\n"                     8 bytes
+        uint32 splat_count, bone_count, influences
+        bone_count x (uint32 length, utf-8 name)
+        uint16 indices[splat_count * influences]
+        float32 weights[splat_count * influences]
+
+    ``bone_names`` is the authoritative slot order: whoever renders this cloud
+    must supply one pose matrix per entry, in this order. Slot 0 is the identity
+    fallback carried by ``_vertex_influence_tables`` for splats with no usable
+    weight, and it is named so the contract cannot be mistaken for a real bone.
+    """
+    influences = indices.shape[1]
+    packed_indices = np.ascontiguousarray(indices, dtype=np.uint16)
+    packed_weights = np.ascontiguousarray(weights, dtype=np.float32)
+    with open(path, "wb") as stream:
+        stream.write(b"FRSKIN1\n")
+        stream.write(
+            np.asarray(
+                [len(indices), len(bone_names), influences], dtype="<u4"
+            ).tobytes()
+        )
+        for name in bone_names:
+            encoded = name.encode("utf-8")
+            stream.write(np.asarray([len(encoded)], dtype="<u4").tobytes())
+            stream.write(encoded)
+        stream.write(packed_indices.tobytes())
+        stream.write(packed_weights.tobytes())
+    return path
+
+
 def _read_ply(path):
     """Return ``(header_lines, points)`` for a binary little-endian 3DGS PLY."""
     with open(path, "rb") as stream:
@@ -313,6 +352,7 @@ def _write_carried_splat(splat_path, output_path, normalization_matrix, mesh_obj
     )
 
     dominant_bones = {}
+    skin_table = None
     if mesh_obj is not None and armature_obj is not None and mesh_obj.vertex_groups:
         rest_world, rest_groups = _rest_pose_reference(mesh_obj, armature_obj)
         bone_matrices, bone_index_by_name, bone_names = _world_skinning_matrices(armature_obj)
@@ -351,6 +391,16 @@ def _write_carried_splat(splat_path, output_path, normalization_matrix, mesh_obj
             for index, bone in zip(rows[weighted], dominant_indices[weighted])
         }
 
+        # The full influence table, kept rather than reduced to the dominant
+        # bone: the sprite renderer re-poses this cloud for every animation
+        # frame, and a one-bone approximation would tear every joint it crosses.
+        skin_table = _write_skin_table(
+            os.path.splitext(output_path)[0] + ".skin",
+            ["__identity__", *bone_names],
+            splat_bones,
+            splat_weights,
+        )
+
     points[:, 0:3] = world_positions
     points[:, _ROT] = world_rotations
     _write_ply(output_path, header, points)
@@ -364,6 +414,7 @@ def _write_carried_splat(splat_path, output_path, normalization_matrix, mesh_obj
         "input": splat_path,
         "output": output_path,
         "weights": weights_path,
+        "skin": skin_table,
         "count": int(len(points)),
         "skinned": int(len(dominant_bones)),
         "normalization_yaw_deg": round(
