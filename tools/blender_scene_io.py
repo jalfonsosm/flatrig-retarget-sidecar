@@ -1272,39 +1272,6 @@ def inspect_source(source_path: str) -> dict[str, object]:
     return payload
 
 
-def convert_source(source_path: str, output_path: str) -> dict[str, object]:
-    bpy.ops.wm.read_factory_settings(use_empty=True)
-    import_model(source_path)
-
-    output = Path(output_path)
-    output.parent.mkdir(parents=True, exist_ok=True)
-
-    export_path = output
-    if export_path.suffix.lower() != ".glb":
-        export_path = export_path.with_suffix(".glb")
-
-    bpy.ops.export_scene.gltf(
-        filepath=str(export_path),
-        export_format="GLB",
-        export_yup=True,
-        export_animations=True,
-        export_skins=True,
-        export_texcoords=True,
-        export_normals=True,
-        export_materials="EXPORT",
-    )
-
-    inspected = inspect_source(str(export_path))
-    return {
-        "ok": True,
-        "detail": "converted",
-        "source": source_path,
-        "output": str(export_path),
-        "target_format": "glb",
-        "inspection": inspected,
-    }
-
-
 def _drop_debris_islands(mesh_obj, min_dimension_fraction: float = 0.1):
     """Split loose parts and delete floating debris islands.
 
@@ -4026,8 +3993,6 @@ def main() -> None:
 
     if args.command == "inspect":
         payload = inspect_source(source_path)
-    elif args.command == "convert":
-        payload = convert_source(source_path, str(output_path))
     elif args.command == "extract-scene":
         payload = extract_scene_cli(
             source_path,

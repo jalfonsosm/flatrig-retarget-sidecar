@@ -8,7 +8,6 @@ from collections.abc import Iterable, Sequence
 
 WORKER_COMMANDS = (
     "inspect",
-    "convert",
     "extract-scene",
     "extract-animations",
     "render-sprites",

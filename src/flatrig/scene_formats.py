@@ -453,8 +453,6 @@ def _run_bpy_command(command: str, source: str, output: str) -> SceneCommandResu
         source_path = str(Path(source).expanduser().resolve())
         if command == "inspect":
             payload = worker.inspect_source(source_path)
-        elif command == "convert":
-            payload = worker.convert_source(source_path, str(output_path))
         else:  # pragma: no cover - internal contract
             raise ValueError(f"Unsupported scene command: {command}")
         output_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
@@ -621,13 +619,6 @@ def inspect_3d_source(source: str, output: str) -> SceneCommandResult:
     if probe.mode == "bpy_module" and probe.available:
         return _run_bpy_command("inspect", source, output)
     return _run_blender_command("inspect", source, output)
-
-
-def convert_3d_source(source: str, output: str) -> SceneCommandResult:
-    probe = probe_scene_backend_impl()
-    if probe.mode == "bpy_module" and probe.available:
-        return _run_bpy_command("convert", source, output)
-    return _run_blender_command("convert", source, output)
 
 
 def _run_blender_command_with_args(

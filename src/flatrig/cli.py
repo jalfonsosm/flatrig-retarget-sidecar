@@ -15,7 +15,6 @@ from flatrig.scene_formats import (
     bake_predicted_rig,
     bake_rig_animation,
     cleanup_mesh,
-    convert_3d_source,
     dump_rig_animation,
     export_3d_animation_bvh,
     export_3d_rest_bvh,
@@ -73,14 +72,6 @@ def main() -> None:
     )
     inspect_3d_parser.add_argument("source")
     inspect_3d_parser.add_argument("--output", required=True)
-
-
-    convert_3d_parser = subparsers.add_parser(
-        "convert-3d-source",
-        help="normalize a 3D source through Blender into a format the native app can consume",
-    )
-    convert_3d_parser.add_argument("source")
-    convert_3d_parser.add_argument("--output", required=True)
 
 
     extract_scene_parser = subparsers.add_parser(
@@ -326,12 +317,6 @@ def main() -> None:
 
     if args.command == "inspect-3d-source":
         result = inspect_3d_source(args.source, args.output)
-        _emit_result(result)
-        return
-
-
-    if args.command == "convert-3d-source":
-        result = convert_3d_source(args.source, args.output)
         _emit_result(result)
         return
 
