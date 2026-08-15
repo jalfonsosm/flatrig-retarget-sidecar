@@ -265,6 +265,15 @@ def main() -> None:
     )
     cleanup_mesh_parser.add_argument("--target-triangles", type=int, default=10000)
     cleanup_mesh_parser.add_argument(
+        "--handle-tolerance",
+        type=int,
+        default=0,
+        help=(
+            "handles the cleaned surface may keep (0 = closed and genus 0). "
+            "Closed, single-component and consistently wound stay required"
+        ),
+    )
+    cleanup_mesh_parser.add_argument(
         "--no-voxel-remesh", dest="voxel_remesh", action="store_false", default=True
     )
     cleanup_mesh_parser.add_argument(
@@ -428,6 +437,7 @@ def main() -> None:
             remove_loose=args.remove_loose,
             fbx_output=args.fbx_output,
             orientation_fix=args.orientation_fix,
+            handle_tolerance=args.handle_tolerance,
         )
         _emit_result(result)
         return

@@ -748,6 +748,7 @@ def cleanup_mesh(
     remove_loose: bool = True,
     fbx_output: str | None = None,
     orientation_fix: str = "none",
+    handle_tolerance: int = 0,
 ) -> SceneCommandResult:
     """Clean a raw generated mesh (image-to-3D output) for auto-rigging.
 
@@ -772,6 +773,8 @@ def cleanup_mesh(
         extra_args.append("--no-voxel-remesh")
     if not remove_loose:
         extra_args.append("--no-remove-loose")
+    if int(handle_tolerance) > 0:
+        extra_args.extend(["--handle-tolerance", str(int(handle_tolerance))])
 
     probe = probe_scene_backend_impl()
     if probe.mode == "bpy_module" and probe.available:

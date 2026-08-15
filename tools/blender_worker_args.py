@@ -226,6 +226,19 @@ def parse_worker_args(
         help="Triangle budget for cleanup-mesh decimation (0 disables)",
     )
     parser.add_argument(
+        "--handle-tolerance",
+        type=int,
+        default=0,
+        help=(
+            "Handles the cleaned surface may keep and still satisfy the "
+            "cleanup contract (0 = the closed, zero-handle default). Closed, "
+            "single-component and consistently wound stay required either way; "
+            "the caller owns the number because whether a handle is real "
+            "character topology or a reconstruction artifact is a product "
+            "judgement, not one this tool can make"
+        ),
+    )
+    parser.add_argument(
         "--no-voxel-remesh",
         dest="voxel_remesh",
         action="store_false",

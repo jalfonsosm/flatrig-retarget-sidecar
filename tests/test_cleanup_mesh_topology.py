@@ -70,6 +70,59 @@ def test_cleanup_restores_decimation_rejected_by_topology_guard(tmp_path, monkey
     assert report["output"] is None
 
 
+def _import_synthetic_torus(_source_path: str) -> None:
+    """A closed, single-piece, consistently wound surface with one handle."""
+    bpy.ops.mesh.primitive_torus_add(major_segments=32, minor_segments=16)
+    bpy.context.object.name = "synthetic_cleanup_torus"
+
+
+def test_a_handle_fails_the_contract_unless_the_caller_allows_one(
+    tmp_path, monkeypatch
+):
+    """The tolerance is the caller's to set, and 0 stays the default.
+
+    Whether a handle is real character topology -- a hand resting on a hip --
+    or a reconstruction artifact is a product judgement this tool cannot make,
+    so it enforces the number it is given rather than choosing one. Nothing
+    else moves: the surface still has to be closed and single-piece.
+    """
+    monkeypatch.setattr(scene_io, "import_model", _import_synthetic_torus)
+
+    strict = scene_io.cleanup_generated_mesh(
+        "synthetic.glb",
+        glb_output=str(tmp_path / "strict.glb"),
+        target_triangles=0,
+        voxel_remesh=False,
+        remove_loose=False,
+    )
+
+    assert strict["topology_after"]["handles"] == 1
+    assert strict["handle_tolerance"] == 0
+    assert strict["strict_topology_satisfied"] is False
+    assert "closed_zero_handle_topology_not_satisfied" in strict["contract_issues"]
+    assert strict["contract_ok"] is False
+    # A refused contract writes no mesh at all, which is why the caller's
+    # tolerance has to reach this far and not just the report it reads back.
+    assert strict["output"] is None
+
+    monkeypatch.setattr(scene_io, "import_model", _import_synthetic_torus)
+    tolerant = scene_io.cleanup_generated_mesh(
+        "synthetic.glb",
+        glb_output=str(tmp_path / "tolerant.glb"),
+        target_triangles=0,
+        voxel_remesh=False,
+        remove_loose=False,
+        handle_tolerance=1,
+    )
+
+    assert tolerant["topology_after"]["handles"] == 1
+    assert tolerant["handle_tolerance"] == 1
+    assert tolerant["strict_topology_satisfied"] is True
+    assert "closed_zero_handle_topology_not_satisfied" not in tolerant["contract_issues"]
+    assert tolerant["contract_ok"] is True
+    assert Path(tolerant["output"]).exists()
+
+
 def test_open_surface_decimation_cannot_create_new_components():
     before = {
         "readable": True,

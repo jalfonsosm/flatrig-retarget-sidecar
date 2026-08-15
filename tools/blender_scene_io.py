@@ -1373,6 +1373,7 @@ def cleanup_generated_mesh(
     remove_loose: bool = True,
     fbx_output: str | None = None,
     orientation_fix: str = "none",
+    handle_tolerance: int = 0,
 ) -> dict[str, object]:
     """Prepare a raw image-to-3D mesh for auto-rigging.
 
@@ -1516,12 +1517,24 @@ def cleanup_generated_mesh(
         and not topology_validation_issues
         and decimation_error is None
     )
+    # Closed, single-piece and consistently wound are non-negotiable; only the
+    # handle count moves, and only as far as the caller asked. A handle can be
+    # real character topology (a hand resting on a hip) or a reconstruction
+    # artifact, and this tool cannot tell them apart -- so it enforces the
+    # number rather than choosing it, and reports which one it applied.
+    allowed_handles = max(0, int(handle_tolerance))
+    measured_handles = topology_after.get("handles")
     strict_topology_satisfied = bool(
         topology_after.get("valid")
         and topology_after.get("watertight")
         and topology_after.get("components") == 1
-        and topology_after.get("euler") == 2
-        and topology_after.get("handles") == 0
+        and isinstance(measured_handles, int)
+        and not isinstance(measured_handles, bool)
+        and 0 <= measured_handles <= allowed_handles
+        # Euler is the measured quantity and the handle count is derived from
+        # it, so requiring both to agree keeps a bad derivation from widening
+        # the gate on its own.
+        and topology_after.get("euler") == 2 - 2 * measured_handles
     )
     contract_issues = []
     if int(target_triangles) > 0 and not budget_satisfied:
@@ -1599,6 +1612,9 @@ def cleanup_generated_mesh(
         "decimation_error": decimation_error,
         "topology_validated": topology_validated,
         "strict_topology_satisfied": strict_topology_satisfied,
+        # Echoed so the caller can tell "this mesh is genus 0" from "this mesh
+        # was accepted under the tolerance I asked for".
+        "handle_tolerance": allowed_handles,
         "contract_ok": cleanup_contract_ok,
         "contract_issues": contract_issues,
         "topology_validation_issues": topology_validation_issues,
@@ -4109,6 +4125,7 @@ def main() -> None:
             remove_loose=args.remove_loose,
             fbx_output=args.fbx_output,
             orientation_fix=args.orientation_fix,
+            handle_tolerance=getattr(args, "handle_tolerance", 0),
         )
     elif args.command == "bake-predicted-rig":
         if not args.fbx_output:
