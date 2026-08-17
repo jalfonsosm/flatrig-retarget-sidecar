@@ -28,6 +28,8 @@ import numpy as np
 try:
     import bpy
     import mathutils
+    import mathutils.bvhtree  # noqa: F401 - submodule, not exposed by `import mathutils`
+    import mathutils.kdtree  # noqa: F401 - same
 except ImportError:  # pragma: no cover - import-time guard for non-Blender use
     bpy = None
     mathutils = None
@@ -204,11 +206,13 @@ def _orthonormalize(matrices):
 
 
 def _rest_pose_reference(mesh_obj, armature_obj):
-    """Rest-pose world vertices plus their per-bone weights.
+    """Rest-pose world vertices, their per-bone weights, and the triangle list.
 
-    The splat cloud was generated against the un-posed model, so the nearest
-    neighbour search has to run against the rest shape even when the scene is
-    currently sitting on a setup/donor frame.
+    The splat cloud was generated against the un-posed model, so the closest
+    surface search has to run against the rest shape even when the scene is
+    currently sitting on a setup/donor frame. The triangles come along because
+    the weight lookup interpolates across a face rather than snapping to a
+    vertex -- see `_surface_influence_tables`.
     """
     previous_position = None
     if armature_obj is not None:
@@ -223,6 +227,10 @@ def _rest_pose_reference(mesh_obj, armature_obj):
             local = np.empty((len(rest_mesh.vertices), 3), dtype=np.float64)
             rest_mesh.vertices.foreach_get("co", local.reshape(-1))
             groups = [[(g.group, g.weight) for g in v.groups] for v in rest_mesh.vertices]
+            rest_mesh.calc_loop_triangles()
+            triangles = np.empty((len(rest_mesh.loop_triangles), 3), dtype=np.int32)
+            if len(triangles):
+                rest_mesh.loop_triangles.foreach_get("vertices", triangles.reshape(-1))
         finally:
             evaluated.to_mesh_clear()
     finally:
@@ -231,7 +239,7 @@ def _rest_pose_reference(mesh_obj, armature_obj):
             bpy.context.view_layer.update()
 
     world = _transform_points(local, _matrix_to_numpy(mesh_obj.matrix_world))
-    return world, groups
+    return world, groups, triangles
 
 
 def _vertex_influence_tables(groups, group_index_to_bone, bone_index_by_name):
@@ -305,6 +313,148 @@ def _nearest_rest_vertices(rest_world, query_points):
     return nearest
 
 
+def _barycentric_coordinates(corners, points):
+    """Barycentric coordinates of (N, 3) `points` in (N, 3, 3) triangle `corners`.
+
+    The caller hands in points that already lie on their triangle, so this is a
+    plain solve rather than a closest-point clamp; the clip afterwards only
+    absorbs numerical slop and degenerate faces, which resolve to the first
+    corner rather than to a negative weight.
+    """
+    origin = corners[:, 0, :]
+    edge_a = corners[:, 1, :] - origin
+    edge_b = corners[:, 2, :] - origin
+    offset = points - origin
+
+    daa = np.einsum("ni,ni->n", edge_a, edge_a)
+    dab = np.einsum("ni,ni->n", edge_a, edge_b)
+    dbb = np.einsum("ni,ni->n", edge_b, edge_b)
+    dpa = np.einsum("ni,ni->n", offset, edge_a)
+    dpb = np.einsum("ni,ni->n", offset, edge_b)
+
+    denominator = daa * dbb - dab * dab
+    degenerate = np.abs(denominator) <= 1e-20
+    safe = np.where(degenerate, 1.0, denominator)
+    beta = (dbb * dpa - dab * dpb) / safe
+    gamma = (daa * dpb - dab * dpa) / safe
+
+    bary = np.stack((1.0 - beta - gamma, beta, gamma), axis=1)
+    bary[degenerate] = (1.0, 0.0, 0.0)
+    np.clip(bary, 0.0, 1.0, out=bary)
+    total = bary.sum(axis=1, keepdims=True)
+    return bary / np.maximum(total, 1e-12)
+
+
+def _blend_influence_rows(corner_vertices, bary, vertex_bones, vertex_weights, bone_count):
+    """Interpolate three vertices' influence rows into one (N, _MAX_INFLUENCES) pair.
+
+    Three corners with four influences each give up to twelve candidate bones
+    per splat, so the merge runs through a dense per-bone row and then keeps the
+    strongest four -- the same budget every vertex row already carries. Rows are
+    built in chunks because the dense stage is `chunk * bone_count` wide.
+    """
+    count = len(corner_vertices)
+    indices = np.zeros((count, _MAX_INFLUENCES), dtype=np.int32)
+    weights = np.zeros((count, _MAX_INFLUENCES), dtype=np.float64)
+    weights[:, 0] = 1.0
+    if count == 0:
+        return indices, weights
+
+    keep = min(_MAX_INFLUENCES, bone_count)
+    for start in range(0, count, _CHUNK):
+        stop = min(start + _CHUNK, count)
+        corners = corner_vertices[start:stop]
+        span = stop - start
+        dense = np.zeros((span, bone_count), dtype=np.float64)
+        rows = np.repeat(np.arange(span), 3 * _MAX_INFLUENCES)
+        bones = vertex_bones[corners].reshape(-1)
+        contribution = (
+            vertex_weights[corners] * bary[start:stop][:, :, np.newaxis]
+        ).reshape(-1)
+        np.add.at(dense, (rows, bones), contribution)
+
+        chosen = np.argpartition(-dense, keep - 1, axis=1)[:, :keep]
+        picked = np.take_along_axis(dense, chosen, axis=1)
+        order = np.argsort(-picked, axis=1)
+        chosen = np.take_along_axis(chosen, order, axis=1)
+        picked = np.take_along_axis(picked, order, axis=1)
+
+        total = picked.sum(axis=1, keepdims=True)
+        usable = total[:, 0] > 0.0
+        chosen = np.where(picked > 0.0, chosen, 0)
+        picked = np.divide(picked, np.maximum(total, 1e-12))
+
+        target = slice(start, stop)
+        indices[target, :keep] = np.where(usable[:, np.newaxis], chosen, 0)
+        weights[target, :keep] = np.where(usable[:, np.newaxis], picked, 0.0)
+        # A splat whose three corners carry nothing keeps the identity fallback.
+        weights[target, 0] = np.where(usable, weights[target, 0], 1.0)
+    return indices, weights
+
+
+def _nearest_rest_surface(rest_world, triangles, query_points):
+    """Closest point on the rest surface for each query point.
+
+    Returns the hit triangle index and the location, both per query point.
+    Points the tree cannot resolve come back with triangle -1.
+    """
+    tree = mathutils.bvhtree.BVHTree.FromPolygons(
+        [tuple(float(axis) for axis in vertex) for vertex in rest_world],
+        [tuple(int(corner) for corner in triangle) for triangle in triangles],
+        all_triangles=True,
+    )
+
+    hit_triangle = np.full(len(query_points), -1, dtype=np.int32)
+    hit_location = np.zeros((len(query_points), 3), dtype=np.float64)
+    find_nearest = tree.find_nearest
+    for index, point in enumerate(query_points):
+        location, _, triangle, _ = find_nearest(
+            (float(point[0]), float(point[1]), float(point[2]))
+        )
+        if triangle is None:
+            continue
+        hit_triangle[index] = triangle
+        hit_location[index] = (location[0], location[1], location[2])
+    return hit_triangle, hit_location
+
+
+def _surface_influence_tables(
+    rest_world, triangles, vertex_bones, vertex_weights, query_points, bone_count
+):
+    """Per-splat influences sampled from the rest surface, not from one vertex.
+
+    Snapping each splat to its nearest rest *vertex* makes the skinning field
+    piecewise constant over that vertex's Voronoi cell. A 260k-point cloud over
+    a decimated rest mesh puts roughly a hundred splats in every cell, so whole
+    patches of the cloud move as one rigid block and the seams between blocks
+    tear open wherever the weights change quickly -- under the armpits first,
+    then the groin and the elbows. Interpolating the three corners of the
+    closest triangle instead makes the field continuous across the surface, and
+    because the three corners always belong to the same face it cannot blend
+    across the gap between two limbs that merely happen to be close.
+
+    Falls back to the nearest vertex when there is no triangle to land on.
+    """
+    if len(triangles) == 0:
+        nearest = _nearest_rest_vertices(rest_world, query_points)
+        return vertex_bones[nearest], vertex_weights[nearest]
+
+    hit_triangle, hit_location = _nearest_rest_surface(rest_world, triangles, query_points)
+    resolved = hit_triangle >= 0
+    corner_vertices = triangles[np.clip(hit_triangle, 0, len(triangles) - 1)]
+    bary = _barycentric_coordinates(rest_world[corner_vertices], hit_location)
+    indices, weights = _blend_influence_rows(
+        corner_vertices, bary, vertex_bones, vertex_weights, bone_count
+    )
+
+    if not resolved.all():
+        missed = np.where(~resolved)[0]
+        nearest = _nearest_rest_vertices(rest_world, query_points[missed])
+        indices[missed] = vertex_bones[nearest]
+        weights[missed] = vertex_weights[nearest]
+    return indices, weights
+
+
 def carry_splat_to_world(splat_path, output_path, *, normalization_matrix=None):
     """Re-express a cloud in normalized world space, without skinning it.
 
@@ -354,16 +504,21 @@ def _write_carried_splat(splat_path, output_path, normalization_matrix, mesh_obj
     dominant_bones = {}
     skin_table = None
     if mesh_obj is not None and armature_obj is not None and mesh_obj.vertex_groups:
-        rest_world, rest_groups = _rest_pose_reference(mesh_obj, armature_obj)
+        rest_world, rest_groups, rest_triangles = _rest_pose_reference(mesh_obj, armature_obj)
         bone_matrices, bone_index_by_name, bone_names = _world_skinning_matrices(armature_obj)
         group_index_to_bone = {group.index: group.name for group in mesh_obj.vertex_groups}
         vertex_bones, vertex_weights = _vertex_influence_tables(
             rest_groups, group_index_to_bone, bone_index_by_name
         )
 
-        nearest = _nearest_rest_vertices(rest_world, world_positions)
-        splat_bones = vertex_bones[nearest]
-        splat_weights = vertex_weights[nearest]
+        splat_bones, splat_weights = _surface_influence_tables(
+            rest_world,
+            rest_triangles,
+            vertex_bones,
+            vertex_weights,
+            world_positions,
+            len(bone_matrices),
+        )
 
         for start in range(0, len(points), _CHUNK):
             stop = min(start + _CHUNK, len(points))
