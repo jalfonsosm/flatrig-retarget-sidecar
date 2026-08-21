@@ -3602,22 +3602,37 @@ def _extract_transferred_animation(
 
 
 def _split_sprite_render_manifest(entries):
-    """Separate the optional full-scene reference from legacy part entries.
+    """Separate the optional reference and lighting entries from part entries.
 
     Part entries intentionally need no ``kind`` field so manifests produced by
     older FlatRig builds remain valid. A reference is returned separately and
     must never contribute to the ``renders`` list: native callers use that
-    list's length as the part-count compatibility contract.
+    list's length as the part-count compatibility contract. Lighting is
+    returned separately for the same reason.
+
+    An unknown ``kind`` stays an error rather than being skipped, and the
+    lighting entry is exactly why that matters: a sidecar too old to know the
+    kind must fail loudly, not render every sprite unlit while the caller
+    believes it asked for a light. The native side re-checks anyway via the
+    ``applied_lighting`` acknowledgement in the payload.
     """
     if not isinstance(entries, list):
         raise ValueError("Sprite render manifest must be a JSON array")
 
     parts = []
     reference = None
+    lighting = None
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ValueError(f"Sprite render manifest entry {index} must be an object")
         kind = str(entry.get("kind") or "part")
+        if kind == "lighting":
+            if lighting is not None:
+                raise ValueError(
+                    "Sprite render manifest may contain only one lighting entry"
+                )
+            lighting = entry
+            continue
         if kind == "reference":
             if reference is not None:
                 raise ValueError("Sprite render manifest may contain only one reference entry")
@@ -3636,7 +3651,7 @@ def _split_sprite_render_manifest(entries):
         if kind != "part":
             raise ValueError(f"Unknown sprite render manifest kind: {kind}")
         parts.append(entry)
-    return parts, reference
+    return parts, reference, lighting
 
 
 def _resolve_reference_triangle_groups(reference, mesh_by_name, primary_mesh):
@@ -3800,7 +3815,7 @@ def render_sprites_cli(
         return {"ok": False, "detail": f"parts-json not found: {parts_path}"}
 
     manifest = json_module.loads(parts_path.read_text(encoding="utf-8"))
-    parts, reference_request = _split_sprite_render_manifest(manifest)
+    parts, reference_request, lighting = _split_sprite_render_manifest(manifest)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if bind_frame > 0:
@@ -3869,6 +3884,19 @@ def render_sprites_cli(
             else None
         )
 
+        # The half vector needs the eye direction, and the light block on the
+        # wire does not carry one: it is a property of the view, not of the
+        # light. `depth_axis` already points from the model back at the camera,
+        # which is exactly what `SpriteShadingContext::resolve` passes as
+        # `towards_camera` on the native side.
+        if isinstance(lighting, dict) and lighting.get("enabled"):
+            lighting = dict(lighting)
+            lighting["to_eye"] = tuple(
+                float(component) for component in view_cfg["depth_axis"]
+            )
+        else:
+            lighting = None
+
         reference_result = None
         if reference_request is not None:
             requested_path = Path(str(reference_request["output_path"])).expanduser()
@@ -3897,6 +3925,7 @@ def render_sprites_cli(
                     bind_frame=render_frame,
                     projection_matrix=projection_matrix,
                     triangle_groups=reference_triangle_groups,
+                    lighting=lighting,
                 )
             finally:
                 if rest_pose_state:
@@ -3952,6 +3981,7 @@ def render_sprites_cli(
                 use_rest_pose=use_rest_pose,
                 projection_matrix=projection_matrix,
                 core_triangle_keys=core_triangle_keys,
+                lighting=lighting,
             )
             part_seconds = time.perf_counter() - part_started
             render_seconds += part_seconds
@@ -3979,6 +4009,12 @@ def render_sprites_cli(
             "mesh_reduction": mesh_reduction_report,
             "mesh_reduction_summary": mesh_reduction_summary,
             "renders": renders,
+            # An applied-filter acknowledgement, not an echo of the request --
+            # the same contract `applied_triangle_filter` uses on the reference
+            # entry. A caller that asked for a light and gets False back is
+            # talking to a sidecar that rendered the sheet unlit, which is a
+            # silently wrong image rather than a failure it could otherwise see.
+            "applied_lighting": lighting is not None,
             # Which engine/device actually ran, and how much of this command's
             # wall time was spent rendering rather than importing, reducing and
             # splitting the mesh. Without this the only way to tell an Eevee

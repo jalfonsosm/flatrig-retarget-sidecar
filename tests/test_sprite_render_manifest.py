@@ -37,20 +37,22 @@ def test_reference_entry_is_not_counted_as_a_part_render():
         "object_name": "Sword",
     }
 
-    parts, reference = scene_io._split_sprite_render_manifest(
+    parts, reference, lighting = scene_io._split_sprite_render_manifest(
         [legacy_part, _reference_entry(), accessory_part]
     )
 
     assert parts == [legacy_part, accessory_part]
     assert reference == _reference_entry()
+    assert lighting is None
     assert parts[1]["object_name"] == "Sword"
 
 
 def test_reference_entry_is_optional_for_legacy_manifests():
-    parts, reference = scene_io._split_sprite_render_manifest([{"name": "body"}])
+    parts, reference, lighting = scene_io._split_sprite_render_manifest([{"name": "body"}])
 
     assert parts == [{"name": "body"}]
     assert reference is None
+    assert lighting is None
 
 
 def test_filtered_reference_resolves_only_exported_objects_and_deduplicated_keys():
@@ -104,3 +106,43 @@ def test_reference_contract_rejects_ambiguous_or_incomplete_entries():
     missing_object = _filtered_reference_entry()
     with pytest.raises(ValueError, match="object not found: Body"):
         scene_io._resolve_reference_triangle_groups(missing_object, {}, object())
+
+
+def _lighting_entry():
+    return {
+        "kind": "lighting",
+        "enabled": True,
+        "direction": [-1.0, 0.0, -1.0],
+        "ambient": {"color": [0.45, 0.52, 0.68], "intensity": 0.35},
+        "diffuse": {"color": [1.0, 0.98, 0.94], "intensity": 1.0},
+        "softness": 0.35,
+    }
+
+
+def test_lighting_entry_is_not_counted_as_a_part_render():
+    """Native callers use len(renders) as the part-count compatibility contract."""
+    part = {"name": "body", "attachment_name": "body"}
+
+    parts, reference, lighting = scene_io._split_sprite_render_manifest(
+        [part, _lighting_entry()]
+    )
+
+    assert parts == [part]
+    assert reference is None
+    assert lighting == _lighting_entry()
+
+
+def test_lighting_contract_rejects_ambiguous_entries():
+    with pytest.raises(ValueError, match="only one lighting"):
+        scene_io._split_sprite_render_manifest([_lighting_entry(), _lighting_entry()])
+
+
+def test_an_older_sidecar_refuses_a_lit_manifest_rather_than_rendering_it_unlit():
+    """The reason unknown kinds stay an error instead of being skipped.
+
+    Skipping would hand the caller a full set of sprites, correct in every way
+    except that the light it asked for is missing -- a silently wrong image is
+    far worse than a command that fails.
+    """
+    with pytest.raises(ValueError, match="Unknown sprite render manifest kind"):
+        scene_io._split_sprite_render_manifest([{"kind": "some_future_thing"}])

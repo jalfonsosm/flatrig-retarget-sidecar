@@ -416,6 +416,249 @@ def render_projected_sprite(scene, output_path, resolution=2048):
         return True
 
 
+# --- sprite lighting ------------------------------------------------------
+#
+# The native side owns this look. `SpriteLighting` in
+# flatRig/include/pipeline/splat_frame_render.hpp shades a Gaussian cloud with a
+# wrapped Lambert term, optional cel banding and an additive Blinn-Phong
+# highlight, and the viewer's 3D preview shades live with the same model. A mesh
+# asset -- TRELLIS.2.cpp output, or a TripoSplat asset exported as geometry --
+# has no cloud, so before this it rendered unlit whatever the light gizmo said.
+#
+# So the formula below is a transcription, not a design. Deliberately *not*
+# Blender lamps and a Principled BSDF: those would give a physically-based
+# result that looks nothing like the splat path under the same controls, and
+# they would drag shadows and GI into a render that is currently 16 samples of
+# flat emission. Evaluating the same arithmetic in a node graph and feeding it
+# to an Emission keeps the render setup, the speed and the look identical.
+#
+#   lambert   = clamp((N.L + wrap) / (1 + wrap), 0, 1)
+#   banded    = clamp(floor(lambert * bands) / (bands - 1), 0, 1)     [bands >= 2]
+#   highlight = max(0, N.H) ** shininess                              [specular]
+#   out       = albedo * (ambient + diffuse * lambert) + specular * highlight
+#
+# One honest difference: the native path multiplies the cloud's stored colour,
+# while these nodes multiply the base-colour texture after Blender has decoded
+# it to linear. The controls and the shape of the falloff match; the ramp
+# through the midtones is slightly different. Rendering the two side by side is
+# not a thing the product does -- an asset has a cloud or it does not -- so
+# consistency of look and controls is what this buys, not pixel equality.
+
+
+def _sprite_light_vectors(lighting):
+    """``(to_light, half)`` unit vectors, matching ``light_vector`` in C++.
+
+    The spec states where the light *travels*; a Lambert term wants the
+    direction from the surface towards it, hence the negation. A zero or
+    non-finite direction is not a light, so it falls back to the
+    azimuth/elevation pair the same way the native code does.
+    """
+    import math
+
+    def _normalise(vec):
+        length = math.sqrt(sum(component * component for component in vec))
+        if not math.isfinite(length) or length <= 1e-12:
+            return None
+        return [component / length for component in vec]
+
+    to_light = None
+    raw = lighting.get("direction")
+    if isinstance(raw, (list, tuple)) and len(raw) == 3:
+        try:
+            to_light = _normalise([-float(component) for component in raw])
+        except (TypeError, ValueError):
+            to_light = None
+    if to_light is None:
+        azimuth = math.radians(float(lighting.get("azimuth", 135.0)))
+        elevation = math.radians(float(lighting.get("elevation", 35.0)))
+        to_light = [
+            math.sin(azimuth) * math.cos(elevation),
+            math.cos(azimuth) * math.cos(elevation),
+            math.sin(elevation),
+        ]
+
+    # `to_eye` is the view's depth axis: it already points from the model back
+    # at the camera. Light and eye exactly opposed leaves no half vector, and
+    # no highlight to place -- any finite value does, the specular term is 0.
+    to_eye = _normalise([float(component) for component in
+                         lighting.get("to_eye", (0.0, 1.0, 0.0))]) or [0.0, 1.0, 0.0]
+    half = _normalise([a + b for a, b in zip(to_light, to_eye)]) or list(to_eye)
+    return to_light, half
+
+
+def _sprite_light_term(lighting, name, default_colour, default_intensity):
+    block = lighting.get(name)
+    colour, intensity = default_colour, default_intensity
+    if isinstance(block, dict):
+        raw = block.get("color")
+        if isinstance(raw, (list, tuple)) and len(raw) >= 3:
+            try:
+                colour = tuple(float(component) for component in raw[:3])
+            except (TypeError, ValueError):
+                colour = default_colour
+        if "intensity" in block:
+            try:
+                intensity = float(block["intensity"])
+            except (TypeError, ValueError):
+                intensity = default_intensity
+    return tuple(component * intensity for component in colour), intensity
+
+
+def sprite_lighting_enabled(lighting):
+    return bool(isinstance(lighting, dict) and lighting.get("enabled"))
+
+
+def _build_lit_material(original_material, lighting):
+    """Emission-only copy whose colour is the shaded base colour.
+
+    Still an emission surface: nothing here casts, receives or bounces light.
+    The shading is arithmetic on the interpolated normal, which is what makes it
+    reproducible and what makes it agree with the cloud shader.
+    """
+    material = original_material.copy()
+    material.use_nodes = True
+    if hasattr(material, "use_backface_culling"):
+        material.use_backface_culling = False
+    if hasattr(material, "show_transparent_back"):
+        material.show_transparent_back = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+
+    output_node = next(
+        (node for node in nodes if node.bl_idname == "ShaderNodeOutputMaterial"), None
+    )
+    principled_node = next(
+        (node for node in nodes if node.bl_idname == "ShaderNodeBsdfPrincipled"), None
+    )
+    if output_node is None:
+        output_node = nodes.new("ShaderNodeOutputMaterial")
+
+    # --- albedo, exactly as the unlit path resolves it ---
+    albedo_socket = None
+    albedo_value = (1.0, 1.0, 1.0, 1.0)
+    if principled_node is not None:
+        base_input = principled_node.inputs["Base Color"]
+        if base_input.links:
+            albedo_socket = base_input.links[0].from_socket
+        else:
+            albedo_value = base_input.default_value
+
+    to_light, half = _sprite_light_vectors(lighting)
+    ambient, _ = _sprite_light_term(lighting, "ambient", (0.45, 0.52, 0.68), 0.35)
+    diffuse, _ = _sprite_light_term(lighting, "diffuse", (1.0, 0.98, 0.94), 1.0)
+    specular, specular_intensity = _sprite_light_term(
+        lighting, "specular", (1.0, 1.0, 1.0), 0.0
+    )
+    try:
+        softness = min(1.0, max(0.0, float(lighting.get("softness", 0.35))))
+    except (TypeError, ValueError):
+        softness = 0.35
+    try:
+        bands = int(lighting.get("bands", 0) or 0)
+    except (TypeError, ValueError):
+        bands = 0
+    bands = bands if bands >= 2 else 0
+    try:
+        shininess = max(1.0, float(lighting.get("shininess", 24.0)))
+    except (TypeError, ValueError):
+        shininess = 24.0
+
+    def _new(idname, **attrs):
+        node = nodes.new(idname)
+        for key, value in attrs.items():
+            setattr(node, key, value)
+        return node
+
+    def _vec(vector):
+        node = _new("ShaderNodeCombineXYZ")
+        for socket, component in zip("XYZ", vector):
+            node.inputs[socket].default_value = float(component)
+        return node.outputs["Vector"]
+
+    # Geometry normal is already world space, which is the space the light
+    # direction is expressed in (pipeline-normalised world: Z up, model -Y).
+    geometry = _new("ShaderNodeNewGeometry")
+
+    dot = _new("ShaderNodeVectorMath", operation="DOT_PRODUCT")
+    links.new(geometry.outputs["Normal"], dot.inputs[0])
+    links.new(_vec(to_light), dot.inputs[1])
+
+    # clamp((N.L + wrap) / (1 + wrap), 0, 1)
+    wrapped = _new("ShaderNodeMath", operation="ADD")
+    links.new(dot.outputs["Value"], wrapped.inputs[0])
+    wrapped.inputs[1].default_value = softness
+    lambert = _new("ShaderNodeMath", operation="MULTIPLY", use_clamp=True)
+    links.new(wrapped.outputs["Value"], lambert.inputs[0])
+    lambert.inputs[1].default_value = 1.0 / (1.0 + softness)
+    lambert_socket = lambert.outputs["Value"]
+
+    if bands:
+        scaled = _new("ShaderNodeMath", operation="MULTIPLY")
+        links.new(lambert_socket, scaled.inputs[0])
+        scaled.inputs[1].default_value = float(bands)
+        floored = _new("ShaderNodeMath", operation="FLOOR")
+        links.new(scaled.outputs["Value"], floored.inputs[0])
+        stepped = _new("ShaderNodeMath", operation="DIVIDE", use_clamp=True)
+        links.new(floored.outputs["Value"], stepped.inputs[0])
+        stepped.inputs[1].default_value = float(bands - 1)
+        lambert_socket = stepped.outputs["Value"]
+
+    # albedo * (ambient + diffuse * lambert)
+    diffuse_term = _new("ShaderNodeVectorMath", operation="SCALE")
+    links.new(_vec(diffuse), diffuse_term.inputs[0])
+    links.new(lambert_socket, diffuse_term.inputs["Scale"])
+    lit = _new("ShaderNodeVectorMath", operation="ADD")
+    links.new(diffuse_term.outputs["Vector"], lit.inputs[0])
+    links.new(_vec(ambient), lit.inputs[1])
+
+    shaded = _new("ShaderNodeVectorMath", operation="MULTIPLY")
+    if albedo_socket is not None:
+        links.new(albedo_socket, shaded.inputs[0])
+    else:
+        for index, component in enumerate(albedo_value[:3]):
+            shaded.inputs[0].default_value[index] = float(component)
+    links.new(lit.outputs["Vector"], shaded.inputs[1])
+    colour_socket = shaded.outputs["Vector"]
+
+    # + specular * max(0, N.H) ** shininess, additive and untinted by albedo:
+    # a highlight is light bouncing off the surface, not light it absorbed.
+    if specular_intensity > 0.0:
+        n_dot_h = _new("ShaderNodeVectorMath", operation="DOT_PRODUCT")
+        links.new(geometry.outputs["Normal"], n_dot_h.inputs[0])
+        links.new(_vec(half), n_dot_h.inputs[1])
+        clamped = _new("ShaderNodeMath", operation="MAXIMUM")
+        links.new(n_dot_h.outputs["Value"], clamped.inputs[0])
+        clamped.inputs[1].default_value = 0.0
+        highlight = _new("ShaderNodeMath", operation="POWER")
+        links.new(clamped.outputs["Value"], highlight.inputs[0])
+        highlight.inputs[1].default_value = shininess
+        highlight_socket = highlight.outputs["Value"]
+        if bands:
+            # A cel highlight is a hard shape, not a gradient falling off into
+            # the band below it.
+            hard = _new("ShaderNodeMath", operation="GREATER_THAN")
+            links.new(highlight_socket, hard.inputs[0])
+            hard.inputs[1].default_value = 0.5
+            highlight_socket = hard.outputs["Value"]
+        specular_term = _new("ShaderNodeVectorMath", operation="SCALE")
+        links.new(_vec(specular), specular_term.inputs[0])
+        links.new(highlight_socket, specular_term.inputs["Scale"])
+        summed = _new("ShaderNodeVectorMath", operation="ADD")
+        links.new(colour_socket, summed.inputs[0])
+        links.new(specular_term.outputs["Vector"], summed.inputs[1])
+        colour_socket = summed.outputs["Vector"]
+
+    emission_node = _new("ShaderNodeEmission")
+    emission_node.name = "_sidecar_emission"
+    emission_node.inputs["Strength"].default_value = 1.0
+    links.new(colour_socket, emission_node.inputs["Color"])
+
+    for link in list(output_node.inputs["Surface"].links):
+        links.remove(link)
+    links.new(emission_node.outputs["Emission"], output_node.inputs["Surface"])
+    return material
+
+
 def _build_unlit_material(original_material):
     """Create a temporary emission-only copy that preserves base-color textures."""
     material = original_material.copy()
@@ -459,8 +702,17 @@ def _build_unlit_material(original_material):
     return material
 
 
-def _apply_unlit_materials(objects):
-    """Swap materials to temporary unlit copies and return a restore token."""
+def _apply_unlit_materials(objects, lighting=None):
+    """Swap materials to temporary render copies and return a restore token.
+
+    ``lighting`` omitted or disabled keeps the historical behaviour exactly:
+    emission-only copies, so the sprite is the source texture reproduced. The
+    native side promises the same thing on the cloud path -- "an unlit sprite is
+    still the cloud's own baked colour, byte for byte" -- and that guarantee is
+    why the disabled case routes to the untouched builder rather than to a lit
+    one with neutral terms, which would not be a no-op.
+    """
+    lit = sprite_lighting_enabled(lighting)
     restore_info = []
     created_materials = []
 
@@ -474,7 +726,10 @@ def _apply_unlit_materials(objects):
             if material is None:
                 replacement_materials.append(None)
                 continue
-            unlit_material = _build_unlit_material(material)
+            unlit_material = (
+                _build_lit_material(material, lighting) if lit
+                else _build_unlit_material(material)
+            )
             replacement_materials.append(unlit_material)
             created_materials.append(unlit_material)
 
@@ -789,6 +1044,7 @@ def _render_filtered_preview_sprite(
     depth_center,
     bind_frame,
     projection_matrix,
+    lighting=None,
 ):
     """Render only the exported core-triangle union, preserving scene depth."""
     scene = bpy.context.scene
@@ -828,7 +1084,9 @@ def _render_filtered_preview_sprite(
             hidden_objects.append((scene_obj, scene_obj.hide_render))
             scene_obj.hide_render = True
 
-        restore_info, created_materials = _apply_unlit_materials(render_objects)
+        restore_info, created_materials = _apply_unlit_materials(
+            render_objects, lighting
+        )
         return render_projected_sprite(scene, output_path, resolution=resolution)
     finally:
         if restore_info or created_materials:
@@ -853,6 +1111,7 @@ def render_preview_sprite(
     bind_frame=None,
     projection_matrix=None,
     triangle_groups=None,
+    lighting=None,
 ):
     """Render an assembled preview that matches the exported projection.
 
@@ -870,6 +1129,7 @@ def render_preview_sprite(
             depth_center=depth_center,
             bind_frame=bind_frame,
             projection_matrix=projection_matrix,
+            lighting=lighting,
         )
 
     scene = bpy.context.scene
@@ -891,7 +1151,7 @@ def render_preview_sprite(
         camera_name="Sidecar_PreviewCamera",
         projection_matrix=projection_matrix,
     )
-    restore_info, created_materials = _apply_unlit_materials(mesh_objects)
+    restore_info, created_materials = _apply_unlit_materials(mesh_objects, lighting)
 
     try:
         return render_projected_sprite(scene, output_path, resolution=resolution)
@@ -914,6 +1174,7 @@ def render_part_sprite(
     use_rest_pose=False,
     projection_matrix=None,
     core_triangle_keys=None,
+    lighting=None,
 ):
     """Render a cropped sprite for one body part.
 
@@ -1026,7 +1287,7 @@ def render_part_sprite(
         scene.collection.objects.link(core_obj)
         core_obj.hide_render = True
 
-    restore_info, created_materials = _apply_unlit_materials([render_obj])
+    restore_info, created_materials = _apply_unlit_materials([render_obj], lighting)
 
     camera = setup_orthographic_camera(
         view_cfg,
