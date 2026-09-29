@@ -1,0 +1,598 @@
+"""Stable CLI surface for the public Blender worker sidecar.
+
+Only Blender-bound (`bpy`) worker commands live here: scene/animation/mesh
+extraction, rig dump/bake, sprite rendering, and BVH/format export.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+
+from flatrig import __version__
+from flatrig.curation import (
+    export_curation_fbx,
+    inspect_curation_source,
+    rewrite_armature_rest_pose,
+)
+from flatrig.scene_formats import (
+    bake_predicted_rig,
+    bake_rig_animation,
+    cleanup_mesh,
+    dump_rig_animation,
+    export_3d_animation_bvh,
+    export_3d_rest_bvh,
+    extract_animations,
+    extract_scene,
+    inspect_3d_source,
+    probe_scene_backend,
+    reduce_rig_to_canonical,
+    render_sprites,
+)
+
+
+def _add_projection_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--view", dest="view_name", default="side")
+    parser.add_argument("--view-dir", default=None)
+    parser.add_argument("--view-up", dest="view_up", default=None)
+    parser.add_argument("--view-roll", dest="view_roll", type=float, default=0.0)
+    parser.add_argument("--source-frame", type=int, default=None)
+    parser.add_argument("--use-rest-pose", action="store_true", default=False)
+    parser.add_argument("--projection-space", choices=("world", "root"), default="world")
+    parser.add_argument("--animation", dest="animation_names", action="append", default=[])
+
+
+def _add_weight_aware_decimation_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--weight-aware-decimation",
+        dest="weight_aware_decimation",
+        action="store_true",
+        default=False,
+        help="Bias mesh decimation toward blend/joint regions. Default is uniform decimation.",
+    )
+    parser.add_argument(
+        "--no-weight-aware-decimation",
+        dest="weight_aware_decimation",
+        action="store_false",
+        help="Use uniform mesh decimation.",
+    )
+
+
+def _emit_result(result, payload: dict | None = None) -> None:
+    print(json.dumps(result.payload if payload is None else payload, indent=2))
+    if not result.ok:
+        raise SystemExit(1)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Public Blender worker sidecar.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser("probe", help="probe the public Blender worker backend")
+
+    inspect_3d_parser = subparsers.add_parser(
+        "inspect-3d-source",
+        help="inspect a 3D source through the public Blender sidecar",
+    )
+    inspect_3d_parser.add_argument("source")
+    inspect_3d_parser.add_argument("--output", required=True)
+
+    curation_inspect_parser = subparsers.add_parser(
+        "inspect-curation-source",
+        help="list actions from an offline curation source (.blend or .fbx)",
+    )
+    curation_inspect_parser.add_argument("source")
+    curation_inspect_parser.add_argument("--output", required=True)
+    curation_inspect_parser.add_argument(
+        "--source-root",
+        required=True,
+        help="root of the third-party catalog used to reconnect linked .blend libraries",
+    )
+
+    curation_export_parser = subparsers.add_parser(
+        "export-curation-fbx",
+        help="export a curated armature/mesh source as FBX",
+    )
+    curation_export_parser.add_argument("source")
+    curation_export_parser.add_argument("--output", required=True)
+    curation_export_parser.add_argument("--source-root", required=True)
+    curation_export_parser.add_argument("--fbx-output", required=True)
+    curation_export_parser.add_argument("--action-name", default=None)
+    curation_export_parser.add_argument("--embed-textures", action="store_true", default=False)
+    curation_export_parser.add_argument(
+        "--clean-control-bones",
+        action="store_true",
+        default=False,
+        help="drop unweighted control-bone hierarchy and its action curves",
+    )
+
+    rest_pose_parser = subparsers.add_parser(
+        "rewrite-armature-rest-pose",
+        help="apply a declarative edit-bone rest pose and export an FBX carrier",
+    )
+    rest_pose_parser.add_argument("source")
+    rest_pose_parser.add_argument("--output", required=True)
+    rest_pose_parser.add_argument("--fbx-output", required=True)
+    rest_pose_parser.add_argument("--rest-spec", required=True)
+    rest_pose_parser.add_argument("--action-name", default=None)
+
+    extract_scene_parser = subparsers.add_parser(
+        "extract-scene",
+        help="extract mesh, skeleton, and weights from a 3D source as JSON",
+    )
+    extract_scene_parser.add_argument(
+        "--keep-projection-slivers",
+        action="store_true",
+        help="keep triangles that project edge-on (needed for 3D preview)",
+    )
+    extract_scene_parser.add_argument("source")
+    extract_scene_parser.add_argument("--output", required=True)
+    _add_projection_args(extract_scene_parser)
+    extract_scene_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
+    extract_scene_parser.add_argument(
+        "--no-mesh-reduction", dest="mesh_reduction", action="store_false", default=True
+    )
+    _add_weight_aware_decimation_args(extract_scene_parser)
+    extract_scene_parser.add_argument(
+        "--bind-from-animation",
+        default=None,
+        help=(
+            "Path to an external animation file (.fbx/.glb/...). When the "
+            "source model has no actions of its own, the first frame of this "
+            "animation is loaded and used as the bind/setup pose so the "
+            "generated 2D rig inherits a natural starting pose (a slight "
+            "walking step) instead of the bare T-pose. Required for clean "
+            "cross-rig retargets onto T-pose mannequins."
+        ),
+    )
+    extract_scene_parser.add_argument(
+        "--base-color-texture-output",
+        default=None,
+        help="Write the model's full-resolution base-color texture to this PNG path.",
+    )
+    extract_scene_parser.add_argument(
+        "--splat-input",
+        default=None,
+        help=(
+            "Gaussian-splat companion cloud (.ply) of the source, in the source "
+            "file's own coordinate frame. Requires --splat-output."
+        ),
+    )
+    extract_scene_parser.add_argument(
+        "--splat-output",
+        default=None,
+        help=(
+            "Write the splat cloud here, carried into the extracted scene's world "
+            "space and setup pose. A sibling <name>_weights.json lists each "
+            "splat's dominant bone."
+        ),
+    )
+
+    extract_animations_parser = subparsers.add_parser(
+        "extract-animations",
+        help="extract animations from a 3D source armature as JSON",
+    )
+    extract_animations_parser.add_argument("source")
+    extract_animations_parser.add_argument("--output", required=True)
+    _add_projection_args(extract_animations_parser)
+    extract_animations_parser.add_argument("--bind-from-animation", default=None)
+    extract_animations_parser.add_argument("--animation-source", default=None)
+    extract_animations_parser.add_argument("--decouple-scale", action="store_true", default=False)
+    extract_animations_parser.add_argument("--fps", type=float, default=30.0)
+    extract_animations_parser.add_argument("--frame-start", type=int, default=None)
+    extract_animations_parser.add_argument("--frame-end", type=int, default=None)
+    extract_animations_parser.add_argument("--sample-substeps", type=int, default=2)
+    extract_animations_parser.add_argument(
+        "--no-optimize-animation-keys", dest="optimize_animation_keys", action="store_false"
+    )
+    extract_animations_parser.set_defaults(optimize_animation_keys=True)
+    extract_animations_parser.add_argument(
+        "--force-loop-closing-keys", action="store_true", default=False
+    )
+    extract_animations_parser.add_argument(
+        "--pose-mode",
+        default="full",
+        choices=("full", "rotation_only", "local_rotation", "blend"),
+    )
+    extract_animations_parser.add_argument("--pose-blend", type=float, default=1.0)
+    extract_animations_parser.add_argument(
+        "--drop-problematic-frames", action="store_true", default=False
+    )
+    extract_animations_parser.add_argument(
+        "--preserve-root-motion", action="store_true", default=False
+    )
+    extract_animations_parser.add_argument(
+        "--preserve-root-rotation", action="store_true", default=False
+    )
+
+    dump_rig_parser = subparsers.add_parser(
+        "dump-rig-animation",
+        help=(
+            "dump rig topology and per-frame pose matrices (world + local "
+            "basis) for one action as JSON, for external animation processors"
+        ),
+    )
+    dump_rig_parser.add_argument("source")
+    dump_rig_parser.add_argument("--output", required=True)
+    dump_rig_parser.add_argument("--animation", dest="animation_names", action="append", default=[])
+    dump_rig_parser.add_argument("--frame-start", type=int, default=None)
+    dump_rig_parser.add_argument("--frame-end", type=int, default=None)
+    dump_rig_parser.add_argument(
+        "--allow-rest-pose",
+        action="store_true",
+        default=False,
+        help="when no action exists, emit one evaluated rest-pose frame",
+    )
+
+    bake_rig_parser = subparsers.add_parser(
+        "bake-rig-animation",
+        help=(
+            "bake externally computed local pose transforms (JSON spec) onto "
+            "a rig and export the animated file (.fbx/.glb)"
+        ),
+    )
+    bake_rig_parser.add_argument("source")
+    bake_rig_parser.add_argument("--output", required=True)
+    bake_rig_parser.add_argument("--bake-spec", required=True)
+    bake_rig_parser.add_argument("--flat-output", required=True)
+
+    reduce_rig_parser = subparsers.add_parser(
+        "reduce-rig-to-canonical",
+        help=(
+            "reduce a rig onto a canonical skeleton in place on the mesh "
+            "(rename/drop/reparent bones, transfer weights) and export. Biped "
+            "humanoids resolve by name; any other body plan needs --mapping-file"
+        ),
+    )
+    reduce_rig_parser.add_argument("source")
+    reduce_rig_parser.add_argument("--output", required=True)
+    reduce_rig_parser.add_argument("--flat-output", required=True)
+    reduce_rig_parser.add_argument(
+        "--mapping-file",
+        default=None,
+        help=(
+            "Joint mapping to reduce against, for a rig whose bone names resolve "
+            "to no canonical bone. Same file the retarget takes: "
+            "{\"mapping\": [{\"source\": <canonical bone>, \"target\": <rig bone>}]}. "
+            "Without it only biped humanoids are reduced."
+        ),
+    )
+    reduce_rig_parser.add_argument(
+        "--splat-input",
+        default=None,
+        help="Gaussian-splat companion cloud (.ply) of the source. Requires --splat-output.",
+    )
+    reduce_rig_parser.add_argument(
+        "--splat-output",
+        default=None,
+        help="Write the cloud here, carried into the frame the reduced model is exported in.",
+    )
+
+    render_sprites_parser = subparsers.add_parser(
+        "render-sprites",
+        help="render sprites from a 3D source as PNG",
+    )
+    render_sprites_parser.add_argument("source")
+    render_sprites_parser.add_argument("--output", required=True)
+    _add_projection_args(render_sprites_parser)
+    render_sprites_parser.add_argument("--bind-from-animation", default=None)
+    render_sprites_parser.add_argument("--parts-json", required=True)
+    render_sprites_parser.add_argument("--images-dir", required=True)
+    render_sprites_parser.add_argument("--resolution", type=int, default=2048)
+    render_sprites_parser.add_argument("--bind-frame", type=int, default=0)
+    render_sprites_parser.add_argument("--mesh-target-vertices", type=int, default=5000)
+    render_sprites_parser.add_argument(
+        "--no-mesh-reduction", dest="mesh_reduction", action="store_false", default=True
+    )
+    _add_weight_aware_decimation_args(render_sprites_parser)
+
+    export_anim_bvh_parser = subparsers.add_parser(
+        "export-3d-animation-bvh",
+        help="export one 3D action to BVH via the public Blender sidecar",
+    )
+    export_anim_bvh_parser.add_argument("source")
+    export_anim_bvh_parser.add_argument("--output", required=True)
+    export_anim_bvh_parser.add_argument("--bvh-output", required=True)
+    export_anim_bvh_parser.add_argument("--animation-name", default=None)
+    export_anim_bvh_parser.add_argument("--fps", type=float, default=30.0)
+    export_anim_bvh_parser.add_argument("--frame-start", type=int, default=None)
+    export_anim_bvh_parser.add_argument("--frame-end", type=int, default=None)
+
+    cleanup_mesh_parser = subparsers.add_parser(
+        "cleanup-mesh",
+        help="clean a raw generated mesh (join, drop debris, remesh, decimate) to GLB",
+    )
+    cleanup_mesh_parser.add_argument("source")
+    cleanup_mesh_parser.add_argument("--output", required=True)
+    cleanup_mesh_parser.add_argument("--glb-output", required=True)
+    cleanup_mesh_parser.add_argument(
+        "--fbx-output",
+        default=None,
+        help="Also export the cleaned mesh as FBX (the no-rig path's final asset)",
+    )
+    cleanup_mesh_parser.add_argument(
+        "--orientation-fix",
+        default="none",
+        choices=("none", "y_up_to_z_up"),
+        help="Bake an up-axis correction into the cleaned mesh (for Y-up generators)",
+    )
+    cleanup_mesh_parser.add_argument("--target-triangles", type=int, default=10000)
+    cleanup_mesh_parser.add_argument(
+        "--handle-tolerance",
+        type=int,
+        default=0,
+        help=(
+            "handles the cleaned surface may keep (0 = closed and genus 0). "
+            "Closed, single-component and consistently wound stay required"
+        ),
+    )
+    cleanup_mesh_parser.add_argument(
+        "--no-voxel-remesh", dest="voxel_remesh", action="store_false", default=True
+    )
+    cleanup_mesh_parser.add_argument(
+        "--no-remove-loose", dest="remove_loose", action="store_false", default=True
+    )
+
+    bake_predicted_rig_parser = subparsers.add_parser(
+        "bake-predicted-rig",
+        help=(
+            "build a from-scratch armature (no template file) for an "
+            "externally predicted mesh/bones/weights .npz and export FBX"
+        ),
+    )
+    bake_predicted_rig_parser.add_argument("source", help="Path to the prediction .npz")
+    bake_predicted_rig_parser.add_argument("--output", required=True)
+    bake_predicted_rig_parser.add_argument("--fbx-output", required=True)
+    bake_predicted_rig_parser.add_argument(
+        "--mesh-path", default=None, help="Original mesh path to keep textures and materials"
+    )
+    bake_predicted_rig_parser.add_argument(
+        "--reduce-to-vertices",
+        type=int,
+        default=0,
+        help=(
+            "reduce the rigged mesh to this vertex budget using the predicted "
+            "skin weights as the importance signal (0 = no reduction)"
+        ),
+    )
+
+    export_rest_bvh_parser = subparsers.add_parser(
+        "export-3d-rest-bvh",
+        help="export the rest/bind pose to BVH via the public Blender sidecar",
+    )
+    export_rest_bvh_parser.add_argument("source")
+    export_rest_bvh_parser.add_argument("--output", required=True)
+    export_rest_bvh_parser.add_argument("--bvh-output", required=True)
+    _add_projection_args(export_rest_bvh_parser)
+    export_rest_bvh_parser.add_argument("--fps", type=float, default=30.0)
+    export_rest_bvh_parser.add_argument("--frame-count", type=int, default=None)
+    export_rest_bvh_parser.add_argument("--bind-from-animation", default=None)
+
+    args = parser.parse_args()
+
+    if args.command == "probe":
+        payload = {
+            "backend": "blender_worker",
+            "sidecar_version": __version__,
+            "scene_backend": probe_scene_backend(),
+        }
+        print(json.dumps(payload, indent=2))
+        return
+
+    if args.command == "inspect-3d-source":
+        result = inspect_3d_source(args.source, args.output)
+        _emit_result(result)
+        return
+
+    if args.command == "inspect-curation-source":
+        result = inspect_curation_source(
+            args.source,
+            args.output,
+            source_root=args.source_root,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "export-curation-fbx":
+        result = export_curation_fbx(
+            args.source,
+            args.output,
+            source_root=args.source_root,
+            fbx_output=args.fbx_output,
+            action_name=args.action_name,
+            embed_textures=args.embed_textures,
+            clean_control_bones=args.clean_control_bones,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "rewrite-armature-rest-pose":
+        result = rewrite_armature_rest_pose(
+            args.source,
+            args.output,
+            fbx_output=args.fbx_output,
+            rest_spec=args.rest_spec,
+            action_name=args.action_name,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "extract-scene":
+        result = extract_scene(
+            args.source,
+            args.output,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
+            projection_space=args.projection_space,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
+            weight_aware_decimation=args.weight_aware_decimation,
+            bind_from_animation=getattr(args, "bind_from_animation", None),
+            keep_projection_slivers=getattr(args, "keep_projection_slivers", False),
+            base_color_texture_output=getattr(args, "base_color_texture_output", None),
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "extract-animations":
+        result = extract_animations(
+            args.source,
+            args.output,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            projection_space=args.projection_space,
+            animation_names=args.animation_names,
+            fps=args.fps,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+            sample_substeps=args.sample_substeps,
+            optimize_animation_keys=args.optimize_animation_keys,
+            force_loop_closing_keys=args.force_loop_closing_keys,
+            pose_mode=args.pose_mode,
+            pose_blend=args.pose_blend,
+            drop_problematic_frames=args.drop_problematic_frames,
+            preserve_root_motion=args.preserve_root_motion,
+            preserve_root_rotation=args.preserve_root_rotation,
+            bind_from_animation=getattr(args, "bind_from_animation", None),
+            animation_source=getattr(args, "animation_source", None),
+            decouple_scale=getattr(args, "decouple_scale", False),
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "dump-rig-animation":
+        result = dump_rig_animation(
+            args.source,
+            args.output,
+            animation_names=args.animation_names,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+            allow_rest_pose=args.allow_rest_pose,
+        )
+        # The full dump (per-frame matrices) lives in the output file; keep
+        # stdout to a light summary so callers can log it.
+        summary = {
+            key: value
+            for key, value in result.payload.items()
+            if key not in {"frames", "bones", "armature_matrix_world"}
+        }
+        summary.setdefault("output", args.output)
+        _emit_result(result, summary)
+        return
+
+    if args.command == "bake-rig-animation":
+        result = bake_rig_animation(
+            args.source,
+            args.output,
+            bake_spec=args.bake_spec,
+            flat_output=args.flat_output,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "reduce-rig-to-canonical":
+        result = reduce_rig_to_canonical(
+            args.source,
+            args.output,
+            flat_output=args.flat_output,
+            splat_input=getattr(args, "splat_input", None),
+            splat_output=getattr(args, "splat_output", None),
+            mapping_file=getattr(args, "mapping_file", None),
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "cleanup-mesh":
+        result = cleanup_mesh(
+            args.source,
+            args.output,
+            glb_output=args.glb_output,
+            target_triangles=args.target_triangles,
+            voxel_remesh=args.voxel_remesh,
+            remove_loose=args.remove_loose,
+            fbx_output=args.fbx_output,
+            orientation_fix=args.orientation_fix,
+            handle_tolerance=args.handle_tolerance,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "bake-predicted-rig":
+        result = bake_predicted_rig(
+            args.source,
+            args.output,
+            fbx_output=args.fbx_output,
+            mesh_path=args.mesh_path,
+            reduce_to_vertices=args.reduce_to_vertices,
+        )
+        _emit_result(result)
+        return
+    if args.command == "render-sprites":
+        result = render_sprites(
+            args.source,
+            args.output,
+            parts_json=args.parts_json,
+            images_dir=args.images_dir,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
+            projection_space=args.projection_space,
+            resolution=args.resolution,
+            bind_frame=args.bind_frame,
+            mesh_reduction=args.mesh_reduction,
+            mesh_target_vertices=args.mesh_target_vertices,
+            weight_aware_decimation=args.weight_aware_decimation,
+            bind_from_animation=getattr(args, "bind_from_animation", None),
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "export-3d-animation-bvh":
+        result = export_3d_animation_bvh(
+            args.source,
+            args.output,
+            bvh_output=args.bvh_output,
+            animation_name=args.animation_name,
+            fps=args.fps,
+            frame_start=args.frame_start,
+            frame_end=args.frame_end,
+        )
+        _emit_result(result)
+        return
+
+    if args.command == "export-3d-rest-bvh":
+        result = export_3d_rest_bvh(
+            args.source,
+            args.output,
+            bvh_output=args.bvh_output,
+            view_preset=args.view_name,
+            view_dir=args.view_dir,
+            view_up=args.view_up,
+            view_roll=args.view_roll,
+            source_frame=args.source_frame,
+            use_rest_pose=args.use_rest_pose,
+            projection_space=args.projection_space,
+            fps=args.fps,
+            frame_count=args.frame_count,
+            bind_from_animation=args.bind_from_animation,
+        )
+        _emit_result(result)
+        return
+
+    raise AssertionError(f"Unhandled command: {args.command}")
+
+
+if __name__ == "__main__":
+    main()
